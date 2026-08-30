@@ -30,7 +30,7 @@ st.markdown("""
 html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"]{
   background:#0d1117;
 }
-.block-container{padding-top:1.25rem;padding-bottom:3rem;max-width:1450px}
+.block-container{padding-top:4.4rem;padding-bottom:3rem;max-width:1450px}
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#10151b 0%,#0b1015 100%);border-right:1px solid var(--line)}
 [data-testid="stSidebar"] .block-container{padding-top:1rem}
 [data-testid="stSidebar"] img{max-width:185px;margin:0 auto .3rem auto;display:block}
@@ -48,7 +48,7 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"]{font-weight:800}
 [data-baseweb="tab-list"]{gap:.25rem}
 [data-baseweb="tab"]{border-radius:8px 8px 0 0}
 [data-baseweb="tab"][aria-selected="true"]{color:#ff7a18}
-.ramona-page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin:.1rem 0 1.2rem 0}
+.ramona-page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin:.35rem 0 1.2rem 0;position:relative;z-index:1}
 .ramona-page-title{font-size:2rem;font-weight:800;line-height:1.15;margin:0;color:#f7f8fa}
 .ramona-page-subtitle{margin-top:.35rem;color:var(--muted);font-size:.95rem}
 .ramona-badge{display:inline-block;padding:.22rem .55rem;border-radius:999px;background:var(--ramona-orange-soft);color:#ff7a18;border:1px solid rgba(255,106,0,.25);font-size:.76rem;font-weight:700}
@@ -58,7 +58,7 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"]{font-weight:800}
 .ramona-login-wrap img{max-width:320px;width:72%;margin:0 auto 1rem auto}
 .small-note{font-size:.86rem;opacity:.75}
 @media (max-width: 700px){
-  .block-container{padding-left:.7rem;padding-right:.7rem;padding-top:.8rem}
+  .block-container{padding-left:.7rem;padding-right:.7rem;padding-top:3.8rem}
   div[data-testid="stHorizontalBlock"]{gap:.35rem}
   .ramona-page-title{font-size:1.55rem}
 }
@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.2"):
+def page_header(title, subtitle="", badge="V0.3.3"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -160,6 +160,14 @@ def init_db():
     con.commit()
 
 init_db()
+
+# V0.3.3 migration: preserve bottle-equivalent counts when ml is still pending.
+def ensure_v033_schema():
+    cols={r[1] for r in con.execute("PRAGMA table_info(inventory_counts)").fetchall()}
+    if 'qty_bottle_equiv' not in cols:
+        con.execute("ALTER TABLE inventory_counts ADD COLUMN qty_bottle_equiv REAL")
+        con.commit()
+ensure_v033_schema()
 
 # ---------------------- catalog seed from current sheet ----------------------
 BEERS = ["Corona","Corona Sunbrew","XX","Negra","Especial","Sol","Coors","Molson"]
@@ -280,23 +288,54 @@ def save_session(kind, counts, session_date=None, notes=""):
     cur=con.execute("INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes) VALUES(?,?,?,?,?)",
                     (d,kind,user['id'],now_iso(),notes)); sid=cur.lastrowid
     for x in counts:
-        con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation)
-                       VALUES(?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs')))
+        con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
+                       VALUES(?,?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
     con.commit(); return sid
 
-def count_input(p, key, default=0.0):
-    default = max(float(default or 0),0)
+def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
     if p['category']=='Cerveza':
-        return float(st.number_input("Conteo actual",min_value=0,value=int(round(default)),step=1,key=key))
-    if not p['bottle_ml']:
-        st.caption("Presentación en ml pendiente. Por ahora registra el total directamente en oz.")
-        return float(st.number_input("Total actual (oz)",min_value=0.0,value=float(round(default,2)),step=.25,key=key))
-    oz=float(p['bottle_ml'])/ML_PER_OZ; full=int(default//oz); rem=max(0.0,default-full*oz)
-    a,b=st.columns(2)
-    f=a.number_input("Botellas completas",min_value=0,value=full,step=1,key=key+'f')
-    o=b.number_input("Botella abierta (oz)",min_value=0.0,max_value=float(round(oz,2)),value=float(min(round(rem,2),round(oz,2))),step=.25,key=key+'o')
-    total=f*oz+o; st.caption(f"{p['bottle_ml']:.0f} ml = {oz:.2f} oz · Total: {total:.2f} oz")
-    return total
+        units=float(st.number_input("Unidades / botellas",min_value=0,value=int(round(max(float(default_base or 0),0))),step=1,key=key+'u'))
+        return {'base':units,'bottles':None}
+    boz=bottle_oz(p)
+    if default_bottles is None:
+        default_bottles=(max(float(default_base or 0),0)/boz) if boz else 0.0
+    default_bottles=max(float(default_bottles or 0),0)
+    full=int(math.floor(default_bottles+1e-9)); frac_raw=max(0.0,min(default_bottles-full,.99))
+    fractions=[0.0,0.25,0.50,0.75]; frac=min(fractions,key=lambda x:abs(x-frac_raw))
+    c1,c2=st.columns([1.2,1])
+    full_val=int(c1.number_input("Botellas completas",min_value=0,value=full,step=1,key=key+'f'))
+    frac_val=float(c2.selectbox("Fracción botella abierta",fractions,index=fractions.index(frac),format_func=lambda x:{0.0:'0 (sin abierta)',0.25:'0.25 · ¼',0.5:'0.50 · ½',0.75:'0.75 · ¾'}[x],key=key+'q'))
+    bottle_equiv=full_val+frac_val
+    if boz:
+        total_oz=bottle_equiv*boz
+        st.caption(f"Conteo: {bottle_equiv:.2f} botellas · {p['bottle_ml']:.0f} ml/botella · Total calculado: {total_oz:.2f} oz")
+        return {'base':total_oz,'bottles':bottle_equiv}
+    st.info(f"Conteo guardado: {bottle_equiv:.2f} botellas. La presentación en ml está pendiente; las oz se calcularán automáticamente cuando el ADMIN registre los ml.")
+    return {'base':0.0,'bottles':bottle_equiv}
+
+def last_close_detail(pid,lid,before_or_on=None):
+    sql="""SELECT ic.qty_base,ic.qty_bottle_equiv,s.session_date,s.created_at FROM inventory_counts ic
+           JOIN inventory_sessions s ON s.id=ic.session_id
+           WHERE ic.product_id=? AND ic.location_id=? AND s.session_type='CLOSING'"""
+    ps=[pid,lid]
+    if before_or_on: sql += " AND s.session_date<=?"; ps.append(before_or_on)
+    sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
+    r=one(sql,ps)
+    return (float(r['qty_base']), float(r['qty_bottle_equiv']) if r['qty_bottle_equiv'] is not None else None, r['session_date']) if r else (None,None,None)
+
+def session_qty_detail(d,pid,kind,lid):
+    r=one("""SELECT ic.qty_base,ic.qty_bottle_equiv FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+             WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
+             ORDER BY s.created_at DESC LIMIT 1""",(d,kind,pid,lid))
+    return (float(r['qty_base']), float(r['qty_bottle_equiv']) if r['qty_bottle_equiv'] is not None else None) if r else (None,None)
+
+def backfill_product_bottle_counts(pid):
+    p=one("SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=?",(pid,))
+    if not p or p['category']!='Licor' or not p['bottle_ml']:
+        return
+    boz=float(p['bottle_ml'])/ML_PER_OZ
+    con.execute("UPDATE inventory_counts SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
+    con.commit()
 
 def movement_qty_input(p,key,label="Cantidad"):
     step=1.0 if p['category']=='Cerveza' else .25
@@ -464,7 +503,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.3.2 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.3.3 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -515,21 +554,27 @@ if page=='Apertura':
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
         for p in g:
-            prev,prev_date=last_close(p['id'],bar,d.isoformat())
+            prev,prev_bottles,prev_date=last_close_detail(p['id'],bar,d.isoformat())
             with st.expander(product_label(p),expanded=True):
                 if prev is None:
                     st.info("Primer inventario registrado para este producto. No existe cierre anterior para comparar.")
-                    val=count_input(p,f"op_{d}_{p['id']}",0); var=None; obs=''
+                    res=bottle_count_input(p,f"op_{d}_{p['id']}",0); val=res['base']; var=None; obs=''; bottle_equiv=res['bottles']
                 else:
-                    st.caption(f"Cierre anterior ({prev_date}): **{qty_fmt(p,prev)}**")
-                    val=count_input(p,f"op_{d}_{p['id']}",prev); var=val-prev; obs=''
-                    tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1'))
-                    if abs(var)>tol:
-                        st.warning(f"Diferencia contra cierre anterior: {var:+.2f} {unit_label(p)}")
+                    if cat=='Licor' and not p['bottle_ml'] and prev_bottles is not None:
+                        st.caption(f"Cierre anterior ({prev_date}): **{prev_bottles:.2f} botellas** · ml pendiente")
+                    else:
+                        st.caption(f"Cierre anterior ({prev_date}): **{qty_fmt(p,prev)}**")
+                    res=bottle_count_input(p,f"op_{d}_{p['id']}",prev,prev_bottles); val=res['base']; bottle_equiv=res['bottles']; obs=''
+                    if cat=='Licor' and not p['bottle_ml']:
+                        var=(bottle_equiv-prev_bottles) if prev_bottles is not None else None; tol=.25; var_unit='botellas'
+                    else:
+                        var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
+                    if var is not None and abs(var)>tol:
+                        st.warning(f"Diferencia contra cierre anterior: {var:+.2f} {var_unit}")
                         obs=st.text_input("Observación obligatoria",key=f"opobs_{d}_{p['id']}")
                         missing_obs |= not bool(obs.strip())
-                    else: st.caption(f"Diferencia: {var:+.2f} {unit_label(p)} · dentro de tolerancia")
-                counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs})
+                    elif var is not None: st.caption(f"Diferencia: {var:+.2f} {var_unit} · dentro de tolerancia")
+                counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv})
     if st.button("Guardar apertura",type="primary",width="stretch"):
         if missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
         else: save_session('OPENING',counts,d); st.success("Apertura guardada correctamente.")
@@ -543,12 +588,16 @@ elif page=='Cierre':
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
         for p in g:
-            op=session_qty(d.isoformat(),p['id'],'OPENING',bar)
-            default=op if op is not None else (last_close(p['id'],bar,d.isoformat())[0] or 0)
+            op,op_bottles=session_qty_detail(d.isoformat(),p['id'],'OPENING',bar)
+            if op is not None: default,default_bottles=op,op_bottles
+            else:
+                lc,lc_bottles,_=last_close_detail(p['id'],bar,d.isoformat()); default,default_bottles=(lc or 0),lc_bottles
             with st.expander(product_label(p),expanded=True):
-                if op is not None: st.caption(f"Apertura de hoy: **{qty_fmt(p,op)}**")
-                val=count_input(p,f"cl_{d}_{p['id']}",default)
-                counts.append({'pid':p['id'],'lid':bar,'qty':val})
+                if op is not None:
+                    if cat=='Licor' and not p['bottle_ml'] and op_bottles is not None: st.caption(f"Apertura de hoy: **{op_bottles:.2f} botellas** · ml pendiente")
+                    else: st.caption(f"Apertura de hoy: **{qty_fmt(p,op)}**")
+                res=bottle_count_input(p,f"cl_{d}_{p['id']}",default,default_bottles); val=res['base']
+                counts.append({'pid':p['id'],'lid':bar,'qty':val,'bottle_equiv':res['bottles']})
     st.divider(); pending=[]
     st.subheader("Movimientos pendientes del día")
     st.caption("Solo registra aquí lo que todavía NO haya sido ingresado desde las opciones independientes.")
@@ -790,12 +839,14 @@ elif page=='Administración':
             try:
                 ex("INSERT INTO products(category_id,name,bottle_ml,package_type) VALUES(?,?,?,?)",(cm[cat],name.strip(),ml or None,pkg)); st.success("Producto agregado."); st.rerun()
             except sqlite3.IntegrityError: st.error("Ese producto con la misma presentación ya existe.")
-        st.caption("Completa la presentación en ml para licores; es necesaria para convertir oz a botellas y calcular abastecimiento. El costo es opcional y permite estimar el valor de las diferencias.")
+        st.caption("La presentación en ml puede completarse más adelante. Mientras esté pendiente, el inventario de licor se guarda como botellas completas + fracción; al registrar los ml, la app convierte automáticamente esos conteos a oz. El costo es opcional.")
         df=pd.read_sql_query("SELECT p.id ID,c.name Categoría,p.name Producto,p.bottle_ml 'ml',p.package_type Envase,p.unit_cost 'Costo por botella/unidad',p.active Activo FROM products p JOIN categories c ON c.id=p.category_id ORDER BY c.name,p.name",con)
         st.dataframe(df,width="stretch",hide_index=True)
         pid=st.number_input("ID del producto a actualizar",min_value=1,step=1); newml=st.number_input("Nuevo ml",min_value=0.0,step=5.0,key='updml'); newcost=st.number_input("Costo por botella/unidad ($, opcional)",min_value=0.0,step=.01,key='updcost')
         if st.button("Actualizar presentación / costo"):
-            ex("UPDATE products SET bottle_ml=?,unit_cost=? WHERE id=?",(newml or None,newcost or None,int(pid))); st.success("Producto actualizado."); st.rerun()
+            ex("UPDATE products SET bottle_ml=?,unit_cost=? WHERE id=?",(newml or None,newcost or None,int(pid)))
+            if newml>0: backfill_product_bottle_counts(int(pid))
+            st.success("Producto actualizado. Si había conteos guardados por botellas, sus oz fueron recalculadas automáticamente."); st.rerun()
     with t2:
         cn=st.text_input("Nombre del cóctel")
         if st.button("Crear cóctel") and cn.strip():
