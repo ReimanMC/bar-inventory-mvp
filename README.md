@@ -1,4 +1,4 @@
-# Inventario La Ramona — V0.3.1
+# Inventario La Ramona — V0.3.2
 
 MVP de inventario de bar en Streamlit con autenticación Google/OIDC, acceso por correo autorizado, roles, apertura/cierre, proveedores, Bodega → Bar, ajustes operativos, POS/recetas, dashboard gerencial, abastecimiento y reportes.
 
@@ -10,7 +10,7 @@ MVP de inventario de bar en Streamlit con autenticación Google/OIDC, acceso por
 - Solo el Developer/Owner puede otorgar rol ADMIN.
 - Usuarios pueden bloquearse/reactivarse sin eliminar su historial.
 
-## V0.3.1
+## V0.3.2
 - Dashboard gerencial con filtros Hoy / 7 / 14 / 28 días / personalizado.
 - KPIs: consumo, exactitud, alertas, mayor diferencia, costo estimado de diferencias y cobertura crítica.
 - Alertas prioritarias, Top consumo, Top diferencias y tendencias real vs esperado.
@@ -37,3 +37,10 @@ organization_name = "La Ramona"
 ```
 
 Nunca subas `client_secret`, `cookie_secret` ni `secrets.toml` a GitHub.
+
+
+## V0.3.2 — Identidad visual
+- Logo oficial de La Ramona visible en login, encabezado de la app y barra lateral.
+- Tema oscuro con acentos naranja/rojo inspirado en la identidad del bar.
+- Dashboard y navegación con estilo ejecutivo más compacto.
+- Dashboard como pantalla inicial para MANAGER/ADMIN.
