@@ -12,18 +12,75 @@ ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
 
-st.set_page_config(page_title="Inventario La Ramona", page_icon="🍸", layout="wide")
+st.set_page_config(page_title="Inventario La Ramona", page_icon="❤️", layout="wide", initial_sidebar_state="expanded")
+
+LOGO_PATH = "assets/la_ramona_logo.webp"
+
 st.markdown("""
 <style>
-.block-container{padding-top:1.2rem;padding-bottom:3rem;max-width:1250px}
-div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);padding:10px;border-radius:10px}
+:root{
+  --ramona-orange:#ff6a00;
+  --ramona-orange-soft:rgba(255,106,0,.12);
+  --ramona-red:#d9272e;
+  --panel:#171c22;
+  --panel-2:#1d232b;
+  --line:rgba(255,255,255,.10);
+  --muted:#9ea7b3;
+}
+html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"]{
+  background:#0d1117;
+}
+.block-container{padding-top:1.25rem;padding-bottom:3rem;max-width:1450px}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#10151b 0%,#0b1015 100%);border-right:1px solid var(--line)}
+[data-testid="stSidebar"] .block-container{padding-top:1rem}
+[data-testid="stSidebar"] img{max-width:185px;margin:0 auto .3rem auto;display:block}
+[data-testid="stSidebar"] hr{border-color:var(--line)}
+[data-testid="stSidebar"] [role="radiogroup"] label{padding:.48rem .62rem;border-radius:9px;margin:.12rem 0}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked){background:var(--ramona-orange-soft);border:1px solid rgba(255,106,0,.20)}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p{color:#ff7a18;font-weight:700}
+div[data-testid="stMetric"]{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--line);padding:15px 16px;border-radius:12px;box-shadow:0 5px 18px rgba(0,0,0,.14)}
+div[data-testid="stMetric"] label{color:#c5ccd5!important}
+div[data-testid="stMetric"] [data-testid="stMetricValue"]{font-weight:800}
+.stButton>button[kind="primary"], .stDownloadButton>button{background:linear-gradient(90deg,#e74b4d,#ef6a4c);border:0;border-radius:10px;font-weight:700}
+.stButton>button{border-radius:9px}
+[data-testid="stExpander"], [data-testid="stDataFrame"], [data-testid="stTable"]{border-radius:11px;overflow:hidden}
+[data-testid="stExpander"]{border:1px solid var(--line);background:rgba(255,255,255,.015)}
+[data-baseweb="tab-list"]{gap:.25rem}
+[data-baseweb="tab"]{border-radius:8px 8px 0 0}
+[data-baseweb="tab"][aria-selected="true"]{color:#ff7a18}
+.ramona-page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin:.1rem 0 1.2rem 0}
+.ramona-page-title{font-size:2rem;font-weight:800;line-height:1.15;margin:0;color:#f7f8fa}
+.ramona-page-subtitle{margin-top:.35rem;color:var(--muted);font-size:.95rem}
+.ramona-badge{display:inline-block;padding:.22rem .55rem;border-radius:999px;background:var(--ramona-orange-soft);color:#ff7a18;border:1px solid rgba(255,106,0,.25);font-size:.76rem;font-weight:700}
+.ramona-section{font-size:1.18rem;font-weight:750;margin:1.2rem 0 .6rem}
+.ramona-note{color:var(--muted);font-size:.88rem}
+.ramona-login-wrap{max-width:720px;margin:5vh auto 0 auto;text-align:center}
+.ramona-login-wrap img{max-width:320px;width:72%;margin:0 auto 1rem auto}
 .small-note{font-size:.86rem;opacity:.75}
 @media (max-width: 700px){
-  .block-container{padding-left:.65rem;padding-right:.65rem}
+  .block-container{padding-left:.7rem;padding-right:.7rem;padding-top:.8rem}
   div[data-testid="stHorizontalBlock"]{gap:.35rem}
+  .ramona-page-title{font-size:1.55rem}
 }
 </style>
 """, unsafe_allow_html=True)
+
+try:
+    st.logo(LOGO_PATH, size="large", icon_image=LOGO_PATH)
+except Exception:
+    pass
+
+def page_header(title, subtitle="", badge="V0.3.2"):
+    st.markdown(f"""
+    <div class="ramona-page-header">
+      <div>
+        <div class="ramona-page-title">{title}</div>
+        <div class="ramona-page-subtitle">{subtitle}</div>
+      </div>
+      <div class="ramona-badge">{badge}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # --------------------------- DB ---------------------------
 @st.cache_resource
@@ -404,11 +461,14 @@ def bootstrap_admin(identity):
            (identity['name'] or admin_email,'',admin_email,'ADMIN',now_iso(),now_iso()))
 
 def login_screen():
-    st.title("🍸 Inventario La Ramona")
-    st.caption("Control de inventario · V0.3.1 · Acceso seguro con Google")
+    st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
+    st.image(LOGO_PATH, width=320)
+    st.markdown("## Inventario La Ramona")
+    st.caption("Control de inventario · V0.3.2 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 if not st.user.is_logged_in:
     login_screen(); st.stop()
@@ -417,7 +477,7 @@ identity=google_identity()
 bootstrap_admin(identity)
 user_row=one("SELECT * FROM users WHERE lower(email)=?",(identity['email'],)) if identity else None
 if not user_row or not user_row['active']:
-    st.title("🔒 Acceso no autorizado")
+    page_header("Acceso no autorizado", "La cuenta actual no tiene permisos activos para usar el sistema.")
     if identity:
         st.write(f"La cuenta **{identity['email']}** no tiene acceso activo a Inventario La Ramona.")
     st.caption("Solicita al administrador que autorice o reactive este correo.")
@@ -428,17 +488,25 @@ user=dict(user_row)
 ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']))
 
 with st.sidebar:
-    st.markdown(f"### {user['name']}")
+    st.image(LOGO_PATH, width=185)
+    st.markdown("---")
+    st.markdown(f"**{user['name']}**")
     st.caption(f"{user['role']} · {user['email']}")
-    pages=['Apertura','Cierre','Recibir pedido','Trasladar productos']
-    if user['role'] in ('MANAGER','ADMIN'): pages += ['POS / Ventas','Dashboard','Abastecimiento','Reporte PDF']
+    if user['role'] in ('MANAGER','ADMIN'):
+        pages=['Dashboard','Apertura','Cierre','Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
+    else:
+        pages=['Apertura','Cierre','Recibir pedido','Trasladar productos']
     if user['role']=='ADMIN': pages += ['Administración']
-    page=st.radio("Menú",pages)
+    icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
+    display=[f"{icons.get(p,'•')}  {p}" for p in pages]
+    selected=st.radio("Navegación",display,label_visibility="collapsed")
+    page=pages[display.index(selected)]
+    st.markdown("---")
     if st.button("Cerrar sesión",width="stretch"): st.logout()
 
 # --------------------------- pages ---------------------------
 if page=='Apertura':
-    st.title("Apertura")
+    page_header("Apertura", "Conteo inicial del turno y comparación contra el último cierre.")
     st.caption("Compara el conteo actual con el último cierre. Si no existe cierre anterior, el primer conteo se guarda como línea base y no genera alerta.")
     d=st.date_input("Fecha de apertura",value=date.today())
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
@@ -467,7 +535,7 @@ if page=='Apertura':
         else: save_session('OPENING',counts,d); st.success("Apertura guardada correctamente.")
 
 elif page=='Cierre':
-    st.title("Cierre")
+    page_header("Cierre", "Conteo final, movimientos pendientes y ajustes del día.")
     d=st.date_input("Fecha de cierre",value=date.today())
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
     counts=[]
@@ -510,7 +578,7 @@ elif page=='Cierre':
         st.success("Cierre y movimientos pendientes guardados correctamente.")
 
 elif page=='Recibir pedido':
-    st.title("📦 Recibir pedido")
+    page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
     st.caption("Opción adicional: úsala si puedes registrar el pedido cuando llega. Si no, podrá ingresarse más tarde desde apertura/cierre.")
     d=st.date_input("Fecha de recepción",value=date.today()); supplier=st.text_input("Proveedor"); ref=st.text_input("Factura / referencia (opcional)")
     wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
@@ -528,7 +596,7 @@ elif page=='Recibir pedido':
             st.success(f"Recepción registrada en {dest_name}.")
 
 elif page=='Trasladar productos':
-    st.title("↔️ Trasladar productos")
+    page_header("Trasladar productos", "Registra movimientos de inventario entre bodega y bar.")
     st.caption("Opción adicional para registrar un traslado en el momento. Si no hay tiempo, puede registrarse después como movimiento pendiente.")
     d=st.date_input("Fecha del traslado",value=date.today()); wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
     ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]; n=int(st.number_input("Número de productos trasladados",1,50,1)); mp={product_label(p):p for p in ps}; rows=[]
@@ -542,7 +610,7 @@ elif page=='Trasladar productos':
             st.success("Traslado registrado.")
 
 elif page=='POS / Ventas':
-    st.title("POS / Ventas")
+    page_header("POS / Ventas", "Registra ventas para calcular el consumo teórico por recetas y productos.")
     st.caption("Puedes registrar ventas por día. La carga masiva desde Excel se encuentra en Administración.")
     d=st.date_input("Fecha de ventas",value=date.today()); typ=st.selectbox("Tipo",['Cóctel','Shot','Cerveza','Botella de licor'])
     cid=pid=None; ozunit=None
@@ -560,7 +628,7 @@ elif page=='POS / Ventas':
             st.success("Venta guardada.")
 
 elif page=='Dashboard':
-    st.title("📊 Dashboard gerencial")
+    page_header("Dashboard Gerencial", "Resumen ejecutivo del inventario, consumo, diferencias y abastecimiento.")
     period=st.selectbox("Periodo",['Hoy','7 días','14 días','28 días','Personalizado'],index=1)
     if period=='Hoy': d1=d2=date.today()
     elif period=='7 días': d2=date.today(); d1=d2-timedelta(days=6)
@@ -602,7 +670,7 @@ elif page=='Dashboard':
 
     st.caption("Exactitud = cercanía entre consumo físico y consumo explicado por POS/recetas/ajustes. El costo de diferencias aparece cuando se registre el costo por botella/unidad.")
 
-    st.subheader("🚨 Alertas prioritarias")
+    st.markdown('<div class="ramona-section">🚨 Alertas importantes</div>', unsafe_allow_html=True)
     if alerts:
         for r in sorted(alerts,key=lambda x:(-abs(x['Diferencia no explicada']),-x['Alertas apertura']))[:8]:
             unit=r['_unit']; diff=r['Diferencia no explicada']
@@ -610,7 +678,7 @@ elif page=='Dashboard':
     else:
         st.success("No hay alertas de inventario para el periodo seleccionado.")
 
-    st.subheader("📦 Resumen por producto")
+    st.markdown('<div class="ramona-section">📦 Resumen por producto</div>', unsafe_allow_html=True)
     show=[]
     for r in with_data:
         p=r['_p']
@@ -635,7 +703,7 @@ elif page=='Dashboard':
         if topd:
             st.dataframe(pd.DataFrame([{'Producto':r['Producto'],'Diferencia':f"{r['Diferencia no explicada']:+.2f} {r['_unit']}",'Estado':r['Estado']} for r in topd]),width="stretch",hide_index=True)
 
-    st.subheader("📈 Tendencia: real vs esperado")
+    st.markdown('<div class="ramona-section">📈 Tendencia: consumo real vs esperado</div>', unsafe_allow_html=True)
     t1,t2=st.tabs(["Licores (oz)","Cervezas (unidades)"])
     with t1:
         t=daily_trend(d1,d2,'Licor')
@@ -646,7 +714,7 @@ elif page=='Dashboard':
         if len(t): st.line_chart(t.set_index('Fecha'),width="stretch")
         else: st.info("Sin datos suficientes de cerveza para graficar.")
 
-    st.divider(); st.subheader("Detalle para auditoría")
+    st.divider(); st.markdown('<div class="ramona-section">Detalle para auditoría</div>', unsafe_allow_html=True)
     mode=st.selectbox("Mostrar",['Solo alertas de apertura','Aperturas','Cierres','Ambos'])
     if mode=='Solo alertas de apertura':
         df=pd.read_sql_query("""SELECT s.session_date Fecha,p.name Producto,ROUND(ic.previous_qty,2) 'Cierre anterior',ROUND(ic.qty_base,2) Apertura,ROUND(ic.variance,2) Diferencia,COALESCE(ic.observation,'') Observación,u.name Empleado
@@ -660,7 +728,7 @@ elif page=='Dashboard':
     st.dataframe(df,width="stretch",hide_index=True)
 
 elif page=='Abastecimiento':
-    st.title("📦 Abastecimiento semanal")
+    page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
     st.caption("Consumo en oz para operación y su equivalente en botellas para compras. La recomendación usa consumo real reciente + stock de seguridad − stock disponible.")
     lookback=int(st.selectbox("Histórico para estimar consumo",[14,21,28,42,56],index=2,format_func=lambda x:f"Últimos {x} días")); safety=float(setting('safety_stock_pct','15'))/100
     d2=date.today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
@@ -700,7 +768,7 @@ elif page=='Abastecimiento':
     st.caption("En licores sin presentación en ml no se genera una compra estimada: primero debe completarse la presentación para convertir oz a botellas con precisión.")
 
 elif page=='Reporte PDF':
-    st.title("Reporte PDF")
+    page_header("Reportes", "Genera un reporte consolidado del período seleccionado.")
     a,b=st.columns(2); d1=a.date_input("Desde",value=date.today()-timedelta(days=6),key='pdf1'); d2=b.date_input("Hasta",value=date.today(),key='pdf2')
     if st.button("Generar reporte consolidado",type="primary"):
         data=[r for r in consolidated(d1,d2) if r['Días completos']>0 or r['Consumo esperado']>0 or r['Ajustes']>0 or r['Alertas apertura']>0]
@@ -713,7 +781,7 @@ elif page=='Reporte PDF':
         st.download_button("Descargar PDF",buf,file_name=f"inventario_la_ramona_{d1}_{d2}.pdf",mime="application/pdf")
 
 elif page=='Administración':
-    st.title("Administración")
+    page_header("Configuración y administración", "Productos, recetas, usuarios, importaciones y parámetros del sistema.")
     t1,t2,t3,t4,t5=st.tabs(['Productos','Cócteles / Recetas','Usuarios','Importar Excel','Configuración'])
     with t1:
         st.subheader("Agregar / actualizar producto")
