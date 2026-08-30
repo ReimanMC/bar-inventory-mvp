@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata
+import sqlite3, hashlib, io, math, re, unicodedata, json, os
 from datetime import datetime, date, timedelta
 import pandas as pd
 from reportlab.lib.pagesizes import letter, landscape
@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.3"):
+def page_header(title, subtitle="", badge="V0.3.4"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -81,6 +81,64 @@ def page_header(title, subtitle="", badge="V0.3.3"):
     </div>
     """, unsafe_allow_html=True)
 
+
+# ---------------------- optional Google Drive backup ----------------------
+def _gdrive_cfg():
+    try:
+        sec=st.secrets.get("gdrive", {})
+        return {"enabled": bool(sec.get("enabled", False)), "folder_id": str(sec.get("folder_id", "")).strip(), "service_account_json": str(sec.get("service_account_json", "")).strip()}
+    except Exception:
+        return {"enabled": False, "folder_id": "", "service_account_json": ""}
+
+def _drive_service():
+    cfg=_gdrive_cfg()
+    if not (cfg["enabled"] and cfg["folder_id"] and cfg["service_account_json"]): return None
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        creds=Credentials.from_service_account_info(json.loads(cfg["service_account_json"]), scopes=["https://www.googleapis.com/auth/drive"])
+        return build("drive","v3",credentials=creds,cache_discovery=False)
+    except Exception:
+        return None
+
+def _find_drive_file(service,name,folder_id):
+    safe=name.replace("'","\\'")
+    res=service.files().list(q=f"name='{safe}' and '{folder_id}' in parents and trashed=false",spaces='drive',fields='files(id,name,modifiedTime)',pageSize=10).execute()
+    files=res.get('files',[]); return files[0] if files else None
+
+def backup_db_to_drive(force=False):
+    service=_drive_service(); cfg=_gdrive_cfg()
+    if not service or not os.path.exists(DB): return False,"Respaldo Drive no configurado"
+    try:
+        from googleapiclient.http import MediaFileUpload
+        folder=cfg['folder_id']
+        for name in ['bar_inventory_v3_latest.db',f"bar_inventory_v3_{date.today().isoformat()}.db"]:
+            media=MediaFileUpload(DB,mimetype='application/octet-stream',resumable=False)
+            found=_find_drive_file(service,name,folder)
+            if found: service.files().update(fileId=found['id'],media_body=media).execute()
+            else: service.files().create(body={'name':name,'parents':[folder]},media_body=media,fields='id').execute()
+        st.session_state['_last_drive_backup']=datetime.now().isoformat(timespec='seconds')
+        return True,"Respaldo actualizado en Google Drive"
+    except Exception as e:
+        st.session_state['_drive_backup_error']=str(e)
+        return False,f"No se pudo respaldar en Drive: {e}"
+
+def restore_db_from_drive_if_missing():
+    if os.path.exists(DB) and os.path.getsize(DB)>0: return
+    service=_drive_service(); cfg=_gdrive_cfg()
+    if not service: return
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        found=_find_drive_file(service,'bar_inventory_v3_latest.db',cfg['folder_id'])
+        if not found: return
+        request=service.files().get_media(fileId=found['id'])
+        fh=io.FileIO(DB,'wb'); dl=MediaIoBaseDownload(fh,request); done=False
+        while not done: _,done=dl.next_chunk()
+        fh.close()
+    except Exception:
+        pass
+
+restore_db_from_drive_if_missing()
 
 # --------------------------- DB ---------------------------
 @st.cache_resource
@@ -93,7 +151,7 @@ con = db()
 
 def q(sql, p=()): return con.execute(sql, p).fetchall()
 def one(sql, p=()): return con.execute(sql, p).fetchone()
-def ex(sql, p=()): con.execute(sql, p); con.commit()
+def ex(sql, p=()): con.execute(sql, p); con.commit(); backup_db_to_drive()
 
 def now_iso(): return datetime.now().isoformat(timespec="seconds")
 def hash_pin(pin): return hashlib.sha256(pin.encode()).hexdigest()
@@ -161,12 +219,13 @@ def init_db():
 
 init_db()
 
-# V0.3.3 migration: preserve bottle-equivalent counts when ml is still pending.
+# V0.3.4 migration: preserve bottle-equivalent counts when ml is still pending.
 def ensure_v033_schema():
     cols={r[1] for r in con.execute("PRAGMA table_info(inventory_counts)").fetchall()}
-    if 'qty_bottle_equiv' not in cols:
-        con.execute("ALTER TABLE inventory_counts ADD COLUMN qty_bottle_equiv REAL")
-        con.commit()
+    if 'qty_bottle_equiv' not in cols: con.execute("ALTER TABLE inventory_counts ADD COLUMN qty_bottle_equiv REAL")
+    mcols={r[1] for r in con.execute("PRAGMA table_info(movements)").fetchall()}
+    if 'qty_bottle_equiv' not in mcols: con.execute("ALTER TABLE movements ADD COLUMN qty_bottle_equiv REAL")
+    con.commit()
 ensure_v033_schema()
 
 # ---------------------- catalog seed from current sheet ----------------------
@@ -290,7 +349,7 @@ def save_session(kind, counts, session_date=None, notes=""):
     for x in counts:
         con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
                        VALUES(?,?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
-    con.commit(); return sid
+    con.commit(); backup_db_to_drive(); return sid
 
 def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
     if p['category']=='Cerveza':
@@ -335,16 +394,29 @@ def backfill_product_bottle_counts(pid):
         return
     boz=float(p['bottle_ml'])/ML_PER_OZ
     con.execute("UPDATE inventory_counts SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
-    con.commit()
+    con.execute("UPDATE movements SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
+    con.commit(); backup_db_to_drive()
 
 def movement_qty_input(p,key,label="Cantidad"):
-    step=1.0 if p['category']=='Cerveza' else .25
-    return float(st.number_input(f"{label} ({unit_label(p)})",min_value=0.0,step=step,key=key))
+    if p['category']=='Cerveza':
+        units=float(st.number_input(f"{label} · unidades / botellas",min_value=0,value=0,step=1,key=key+'u'))
+        return {'base':units,'bottles':None}
+    fractions=[0.0,0.25,0.50,0.75]
+    c1,c2=st.columns([1.2,1])
+    full=int(c1.number_input(f"{label} · botellas completas",min_value=0,value=0,step=1,key=key+'f'))
+    frac=float(c2.selectbox("Fracción botella abierta",fractions,index=0,format_func=lambda x:{0.0:'0 (sin abierta)',0.25:'0.25 · ¼',0.5:'0.50 · ½',0.75:'0.75 · ¾'}[x],key=key+'q'))
+    bottles=full+frac; boz=bottle_oz(p)
+    if boz:
+        base=bottles*boz; st.caption(f"Movimiento: {bottles:.2f} botellas · {p['bottle_ml']:.0f} ml/botella · {base:.2f} oz")
+    else:
+        base=0.0
+        if bottles>0: st.caption(f"Movimiento: {bottles:.2f} botellas · ml pendiente; se convertirán a oz cuando se complete la presentación.")
+    return {'base':base,'bottles':bottles}
 
-def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None):
-    con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",((d or date.today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso()))
-    con.commit()
+def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None):
+    con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or date.today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
+    con.commit(); backup_db_to_drive()
 
 def session_qty(d, pid, kind, lid):
     r=one("""SELECT ic.qty_base FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
@@ -503,7 +575,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.3.3 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.3.4 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -605,25 +677,25 @@ elif page=='Cierre':
         n=int(st.number_input("Número de productos recibidos",1,30,1,key='cl_sup_n')); supplier=st.text_input("Proveedor (opcional)",key='cl_sup_name'); ref=st.text_input("Factura / referencia (opcional)",key='cl_sup_ref')
         mp={product_label(p):p for p in ps}
         for i in range(n):
-            nm=st.selectbox(f"Producto recibido {i+1}",list(mp),key=f'cl_sup_p{i}'); p=mp[nm]; qty=movement_qty_input(p,f'cl_sup_q{i}')
-            if qty>0: pending.append(('SUPPLIER',p['id'],qty,None,wh,supplier,ref,''))
+            nm=st.selectbox(f"Producto recibido {i+1}",list(mp),key=f'cl_sup_p{i}'); p=mp[nm]; mv=movement_qty_input(p,f'cl_sup_q{i}')
+            if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append(('SUPPLIER',p['id'],mv['base'],mv['bottles'],None,wh,supplier,ref,''))
     if st.toggle("¿Hoy se trasladaron productos de bodega al bar que aún no han sido registrados?"):
         n=int(st.number_input("Número de productos trasladados",1,30,1,key='cl_tr_n')); mp={product_label(p):p for p in ps}
         for i in range(n):
-            nm=st.selectbox(f"Producto trasladado {i+1}",list(mp),key=f'cl_tr_p{i}'); p=mp[nm]; qty=movement_qty_input(p,f'cl_tr_q{i}')
-            if qty>0: pending.append(('TRANSFER',p['id'],qty,wh,bar,None,None,''))
+            nm=st.selectbox(f"Producto trasladado {i+1}",list(mp),key=f'cl_tr_p{i}'); p=mp[nm]; mv=movement_qty_input(p,f'cl_tr_q{i}')
+            if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append(('TRANSFER',p['id'],mv['base'],mv['bottles'],wh,bar,None,None,''))
     if st.toggle("¿Hoy se realizaron pruebas, hubo desperdicios o se dieron cortesías?"):
         n=int(st.number_input("¿Cuántos registros necesitas ingresar?",1,30,1,key='cl_adj_n')); mp={product_label(p):p for p in ps}
         for i in range(n):
             c1,c2=st.columns([1,2]); typ=c1.selectbox(f"Tipo {i+1}",['Prueba','Desperdicio','Cortesía'],key=f'cl_adj_t{i}'); nm=c2.selectbox(f"Producto {i+1}",list(mp),key=f'cl_adj_p{i}'); p=mp[nm]
-            qty=movement_qty_input(p,f'cl_adj_q{i}'); obs=st.text_input(f"Observación {i+1} (opcional)",key=f'cl_adj_o{i}')
+            mv=movement_qty_input(p,f'cl_adj_q{i}'); obs=st.text_input(f"Observación {i+1} (opcional)",key=f'cl_adj_o{i}')
             typdb={'Prueba':'PRUEBA','Desperdicio':'DESPERDICIO','Cortesía':'CORTESIA'}[typ]
-            if qty>0: pending.append((typdb,p['id'],qty,bar,None,None,None,obs))
+            if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append((typdb,p['id'],mv['base'],mv['bottles'],bar,None,None,None,obs))
     notes=st.text_area("Observaciones generales (opcional)")
     if st.button("Guardar cierre",type="primary",width="stretch"):
         save_session('CLOSING',counts,d,notes)
-        for typ,pid,qty,fr,to,sup,ref,obs in pending:
-            create_movement(typ,pid,qty,fr,to,sup,ref,obs,d)
+        for typ,pid,qty,beq,fr,to,sup,ref,obs in pending:
+            create_movement(typ,pid,qty,fr,to,sup,ref,obs,d,bottle_equiv=beq)
         st.success("Cierre y movimientos pendientes guardados correctamente.")
 
 elif page=='Recibir pedido':
@@ -635,13 +707,13 @@ elif page=='Recibir pedido':
     dest=wh if dest_name=='Bodega' else bar
     ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]; n=int(st.number_input("Número de productos recibidos",1,50,1)); mp={product_label(p):p for p in ps}; rows=[]
     for i in range(n):
-        nm=st.selectbox(f"Producto {i+1}",list(mp),key=f'rp{i}'); p=mp[nm]; qty=movement_qty_input(p,f'rq{i}')
+        nm=st.selectbox(f"Producto {i+1}",list(mp),key=f'rp{i}'); p=mp[nm]; mv=movement_qty_input(p,f'rq{i}')
         obs=st.text_input(f"Observación {i+1} (opcional)",key=f'ro{i}')
-        if qty>0: rows.append((p['id'],qty,obs))
+        if mv['base']>0 or (mv['bottles'] or 0)>0: rows.append((p['id'],mv['base'],mv['bottles'],obs))
     if st.button("Confirmar recepción",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d)
+            for pid,qty,beq,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d,bottle_equiv=beq)
             st.success(f"Recepción registrada en {dest_name}.")
 
 elif page=='Trasladar productos':
@@ -650,12 +722,12 @@ elif page=='Trasladar productos':
     d=st.date_input("Fecha del traslado",value=date.today()); wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
     ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]; n=int(st.number_input("Número de productos trasladados",1,50,1)); mp={product_label(p):p for p in ps}; rows=[]
     for i in range(n):
-        nm=st.selectbox(f"Producto {i+1}",list(mp),key=f'tp{i}'); p=mp[nm]; qty=movement_qty_input(p,f'tq{i}')
-        if qty>0: rows.append((p['id'],qty))
+        nm=st.selectbox(f"Producto {i+1}",list(mp),key=f'tp{i}'); p=mp[nm]; mv=movement_qty_input(p,f'tq{i}')
+        if mv['base']>0 or (mv['bottles'] or 0)>0: rows.append((p['id'],mv['base'],mv['bottles']))
     if st.button("Confirmar traslado Bodega → Bar",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d)
+            for pid,qty,beq in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d,bottle_equiv=beq)
             st.success("Traslado registrado.")
 
 elif page=='POS / Ventas':
@@ -932,6 +1004,19 @@ elif page=='Administración':
                     con.commit(); st.success(f"Importación terminada. Registros procesados: {imported}"); st.rerun()
             except Exception as e: st.error(f"No se pudo leer el archivo: {e}")
     with t5:
+        st.subheader("Respaldo automático")
+        cfg=_gdrive_cfg()
+        if cfg['enabled'] and cfg['folder_id'] and cfg['service_account_json']:
+            last=st.session_state.get('_last_drive_backup','Aún no realizado en esta sesión')
+            st.success(f"Google Drive configurado · último respaldo: {last}")
+            if st.button("Respaldar ahora en Google Drive",width="stretch"):
+                ok,msg=backup_db_to_drive(force=True); (st.success if ok else st.error)(msg)
+        else:
+            st.warning("Respaldo Drive aún no configurado. La app funciona, pero la base local de Streamlit no debe considerarse almacenamiento permanente.")
+        if os.path.exists(DB):
+            with open(DB,'rb') as fh:
+                st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{date.today().isoformat()}.db",mime="application/octet-stream",width="stretch")
+        st.divider()
         safety=st.number_input("Stock de seguridad para abastecimiento (%)",min_value=0,max_value=100,value=int(float(setting('safety_stock_pct','15'))),step=1)
         tb=st.number_input("Tolerancia cerveza (botellas)",min_value=0.0,value=float(setting('tolerance_beer','1')),step=.5)
         tl=st.number_input("Tolerancia licor (oz)",min_value=0.0,value=float(setting('tolerance_liquor','1')),step=.25)
