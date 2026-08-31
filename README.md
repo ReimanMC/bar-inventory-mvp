@@ -1,4 +1,13 @@
-# Inventario La Ramona — V0.3.8
+# Inventario La Ramona — V0.3.9
+
+
+## Cambio V0.3.9 — actualización de productos más intuitiva
+
+- Se elimina la necesidad de escribir o memorizar el ID interno del producto al actualizar presentación o costo.
+- En **Administración → Productos** ahora se selecciona el producto directamente por nombre, categoría y presentación.
+- Se muestran la presentación y el costo actuales antes de guardar cambios.
+- Los campos de edición se cargan con los valores actuales del producto seleccionado.
+- Se conserva el recálculo automático a oz de conteos históricos por botellas cuando se completa o cambia la presentación en ml.
 
 Actualización enfocada únicamente en permisos de Administración y gestión de recetas. El resto de la V0.3.7 se mantiene sin cambios.
 
@@ -69,6 +78,6 @@ Se conserva el comportamiento de V0.3.7 para:
 
 ## Archivos a actualizar
 
-Para pasar de V0.3.7 a V0.3.8 basta con reemplazar `app.py`.
+Para pasar de V0.3.8 a V0.3.9 basta con reemplazar `app.py`.
 
 `README.md` es solo documentación. No cambian `requirements.txt`, assets ni secrets.
