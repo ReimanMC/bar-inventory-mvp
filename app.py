@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3, hashlib, io, math, re, unicodedata, json, os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -70,7 +71,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.0"):
+def page_header(title, subtitle="", badge="V0.4.1"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -81,6 +82,39 @@ def page_header(title, subtitle="", badge="V0.4.0"):
     </div>
     """, unsafe_allow_html=True)
 
+
+# --------------------------- time zone ---------------------------
+# La base guarda timestamps en UTC. La interfaz siempre los presenta en hora local
+# de Ontario usando la zona IANA, que maneja automáticamente EST/EDT.
+APP_TZ = ZoneInfo("America/Toronto")
+
+def local_now():
+    return datetime.now(APP_TZ)
+
+def local_today():
+    return local_now().date()
+
+def now_iso():
+    # UTC naive por compatibilidad con los registros históricos ya existentes.
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+def to_local_datetime(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(APP_TZ)
+    except Exception:
+        return None
+
+def format_local_time(value, fmt="%I:%M %p"):
+    dt = to_local_datetime(value)
+    return dt.strftime(fmt) if dt else (str(value) if value else "—")
+
+def format_local_datetime(value, fmt="%m-%d %I:%M %p"):
+    return format_local_time(value, fmt)
 
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
@@ -112,12 +146,12 @@ def backup_db_to_drive(force=False):
     try:
         from googleapiclient.http import MediaFileUpload
         folder=cfg['folder_id']
-        for name in ['bar_inventory_v3_latest.db',f"bar_inventory_v3_{date.today().isoformat()}.db"]:
+        for name in ['bar_inventory_v3_latest.db',f"bar_inventory_v3_{local_today().isoformat()}.db"]:
             media=MediaFileUpload(DB,mimetype='application/octet-stream',resumable=False)
             found=_find_drive_file(service,name,folder)
             if found: service.files().update(fileId=found['id'],media_body=media).execute()
             else: service.files().create(body={'name':name,'parents':[folder]},media_body=media,fields='id').execute()
-        st.session_state['_last_drive_backup']=datetime.now().isoformat(timespec='seconds')
+        st.session_state['_last_drive_backup']=local_now().isoformat(timespec='seconds')
         return True,"Respaldo actualizado en Google Drive"
     except Exception as e:
         st.session_state['_drive_backup_error']=str(e)
@@ -153,7 +187,6 @@ def q(sql, p=()): return con.execute(sql, p).fetchall()
 def one(sql, p=()): return con.execute(sql, p).fetchone()
 def ex(sql, p=()): con.execute(sql, p); con.commit(); backup_db_to_drive()
 
-def now_iso(): return datetime.now().isoformat(timespec="seconds")
 def hash_pin(pin): return hashlib.sha256(pin.encode()).hexdigest()
 
 def init_db():
@@ -443,7 +476,7 @@ def last_close(pid, lid, before_or_on=None):
     r=one(sql,ps); return (float(r['qty_base']),r['session_date']) if r else (None,None)
 
 def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY"):
-    d=(session_date or date.today()).isoformat() if hasattr((session_date or date.today()),'isoformat') else str(session_date)
+    d=(session_date or local_today()).isoformat() if hasattr((session_date or local_today()),'isoformat') else str(session_date)
     cur=con.execute("INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle) VALUES(?,?,?,?,?,?)",
                     (d,kind,user['id'],now_iso(),notes,inventory_cycle)); sid=cur.lastrowid
     for x in counts:
@@ -515,7 +548,7 @@ def movement_qty_input(p,key,label="Cantidad"):
 
 def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None):
     con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or date.today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or local_today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
     con.commit(); backup_db_to_drive()
 
 def session_qty(d, pid, kind, lid):
@@ -637,7 +670,7 @@ def daily_trend(d1,d2,category):
     return pd.DataFrame(out)
 
 
-# --------------------------- Dashboard operacional V0.4.0 ---------------------------
+# --------------------------- Dashboard operacional V0.4.1 ---------------------------
 def _latest_count_record(ds, pid, kind, bar_id):
     return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
                         s.created_at,s.inventory_cycle,u.name employee
@@ -693,7 +726,7 @@ def _difference_state(p, diff, registered=True):
     return ('ALERT','🔴 Alerta',diff_text)
 
 def today_inventory_snapshot(target_date=None):
-    target_date=target_date or date.today()
+    target_date=target_date or local_today()
     ds=target_date.isoformat()
     bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
     cycle=_latest_cycle_for_date(ds)
@@ -708,10 +741,16 @@ def today_inventory_snapshot(target_date=None):
         diff=None
         basis=''
         if cl is not None and op is not None:
-            # Conteo esperado al cierre = apertura + entradas - ventas teóricas - ajustes autorizados.
-            expected_stock=float(op['qty_base'] or 0)+transfers_in(ds,p['id'],bar_id)-expected_sales(ds,p['id'],p)-adjustments(ds,p['id'],bar_id)
-            diff=float(cl['qty_base'] or 0)-expected_stock
-            basis='Cierre vs esperado'
+            # Sin presentación en ml no podemos mezclar botellas físicas con consumo teórico en oz.
+            if p['category']=='Licor' and not p['bottle_ml']:
+                expected_stock=None
+                diff=None
+                basis='Cierre registrado · ml pendiente'
+            else:
+                # Conteo esperado al cierre = apertura + entradas - ventas teóricas - ajustes autorizados.
+                expected_stock=float(op['qty_base'] or 0)+transfers_in(ds,p['id'],bar_id)-expected_sales(ds,p['id'],p)-adjustments(ds,p['id'],bar_id)
+                diff=float(cl['qty_base'] or 0)-expected_stock
+                basis='Cierre vs esperado'
         elif op is not None:
             # Para apertura usamos la diferencia ya calculada contra el cierre anterior.
             # En licores sin ml la diferencia puede estar expresada en botellas; no la convertimos de forma ficticia.
@@ -731,7 +770,7 @@ def today_inventory_snapshot(target_date=None):
             'Conteo actual':_count_text(p, float(rec['qty_base']) if rec else None, float(rec['qty_bottle_equiv']) if rec and rec['qty_bottle_equiv'] is not None else None),
             'Esperado':_base_expected_text(p,expected_stock),
             'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente',
-            'Base comparación':basis,'Empleado':rec['employee'] if rec else '—','Hora':(rec['created_at'][11:16] if rec and rec['created_at'] else '—'),
+            'Base comparación':basis,'Empleado':rec['employee'] if rec else '—','Hora':(format_local_time(rec['created_at']) if rec and rec['created_at'] else '—'),
             '_state':state_code,'_diff':diff,'_p':p,'_pid':p['id'],'_registered':registered,
             '_has_opening':op is not None,'_has_closing':cl is not None
         })
@@ -793,7 +832,7 @@ def recent_activity(limit=8):
     items.sort(key=lambda x:x[0],reverse=True)
     out=[]
     for created,employee,action in items[:limit]:
-        try: when=datetime.fromisoformat(created).strftime('%m-%d %H:%M')
+        try: when=format_local_datetime(created)
         except Exception: when=str(created)
         out.append({'Fecha / hora':when,'Usuario':employee,'Acción':action})
     return out
@@ -806,6 +845,12 @@ def period_inventory_performance(d1,d2):
     rows=[]
     for p in products():
         if p['category'] not in ('Cerveza','Licor'): continue
+        # Para licor sin ml aún no existe una conversión válida de botellas a oz; no fabricamos diferencias.
+        if p['category']=='Licor' and not p['bottle_ml']:
+            rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':0.0,'Consumo esperado':0.0,
+                         'Ajustes':0.0,'Diferencia':None,'Días completos':0,'Estado':'⏳ Falta ml','_state':'PENDING',
+                         '_p':p,'_diff_text':'—'})
+            continue
         real=expected=adj=0.0; complete=0
         for dd in date_range(d1,d2):
             ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar_id); cl=session_qty(ds,p['id'],'CLOSING',bar_id)
@@ -949,7 +994,7 @@ with st.sidebar:
 # --------------------------- pages ---------------------------
 if page=='Apertura':
     page_header("Apertura", "Conteo inicial del turno con inventario diario o semanal.")
-    d=st.date_input("Fecha de apertura",value=date.today())
+    d=st.date_input("Fecha de apertura",value=local_today())
     cycle_label=st.radio("Tipo de inventario",['Diario','Semanal'],horizontal=True,key='opening_cycle')
     cycle='DAILY' if cycle_label=='Diario' else 'WEEKLY'
     if cycle=='DAILY':
@@ -1000,7 +1045,7 @@ if page=='Apertura':
 
 elif page=='Cierre':
     page_header("Cierre", "Conteo final con inventario diario o semanal y movimientos pendientes.")
-    d=st.date_input("Fecha de cierre",value=date.today())
+    d=st.date_input("Fecha de cierre",value=local_today())
     detected=latest_opening_cycle(d.isoformat())
     options=['Diario','Semanal']; default_idx=1 if detected=='WEEKLY' else 0
     cycle_label=st.radio("Tipo de inventario",options,index=default_idx,horizontal=True,key='closing_cycle')
@@ -1062,7 +1107,7 @@ elif page=='Cierre':
 elif page=='Recibir pedido':
     page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
     st.caption("Opción adicional: úsala si puedes registrar el pedido cuando llega. Si no, podrá ingresarse más tarde desde apertura/cierre.")
-    d=st.date_input("Fecha de recepción",value=date.today()); supplier=st.text_input("Proveedor"); ref=st.text_input("Factura / referencia (opcional)")
+    d=st.date_input("Fecha de recepción",value=local_today()); supplier=st.text_input("Proveedor"); ref=st.text_input("Factura / referencia (opcional)")
     wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
     dest_name=st.selectbox("Destino",['Bodega','Bar'],index=0,disabled=user['role']=='STAFF')
     dest=wh if dest_name=='Bodega' else bar
@@ -1080,7 +1125,7 @@ elif page=='Recibir pedido':
 elif page=='Trasladar productos':
     page_header("Trasladar productos", "Registra movimientos de inventario entre bodega y bar.")
     st.caption("Opción adicional para registrar un traslado en el momento. Si no hay tiempo, puede registrarse después como movimiento pendiente.")
-    d=st.date_input("Fecha del traslado",value=date.today()); wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    d=st.date_input("Fecha del traslado",value=local_today()); wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
     ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]; n=int(st.number_input("Número de productos trasladados",1,50,1)); mp={product_label(p):p for p in ps}; rows=[]
     for i in range(n):
         nm=st.selectbox(f"Producto {i+1}",list(mp),key=f'tp{i}'); p=mp[nm]; mv=movement_qty_input(p,f'tq{i}')
@@ -1094,7 +1139,7 @@ elif page=='Trasladar productos':
 elif page=='POS / Ventas':
     page_header("POS / Ventas", "Registra ventas de cócteles, shots, cervezas y botellas para calcular el consumo teórico.")
     st.caption("Ingresa los totales vendidos del POS por fecha. Shots y cervezas quedan registrados directamente contra el producto correspondiente.")
-    d=st.date_input("Fecha de ventas",value=date.today(),key='pos_date')
+    d=st.date_input("Fecha de ventas",value=local_today(),key='pos_date')
     tab_cocktail,tab_shot,tab_beer,tab_bottle=st.tabs(['🍹 Cócteles','🥃 Shots','🍺 Cervezas','🍾 Botellas de licor'])
 
     with tab_cocktail:
@@ -1193,32 +1238,32 @@ elif page=='Dashboard':
     top_refresh,top_note=st.columns([1,4])
     if top_refresh.button("🔄 Actualizar datos",width='stretch',key='dash_refresh'):
         st.rerun()
-    top_note.caption(f"Última actualización de esta vista: {datetime.now().strftime('%I:%M:%S %p')}")
+    top_note.caption(f"Última actualización de esta vista: {local_now().strftime('%I:%M:%S %p')} · Ontario")
 
     f1,f2,f3=st.columns([1.15,1.45,1.3])
     period=f1.selectbox("Periodo",['Hoy','7 días','Semana','Mes','Personalizado'],index=0,key='dash_period_v4')
     category_view=f2.selectbox("Ver",['General','Licores','Cervezas','Cócteles','Shots'],index=0,key='dash_category_v4')
     status_view=f3.selectbox("Estado",['Todos','Con alerta','Pendientes','OK'],index=0,key='dash_status_v4')
     if period=='Hoy':
-        d1=d2=date.today()
+        d1=d2=local_today()
     elif period=='7 días':
-        d2=date.today(); d1=d2-timedelta(days=6)
+        d2=local_today(); d1=d2-timedelta(days=6)
     elif period=='Semana':
-        d2=date.today(); d1=d2-timedelta(days=d2.weekday())
+        d2=local_today(); d1=d2-timedelta(days=d2.weekday())
     elif period=='Mes':
-        d2=date.today(); d1=d2.replace(day=1)
+        d2=local_today(); d1=d2.replace(day=1)
     else:
         a,b=st.columns(2)
-        d1=a.date_input("Desde",value=date.today()-timedelta(days=6),key='dash1_v4')
-        d2=b.date_input("Hasta",value=date.today(),key='dash2_v4')
+        d1=a.date_input("Desde",value=local_today()-timedelta(days=6),key='dash1_v4')
+        d2=b.date_input("Hasta",value=local_today(),key='dash2_v4')
     if d2<d1:
         st.error("La fecha final no puede ser anterior a la inicial."); st.stop()
 
-    today_snapshot,cycle=today_inventory_snapshot(date.today())
+    today_snapshot,cycle=today_inventory_snapshot(local_today())
     total_required,registered_today,open_done,close_done,inventory_state=_inventory_progress_today(today_snapshot)
     current_alerts=[r for r in today_snapshot if r['_state']=='ALERT']
     current_reviews=[r for r in today_snapshot if r['_state']=='REVIEW']
-    last_act=_last_inventory_activity(date.today().isoformat())
+    last_act=_last_inventory_activity(local_today().isoformat())
 
     beer_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cerveza' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
     cocktails_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cóctel' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
@@ -1259,7 +1304,7 @@ elif page=='Dashboard':
             {'Área':'Cierre','Estado':closing_txt},
         ]
         if last_act:
-            status_rows.append({'Área':'Último registro','Estado':f"{last_act['employee']} · {last_act['created_at'][11:16]}"})
+            status_rows.append({'Área':'Último registro','Estado':f"{last_act['employee']} · {format_local_time(last_act['created_at'])}"})
         st.dataframe(pd.DataFrame(status_rows),width='stretch',hide_index=True)
     with s2:
         st.markdown('<div class="ramona-section">🚨 Alertas prioritarias</div>',unsafe_allow_html=True)
@@ -1402,13 +1447,15 @@ elif page=='Dashboard':
                                 JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
                                 WHERE s.session_date BETWEEN ? AND ? AND s.session_type IN ({placeholders})
                                 ORDER BY s.created_at DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat(),*types))
+    if not df.empty and 'Hora' in df.columns:
+        df['Hora']=df['Hora'].apply(lambda x: format_local_datetime(x, '%Y-%m-%d %I:%M %p'))
     st.dataframe(df,width='stretch',hide_index=True)
 
 elif page=='Abastecimiento':
     page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
     st.caption("Consumo en oz para operación y su equivalente en botellas para compras. La recomendación usa consumo real reciente + stock de seguridad − stock disponible.")
     lookback=int(st.selectbox("Histórico para estimar consumo",[14,21,28,42,56],index=2,format_func=lambda x:f"Últimos {x} días")); safety=float(setting('safety_stock_pct','15'))/100
-    d2=date.today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
+    d2=local_today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     rows=[]; products_to_buy=0; total_buy_units=0
     for r in data:
         p=r['_p']; complete=max(r['Días completos'],0)
@@ -1446,7 +1493,7 @@ elif page=='Abastecimiento':
 
 elif page=='Reporte PDF':
     page_header("Reportes", "Genera un reporte consolidado del período seleccionado.")
-    a,b=st.columns(2); d1=a.date_input("Desde",value=date.today()-timedelta(days=6),key='pdf1'); d2=b.date_input("Hasta",value=date.today(),key='pdf2')
+    a,b=st.columns(2); d1=a.date_input("Desde",value=local_today()-timedelta(days=6),key='pdf1'); d2=b.date_input("Hasta",value=local_today(),key='pdf2')
     if st.button("Generar reporte consolidado",type="primary"):
         data=[r for r in consolidated(d1,d2) if r['Días completos']>0 or r['Consumo esperado']>0 or r['Ajustes']>0 or r['Alertas apertura']>0]
         buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(letter),leftMargin=24,rightMargin=24,topMargin=24,bottomMargin=24); sty=getSampleStyleSheet()
@@ -1702,6 +1749,8 @@ elif page=='Administración':
                     ex("INSERT INTO users(name,pin_hash,email,role,active,created_at) VALUES(?,?,?,?,1,?)",(candidate,'',email,role,now_iso()))
                     st.success("Correo autorizado. Ya puede entrar con Google."); st.rerun()
         users_df=pd.read_sql_query("SELECT id ID,name Nombre,email Email,CASE role WHEN 'GENERAL_MANAGER' THEN 'MANAGER GENERAL' ELSE role END Rol,CASE active WHEN 1 THEN 'Activo' ELSE 'Bloqueado' END Estado,last_login_at 'Último acceso' FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY active DESC,role,name",con)
+        if not users_df.empty and 'Último acceso' in users_df.columns:
+            users_df['Último acceso']=users_df['Último acceso'].apply(lambda x: format_local_datetime(x, '%Y-%m-%d %I:%M %p') if pd.notna(x) and x else '—')
         st.dataframe(users_df,width="stretch",hide_index=True)
         if is_owner:
             manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY name")
@@ -1767,7 +1816,7 @@ elif page=='Administración':
             st.warning("Respaldo Drive aún no configurado. La app funciona, pero la base local de Streamlit no debe considerarse almacenamiento permanente.")
         if os.path.exists(DB):
             with open(DB,'rb') as fh:
-                st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{date.today().isoformat()}.db",mime="application/octet-stream",width="stretch")
+                st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{local_today().isoformat()}.db",mime="application/octet-stream",width="stretch")
         st.divider()
         if user['role']=='ADMIN':
             st.subheader("Inicio de operación / limpiar datos históricos")
