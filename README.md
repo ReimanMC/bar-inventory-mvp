@@ -169,3 +169,12 @@ Se conservan sin modificación funcional:
 Para pasar de V0.3.9 a V0.4.0 basta con reemplazar `app.py`.
 
 `README.md` actualiza la documentación. No cambian `requirements.txt`, assets ni secrets.
+
+
+## V0.4.1 — Zona horaria Ontario
+
+- Corrige las horas mostradas en Dashboard, actividad reciente, inventario y auditoría para usar `America/Toronto`.
+- Los timestamps siguen almacenándose internamente en UTC para mantener consistencia.
+- La conversión maneja automáticamente horario de verano/invierno (EDT/EST).
+- Las fechas predeterminadas de Apertura, Cierre, POS, movimientos, Dashboard, reportes y backups ahora usan la fecha local de Ontario.
+- No modifica inventarios, recetas, permisos, POS ni lógica de diferencias de V0.4.0.
