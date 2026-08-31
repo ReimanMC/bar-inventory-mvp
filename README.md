@@ -1,46 +1,58 @@
-# Inventario La Ramona — V0.3.2
+# Inventario La Ramona — V0.3.7
 
-MVP de inventario de bar en Streamlit con autenticación Google/OIDC, acceso por correo autorizado, roles, apertura/cierre, proveedores, Bodega → Bar, ajustes operativos, POS/recetas, dashboard gerencial, abastecimiento y reportes.
+Actualización de roles, POS e inventario diario/semanal.
 
-## Seguridad
-- Login con Google.
-- Solo correos autorizados y activos pueden acceder.
-- Roles: STAFF, MANAGER y ADMIN.
-- La cuenta `bootstrap_admin_email` en Streamlit Secrets funciona como Developer/Owner principal.
-- Solo el Developer/Owner puede otorgar rol ADMIN.
-- Usuarios pueden bloquearse/reactivarse sin eliminar su historial.
+## Cambios principales
 
-## V0.3.2
-- Dashboard gerencial con filtros Hoy / 7 / 14 / 28 días / personalizado.
-- KPIs: consumo, exactitud, alertas, mayor diferencia, costo estimado de diferencias y cobertura crítica.
-- Alertas prioritarias, Top consumo, Top diferencias y tendencias real vs esperado.
-- Abastecimiento muestra oz y botellas equivalentes dentro de la misma columna/celda.
-- Compras recomendadas siempre en botellas/unidades enteras.
-- Licores sin presentación en ml quedan marcados y no generan una recomendación engañosa.
-- Consumos negativos no alimentan la estimación de compra.
-- Costo por botella/unidad opcional para calcular el impacto económico de diferencias.
-- Incluye `httpx` requerido por Authlib/Google OAuth.
+### 1. Nuevo rol MANAGER GENERAL
+- Nuevo rol interno: `GENERAL_MANAGER`.
+- Acceso a Dashboard, operación, POS, reportes y Administración.
+- Puede gestionar productos, recetas y usuarios.
+- Puede cambiar usuarios entre `STAFF`, `MANAGER` y `MANAGER GENERAL`.
+- El rol `ADMIN` continúa reservado para la cuenta Developer/Owner configurada.
+- El reinicio total de datos operativos sigue reservado a `ADMIN`.
 
-## Streamlit Secrets
-```toml
-[auth]
-redirect_uri = "https://TU-APP.streamlit.app/oauth2callback"
-cookie_secret = "TU_COOKIE_SECRET"
-client_id = "TU_CLIENT_ID"
-client_secret = "TU_CLIENT_SECRET"
-server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+### 2. Cambio de rol de usuarios
+En **Administración → Usuarios** ahora se puede seleccionar un usuario y cambiar su rol.
 
-[app]
-bootstrap_admin_email = "TU_EMAIL"
-organization_id = "LA_RAMONA"
-organization_name = "La Ramona"
-```
+### 3. POS / Ventas ampliado
+La sección POS ahora muestra pestañas independientes para:
+- Cócteles
+- Shots
+- Cervezas
+- Botellas de licor
 
-Nunca subas `client_secret`, `cookie_secret` ni `secrets.toml` a GitHub.
+Las ventas de shots se convierten a consumo esperado usando las oz por shot. Las cervezas se registran directamente por unidades vendidas.
 
+### 4. Inventario diario y semanal
+Antes de realizar Apertura o Cierre se pregunta el tipo de inventario:
 
-## V0.3.2 — Identidad visual
-- Logo oficial de La Ramona visible en login, encabezado de la app y barra lateral.
-- Tema oscuro con acentos naranja/rojo inspirado en la identidad del bar.
-- Dashboard y navegación con estilo ejecutivo más compacto.
-- Dashboard como pantalla inicial para MANAGER/ADMIN.
+- **Diario:** todas las cervezas + licores principales.
+- **Semanal:** todas las cervezas + todos los licores activos.
+
+Los licores principales iniciales son:
+- Jose Cuervo Silver
+- Jose Cuervo Gold
+- Triple Sec McGuinness
+- Mezcal Ilegal
+- Captain Morgan Dark
+- Captain Morgan White
+- Vodka True
+
+Estos nombres corresponden al catálogo actual. La lista puede modificarse en cualquier momento.
+
+### 5. Licores principales configurables
+En **Administración → Productos → Licores principales del inventario diario** se puede añadir o quitar cualquier licor del conteo diario.
+
+Al crear un nuevo licor también existe la opción **Incluir este licor en el inventario diario**.
+
+### 6. Compatibilidad con la base existente
+La app migra automáticamente la base V0.3.x para añadir:
+- rol `GENERAL_MANAGER`;
+- campo `products.daily_inventory`;
+- campo `inventory_sessions.inventory_cycle`.
+
+No elimina productos, recetas, usuarios ni datos existentes durante esta migración.
+
+## Archivos a actualizar
+Para pasar de V0.3.6 a V0.3.7 solo es necesario reemplazar `app.py`. `requirements.txt`, assets y secrets no cambian.
