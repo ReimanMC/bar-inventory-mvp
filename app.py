@@ -4,9 +4,11 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
 from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether, Image as RLImage
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
@@ -71,7 +73,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.1"):
+def page_header(title, subtitle="", badge="V0.4.4"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -194,7 +196,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL DEFAULT '', email TEXT UNIQUE,
       role TEXT NOT NULL CHECK(role IN ('STAFF','MANAGER','GENERAL_MANAGER','ADMIN')), active INTEGER DEFAULT 1,
-      last_login_at TEXT, created_at TEXT);
+      report_access INTEGER DEFAULT 0, last_login_at TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS categories(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, count_unit TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS products(
@@ -236,6 +238,7 @@ def init_db():
     if "email" not in cols: con.execute("ALTER TABLE users ADD COLUMN email TEXT")
     if "last_login_at" not in cols: con.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
     if "created_at" not in cols: con.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+    if "report_access" not in cols: con.execute("ALTER TABLE users ADD COLUMN report_access INTEGER DEFAULT 0")
     pcols={r[1] for r in con.execute("PRAGMA table_info(products)").fetchall()}
     if "unit_cost" not in pcols: con.execute("ALTER TABLE products ADD COLUMN unit_cost REAL")
     try: con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
@@ -266,9 +269,9 @@ def ensure_v037_schema():
             con.execute("""CREATE TABLE users_new(
               id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL DEFAULT '', email TEXT UNIQUE,
               role TEXT NOT NULL CHECK(role IN ('STAFF','MANAGER','GENERAL_MANAGER','ADMIN')), active INTEGER DEFAULT 1,
-              last_login_at TEXT, created_at TEXT)""")
-            con.execute("""INSERT INTO users_new(id,name,pin_hash,email,role,active,last_login_at,created_at)
-                           SELECT id,name,COALESCE(pin_hash,''),email,role,active,last_login_at,created_at FROM users""")
+              report_access INTEGER DEFAULT 0, last_login_at TEXT, created_at TEXT)""")
+            con.execute("""INSERT INTO users_new(id,name,pin_hash,email,role,active,report_access,last_login_at,created_at)
+                           SELECT id,name,COALESCE(pin_hash,''),email,role,active,COALESCE(report_access,0),last_login_at,created_at FROM users""")
             con.execute("DROP TABLE users")
             con.execute("ALTER TABLE users_new RENAME TO users")
             con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
@@ -670,7 +673,7 @@ def daily_trend(d1,d2,category):
     return pd.DataFrame(out)
 
 
-# --------------------------- Dashboard operacional V0.4.1 ---------------------------
+# --------------------------- Dashboard operacional V0.4.2 ---------------------------
 def _latest_count_record(ds, pid, kind, bar_id):
     return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
                         s.created_at,s.inventory_cycle,u.name employee
@@ -909,6 +912,389 @@ def _status_filter(rows,status):
     if status=='OK': return [r for r in rows if r.get('_state')=='OK']
     return rows
 
+
+def _pdf_clean(value):
+    """Texto seguro para las fuentes base de ReportLab y sin emojis de la interfaz."""
+    if value is None:
+        return "-"
+    txt=str(value)
+    replacements={
+        '—':'-', '–':'-', '·':' - ', '✅':'', '🟢':'', '🟡':'', '🔴':'', '⏳':'', '⚠️':'', '⚠':'',
+        '↑':'', '↓':'', '→':'->', '←':'<-'
+    }
+    for a,b in replacements.items(): txt=txt.replace(a,b)
+    return re.sub(r'\s+',' ',txt).strip() or '-'
+
+
+def _pdf_state_label(code):
+    return {'OK':'OK','REVIEW':'REVISAR','ALERT':'ALERTA','PENDING':'PENDIENTE'}.get(code,_pdf_clean(code).upper())
+
+
+def _report_inventory_status(d1,d2):
+    rows=q("""SELECT session_date,
+                     MAX(CASE WHEN session_type='OPENING' THEN 1 ELSE 0 END) has_opening,
+                     MAX(CASE WHEN session_type='CLOSING' THEN 1 ELSE 0 END) has_closing
+              FROM inventory_sessions
+              WHERE session_date BETWEEN ? AND ?
+              GROUP BY session_date ORDER BY session_date""",(d1.isoformat(),d2.isoformat()))
+    active=len(rows)
+    complete=sum(1 for r in rows if int(r['has_opening'] or 0)==1 and int(r['has_closing'] or 0)==1)
+    if active==0:
+        state='SIN INVENTARIO FISICO'
+    elif complete==active:
+        state='COMPLETO' if active==1 else f'COMPLETO - {complete} DIAS CON ACTIVIDAD'
+    else:
+        state=f'PARCIAL - {complete}/{active} DIAS CON APERTURA + CIERRE'
+    counted=one("""SELECT COUNT(DISTINCT ic.product_id) n
+                   FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+                   WHERE s.session_date BETWEEN ? AND ?""",(d1.isoformat(),d2.isoformat()))['n']
+    latest=one("""SELECT s.session_date,s.session_type,s.created_at,u.name employee,COUNT(ic.id) item_count
+                  FROM inventory_sessions s
+                  LEFT JOIN users u ON u.id=s.user_id
+                  LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                  WHERE s.session_date BETWEEN ? AND ?
+                  GROUP BY s.id ORDER BY s.created_at DESC LIMIT 1""",(d1.isoformat(),d2.isoformat()))
+    return {'state':state,'active_days':active,'complete_days':complete,'products_counted':int(counted or 0),'latest':latest}
+
+
+def _report_accuracy(perf_rows):
+    vals=[]
+    for r in perf_rows:
+        if r['Días completos']<=0 or r['Diferencia'] is None: continue
+        real=abs(float(r['Consumo real'] or 0))
+        if real<=0: continue
+        vals.append(max(0.0,min(100.0,(1.0-abs(float(r['Diferencia']))/real)*100.0)))
+    return (sum(vals)/len(vals)) if vals else None
+
+
+def _report_difference_cost(perf_row):
+    p=perf_row['_p']; cost=p['unit_cost']
+    if cost is None or perf_row['Diferencia'] is None: return None
+    diff=abs(float(perf_row['Diferencia'] or 0))
+    if p['category']=='Cerveza': return diff*float(cost)
+    boz=bottle_oz(p)
+    return (diff/boz*float(cost)) if boz else None
+
+
+def _report_replenishment(perf_rows):
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    wh_id=one("SELECT id FROM locations WHERE name='Bodega'")['id']
+    safety=float(setting('safety_stock_pct','15'))/100
+    rows=[]
+    for r in perf_rows:
+        if r['Días completos']<=0: continue
+        p=r['_p']
+        weekly=max(float(r['Consumo real'] or 0),0)/max(r['Días completos'],1)*7
+        target=weekly*(1+safety)
+        stock=max(current_stock(p['id'],bar_id)+current_stock(p['id'],wh_id),0)
+        need=max(target-stock,0)
+        if need<=0: continue
+        if p['category']=='Licor':
+            boz=bottle_oz(p)
+            buy=(math.ceil(need/boz) if boz else None)
+            action=(f'{buy} botellas' if buy is not None else 'Falta presentación ml')
+        else:
+            buy=math.ceil(need)
+            action=f'{buy} unidades'
+        rows.append({'Producto':p['name'],'Categoría':p['category'],'Necesidad':need,'Stock':stock,
+                     'Comprar':action,'_p':p,'_buy':buy})
+    rows.sort(key=lambda x:(0 if x['_buy'] is None else -x['_buy'],x['Producto']))
+    return rows
+
+
+def _report_observations(perf, inv_status, cocktails, shots, beers, replenishment, total_cost, missing_costs):
+    notes=[]
+    comparable=[r for r in perf if r['Días completos']>0 and r['Diferencia'] is not None]
+    alerts=[r for r in comparable if r['_state']=='ALERT']
+    reviews=[r for r in comparable if r['_state']=='REVIEW']
+    if inv_status['active_days']==0:
+        notes.append('No hay inventario físico registrado en el periodo. El reporte muestra únicamente la información comercial disponible.')
+    elif inv_status['complete_days']==0:
+        notes.append('No existen días con apertura y cierre completos. El consumo físico, las diferencias y la exactitud permanecen pendientes para evitar conclusiones falsas.')
+    elif inv_status['complete_days']<inv_status['active_days']:
+        notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) completo(s) de {inv_status['active_days']} día(s) con actividad. Las métricas físicas usan solo días comparables.")
+    else:
+        notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) con apertura y cierre comparables.")
+    if alerts or reviews:
+        notes.append(f"Se identificaron {len(alerts)} alerta(s) crítica(s) y {len(reviews)} producto(s) para revisar por diferencia de inventario.")
+    elif comparable:
+        notes.append('No se detectaron diferencias por encima de las tolerancias configuradas en los productos comparables.')
+    recipe_alerts=[r for r in cocktails if r['Vendidos']>0 and r['_state']=='ALERT']
+    if recipe_alerts:
+        notes.append(f"Hay {len(recipe_alerts)} cóctel(es) con ventas y sin receta completa; su consumo teórico de licor no puede explicarse correctamente.")
+    if replenishment:
+        notes.append(f"El cálculo de abastecimiento sugiere reponer {len(replenishment)} producto(s) según consumo reciente, stock disponible y margen de seguridad.")
+    if total_cost is not None and total_cost>0:
+        cost_note=f"El costo estimado conocido de las diferencias es ${total_cost:,.2f}."
+        if missing_costs: cost_note += f" {missing_costs} producto(s) con diferencia no tienen costo configurado."
+        notes.append(cost_note)
+    elif missing_costs:
+        notes.append(f"No es posible valorar completamente las diferencias: {missing_costs} producto(s) con diferencia no tienen costo configurado.")
+    if not any(r['Vendidos']>0 for r in cocktails) and not shots and not beers:
+        notes.append('No hay ventas POS registradas en el periodo seleccionado.')
+    return notes[:6]
+
+
+def build_executive_report_pdf(d1,d2):
+    """Genera un PDF gerencial: resumen ejecutivo primero y detalle operativo después."""
+    perf=period_inventory_performance(d1,d2)
+    comparable=[r for r in perf if r['Días completos']>0 and r['Diferencia'] is not None]
+    cocktails=cocktail_sales_summary(d1,d2)
+    shots=shot_sales_summary(d1,d2)
+    beers=beer_sales_summary(d1,d2)
+    inv_status=_report_inventory_status(d1,d2)
+    replenishment=_report_replenishment(perf)
+
+    liquor_rows=[r for r in comparable if r['Categoría']=='Licor']
+    beer_rows=[r for r in comparable if r['Categoría']=='Cerveza']
+    liquor_real=sum(float(r['Consumo real'] or 0) for r in liquor_rows)
+    liquor_expected=sum(float(r['Consumo esperado'] or 0) for r in liquor_rows)
+    beer_real=sum(float(r['Consumo real'] or 0) for r in beer_rows)
+    beer_expected=sum(float(r['Consumo esperado'] or 0) for r in beer_rows)
+    cocktail_sold=sum(float(r['Vendidos'] or 0) for r in cocktails)
+    cocktail_oz=sum(float(r['Consumo teórico'] or 0) for r in cocktails)
+    shot_sold=sum(float(r['Shots vendidos'] or 0) for r in shots)
+    shot_oz=sum(float(r['Consumo teórico'] or 0) for r in shots)
+    beer_pos=sum(float(r['Vendidas'] or 0) for r in beers)
+    accuracy=_report_accuracy(perf)
+    review_count=sum(1 for r in comparable if r['_state'] in ('REVIEW','ALERT'))
+    critical_count=sum(1 for r in comparable if r['_state']=='ALERT')
+
+    cost_values=[]; missing_costs=0
+    for r in comparable:
+        if r['_state'] not in ('REVIEW','ALERT'): continue
+        cv=_report_difference_cost(r)
+        if cv is None: missing_costs+=1
+        else: cost_values.append(cv)
+    total_cost=sum(cost_values) if cost_values else (0.0 if review_count and not missing_costs else None)
+
+    def severity(r):
+        tol=float(setting('tolerance_beer','1')) if r['Categoría']=='Cerveza' else float(setting('tolerance_liquor','1'))
+        return abs(float(r['Diferencia'] or 0))/max(tol,1e-9)
+    attention=sorted([r for r in comparable if r['_state'] in ('REVIEW','ALERT')],key=severity,reverse=True)
+    largest=attention[0] if attention else None
+
+    buf=io.BytesIO()
+    page_w,page_h=landscape(letter)
+    doc=SimpleDocTemplate(buf,pagesize=landscape(letter),leftMargin=26,rightMargin=26,topMargin=28,bottomMargin=28,
+                          title=f"La Ramona - Reporte Ejecutivo {d1} a {d2}",author="Inventario La Ramona")
+    styles=getSampleStyleSheet()
+    title_style=ParagraphStyle('RamonaTitle',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=20,leading=23,textColor=colors.HexColor('#20252b'),spaceAfter=4)
+    subtitle_style=ParagraphStyle('RamonaSub',parent=styles['Normal'],fontName='Helvetica',fontSize=9,leading=12,textColor=colors.HexColor('#626b75'))
+    section_style=ParagraphStyle('RamonaSection',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=11.5,leading=14,textColor=colors.HexColor('#d94d35'),spaceBefore=8,spaceAfter=5)
+    small_style=ParagraphStyle('RamonaSmall',parent=styles['Normal'],fontName='Helvetica',fontSize=7.3,leading=9.5,textColor=colors.HexColor('#32373d'))
+    body_style=ParagraphStyle('RamonaBody',parent=styles['Normal'],fontName='Helvetica',fontSize=8.5,leading=11,textColor=colors.HexColor('#32373d'))
+    center_style=ParagraphStyle('RamonaCenter',parent=body_style,alignment=TA_CENTER)
+    card_label=ParagraphStyle('CardLabel',parent=small_style,fontName='Helvetica-Bold',fontSize=7.2,textColor=colors.HexColor('#6a737d'),alignment=TA_CENTER)
+    card_value=ParagraphStyle('CardValue',parent=body_style,fontName='Helvetica-Bold',fontSize=13,leading=15,textColor=colors.HexColor('#1b1f23'),alignment=TA_CENTER)
+
+    def P(txt,style=body_style): return Paragraph(_pdf_clean(txt),style)
+    def metric_cell(label,value):
+        return [Paragraph(_pdf_clean(label),card_label),Spacer(1,2),Paragraph(_pdf_clean(value),card_value)]
+    def state_text(r): return _pdf_state_label(r.get('_state'))
+    def diff_text(r):
+        if r.get('Diferencia') is None: return '-'
+        unit='unid' if r['Categoría']=='Cerveza' else 'oz'
+        return f"{float(r['Diferencia']):+.2f} {unit}"
+    def cost_text(r):
+        v=_report_difference_cost(r)
+        return f"${v:,.2f}" if v is not None else '-'
+    def accuracy_text(r):
+        real=abs(float(r['Consumo real'] or 0)); diff=abs(float(r['Diferencia'] or 0)) if r['Diferencia'] is not None else None
+        if not real or diff is None: return '-'
+        return f"{max(0.0,min(100.0,(1-diff/real)*100)):.1f}%"
+
+    def table_style(header_bg='#252a31',font_size=7.2):
+        return TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor(header_bg)),('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTNAME',(0,1),(-1,-1),'Helvetica'),
+            ('FONTSIZE',(0,0),(-1,-1),font_size),('LEADING',(0,0),(-1,-1),font_size+2),
+            ('GRID',(0,0),(-1,-1),0.25,colors.HexColor('#d7dce1')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f7f8fa')]),
+            ('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),
+        ])
+
+    def page_footer(canvas,doc_obj):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor('#d8dde3')); canvas.setLineWidth(.5)
+        canvas.line(26,20,page_w-26,20)
+        canvas.setFillColor(colors.HexColor('#727b86')); canvas.setFont('Helvetica',7)
+        canvas.drawString(26,9,'La Ramona - Reporte Ejecutivo de Inventario')
+        canvas.drawRightString(page_w-26,9,f'Página {doc_obj.page}')
+        canvas.restoreState()
+
+    story=[]
+    # Cabecera
+    header=[]
+    if os.path.exists(LOGO_PATH):
+        try: header.append(RLImage(LOGO_PATH,width=1.55*inch,height=.72*inch))
+        except Exception: header.append(P('LA RAMONA',title_style))
+    else: header.append(P('LA RAMONA',title_style))
+    head_text=[Paragraph('REPORTE EJECUTIVO DE INVENTARIO',title_style),
+               Paragraph(f"Periodo: {d1.strftime('%d/%m/%Y')} al {d2.strftime('%d/%m/%Y')} | Generado: {local_now().strftime('%d/%m/%Y %I:%M %p')}",subtitle_style)]
+    ht=Table([[header[0],head_text]],colWidths=[1.75*inch,8.1*inch])
+    ht.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+    story += [ht,Spacer(1,5)]
+
+    latest=inv_status['latest']
+    latest_txt='Sin registros'
+    if latest:
+        kind='Apertura' if latest['session_type']=='OPENING' else 'Cierre'
+        latest_txt=f"{kind} por {latest['employee'] or 'Usuario'} - {format_local_datetime(latest['created_at'],'%d/%m/%Y %I:%M %p')} - {int(latest['item_count'] or 0)} productos"
+    status_tbl=Table([[P('Estado del periodo',small_style),P(inv_status['state'],ParagraphStyle('st',parent=body_style,fontName='Helvetica-Bold',textColor=colors.HexColor('#d94d35'))),
+                       P('Último registro',small_style),P(latest_txt,small_style)]],colWidths=[1.05*inch,2.15*inch,1.0*inch,5.6*inch])
+    status_tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#fff5ef')),('BOX',(0,0),(-1,-1),.5,colors.HexColor('#efc2ad')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+    story += [status_tbl,Spacer(1,7),Paragraph('Indicadores clave',section_style)]
+
+    physical_available=inv_status['complete_days']>0
+    largest_txt='Sin diferencias'
+    if largest:
+        largest_txt=f"{largest['Producto']} ({diff_text(largest)})"
+    kpis=[
+        ('Consumo licor',f'{liquor_real:.1f} oz' if physical_available and liquor_rows else 'Pendiente'),
+        ('Cervezas consumidas',f'{beer_real:.0f} unid' if physical_available and beer_rows else 'Pendiente'),
+        ('Cócteles vendidos',f'{cocktail_sold:.0f}'),
+        ('Shots vendidos',f'{shot_sold:.0f}'),
+        ('Exactitud promedio',f'{accuracy:.1f}%' if accuracy is not None else 'Sin datos'),
+        ('Productos con diferencia',str(review_count) if physical_available else 'Pendiente'),
+        ('Alertas críticas',str(critical_count) if physical_available else 'Pendiente'),
+        ('Costo estimado diferencias',f'${total_cost:,.2f}' if total_cost is not None else 'Sin datos'),
+    ]
+    card_rows=[]
+    for i in range(0,len(kpis),4):
+        row=[]
+        for label,value in kpis[i:i+4]:
+            nested=Table([[Paragraph(_pdf_clean(label),card_label)],[Paragraph(_pdf_clean(value),card_value)]],colWidths=[2.42*inch])
+            nested.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#f5f6f8')),('BOX',(0,0),(-1,-1),.45,colors.HexColor('#d9dee4')),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+            row.append(nested)
+        card_rows.append(row)
+    kt=Table(card_rows,colWidths=[2.48*inch]*4)
+    kt.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+    story += [kt,Spacer(1,6)]
+
+    # Resumen comercial / consumo
+    story.append(Paragraph('Resumen comercial y de consumo',section_style))
+    summary_data=[
+        [P('Indicador',small_style),P('Resultado',small_style),P('Indicador',small_style),P('Resultado',small_style)],
+        [P('Consumo físico de licor'),P(f'{liquor_real:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre'),P('Consumo esperado de licor'),P(f'{liquor_expected:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre')],
+        [P('Consumo físico de cerveza'),P(f'{beer_real:.0f} unidades' if physical_available and beer_rows else 'Pendiente de cierre'),P('Cervezas vendidas POS'),P(f'{beer_pos:.0f}')],
+        [P('Cócteles vendidos'),P(f'{cocktail_sold:.0f}'),P('Licor teórico en cócteles'),P(f'{cocktail_oz:.2f} oz')],
+        [P('Shots vendidos'),P(f'{shot_sold:.0f}'),P('Licor teórico en shots'),P(f'{shot_oz:.2f} oz')],
+        [P('Productos contados'),P(f"{inv_status['products_counted']}"),P('Mayor diferencia'),P(largest_txt)],
+        [P('Productos con compra sugerida'),P(f'{len(replenishment)}'),P('Días comparables'),P(f"{inv_status['complete_days']}")],
+    ]
+    stbl=Table(summary_data,colWidths=[1.8*inch,2.0*inch,1.9*inch,4.0*inch],repeatRows=1)
+    stbl.setStyle(table_style('#454b54',7.2)); story += [stbl,Spacer(1,5)]
+
+    story.append(Paragraph('Lectura gerencial',section_style))
+    observations=_report_observations(perf,inv_status,cocktails,shots,beers,replenishment,total_cost,missing_costs)
+    for note in observations:
+        story.append(Paragraph(f"• {_pdf_clean(note)}",body_style))
+
+    # -------- detalle --------
+    story += [PageBreak(),Paragraph('Detalle gerencial y operativo',title_style),Paragraph('Productos con atención prioritaria y detalle de los días físicamente comparables.',subtitle_style),Spacer(1,7)]
+    story.append(Paragraph('Productos que requieren atención',section_style))
+    if attention:
+        att=[['Producto','Tipo','Real','Esperado','Ajustes','Diferencia','Estado','Costo est.']]
+        for r in attention[:10]:
+            unit='unid' if r['Categoría']=='Cerveza' else 'oz'
+            att.append([_pdf_clean(r['Producto']),r['Categoría'],f"{float(r['Consumo real']):.2f} {unit}",f"{float(r['Consumo esperado']):.2f} {unit}",f"{float(r['Ajustes']):.2f} {unit}",diff_text(r),state_text(r),cost_text(r)])
+        t=Table(att,colWidths=[1.55*inch,.62*inch,.83*inch,.87*inch,.72*inch,.85*inch,.72*inch,.78*inch],repeatRows=1)
+        t.setStyle(table_style('#9f3f32',6.8)); story.append(t)
+    else:
+        msg='No hay diferencias calculables todavía.' if not physical_available else 'No hay productos por encima de las tolerancias configuradas.'
+        story.append(P(msg))
+
+    story += [Spacer(1,8),Paragraph('Detalle de inventario comparable',section_style),Paragraph('Solo se calculan consumo, diferencias y exactitud para días con apertura y cierre completos.',subtitle_style),Spacer(1,5)]
+    if comparable:
+        detail=[['Producto','Tipo','Real','Esperado','Ajustes','Diferencia','Exactitud','Estado','Días','Costo est.']]
+        for r in sorted(comparable,key=lambda x:(x['Categoría'],x['Producto'])):
+            unit='unid' if r['Categoría']=='Cerveza' else 'oz'
+            detail.append([_pdf_clean(r['Producto']),r['Categoría'],f"{float(r['Consumo real']):.2f} {unit}",f"{float(r['Consumo esperado']):.2f} {unit}",f"{float(r['Ajustes']):.2f}",diff_text(r),accuracy_text(r),state_text(r),str(r['Días completos']),cost_text(r)])
+        dt=Table(detail,colWidths=[1.55*inch,.6*inch,.82*inch,.82*inch,.62*inch,.82*inch,.7*inch,.66*inch,.4*inch,.7*inch],repeatRows=1)
+        dt.setStyle(table_style('#252a31',6.6)); story.append(dt)
+    else:
+        story.append(P('No hay días comparables de apertura + cierre en el periodo seleccionado.'))
+
+    story += [Spacer(1,9),Paragraph('Ventas POS y consumo teórico',section_style)]
+    sales_summary=[['Categoría','Ventas','Consumo teórico / referencia','Producto más vendido']]
+    cocktail_top=next((r for r in cocktails if r['Vendidos']>0),None)
+    shot_top=shots[0] if shots else None
+    beer_top=beers[0] if beers else None
+    sales_summary.append(['Cócteles',f'{cocktail_sold:.0f}',f'{cocktail_oz:.2f} oz de licor',cocktail_top['Cóctel'] if cocktail_top else '-'])
+    sales_summary.append(['Shots',f'{shot_sold:.0f}',f'{shot_oz:.2f} oz de licor',shot_top['Licor'] if shot_top else '-'])
+    sales_summary.append(['Cervezas',f'{beer_pos:.0f}','Unidades POS',beer_top['Cerveza'] if beer_top else '-'])
+    sat=Table(sales_summary,colWidths=[1.4*inch,1.0*inch,2.0*inch,5.25*inch],repeatRows=1); sat.setStyle(table_style('#454b54',7.3)); story.append(sat)
+
+    if any(r['Vendidos']>0 for r in cocktails):
+        story += [Spacer(1,7),Paragraph('Cócteles vendidos',section_style)]
+        ctbl=[['Cóctel','Vendidos','Oz licor/receta','Consumo teórico','Estado']]
+        for r in [x for x in cocktails if x['Vendidos']>0][:25]:
+            ctbl.append([r['Cóctel'],f"{r['Vendidos']:.0f}",f"{r['Oz licor / cóctel']:.2f}" if r['Oz licor / cóctel'] is not None else '-',f"{r['Consumo teórico']:.2f} oz",_pdf_state_label(r['_state'])])
+        ct=Table(ctbl[:13],colWidths=[2.8*inch,1.0*inch,1.25*inch,1.35*inch,3.25*inch],repeatRows=1); ct.setStyle(table_style('#7c4a3b',7));
+        story[-1:]=[KeepTogether([Paragraph('Cócteles vendidos',section_style),ct])]
+
+    if shots:
+        story += [Spacer(1,7),Paragraph('Shots vendidos',section_style)]
+        sht=[['Licor','Shots','Oz promedio','Consumo teórico']]
+        for r in shots[:25]: sht.append([r['Licor'],f"{r['Shots vendidos']:.0f}",f"{r['Oz / shot promedio']:.2f}",f"{r['Consumo teórico']:.2f} oz"])
+        sh=Table(sht[:13],colWidths=[3.2*inch,1.2*inch,1.4*inch,3.8*inch],repeatRows=1); sh.setStyle(table_style('#7c4a3b',7));
+        story[-1:]=[KeepTogether([Paragraph('Shots vendidos',section_style),sh])]
+
+    if beers:
+        story += [Spacer(1,7),Paragraph('Cervezas vendidas',section_style)]
+        bt=[['Cerveza','Unidades vendidas']]+[[r['Cerveza'],f"{r['Vendidas']:.0f}"] for r in beers[:30]]
+        btb=Table(bt[:11],colWidths=[5.5*inch,4.1*inch],repeatRows=1); btb.setStyle(table_style('#7c4a3b',7));
+        story[-1:]=[KeepTogether([Paragraph('Cervezas vendidas',section_style),btb])]
+
+    story += [Spacer(1,12),Paragraph('Abastecimiento y trazabilidad',title_style),Paragraph('Resumen de reposición sugerida y sesiones de inventario del periodo.',subtitle_style),Spacer(1,8)]
+    story.append(Paragraph('Abastecimiento sugerido',section_style))
+    if replenishment:
+        rt=[['Producto','Tipo','Stock actual','Necesidad estimada','Compra sugerida']]
+        for r in replenishment[:30]:
+            p=r['_p']
+            stock=oz_and_bottles_text(p,r['Stock']).replace('\n',' / ')
+            need=oz_and_bottles_text(p,r['Necesidad']).replace('\n',' / ')
+            rt.append([r['Producto'],r['Categoría'],stock,need,r['Comprar']])
+        rtb=Table(rt,colWidths=[2.4*inch,.8*inch,1.9*inch,1.9*inch,2.6*inch],repeatRows=1); rtb.setStyle(table_style('#355c4d',7)); story.append(rtb)
+    else:
+        story.append(P('No hay una recomendación de compra calculable con los días completos del periodo.'))
+
+    story += [PageBreak(),Paragraph('Trazabilidad operativa',title_style),Paragraph('Sesiones de inventario y movimientos registrados dentro del periodo seleccionado.',subtitle_style),Spacer(1,8),Paragraph('Sesiones de inventario',section_style)]
+    sessions=q("""SELECT s.session_date,s.session_type,s.inventory_cycle,s.created_at,u.name employee,COUNT(ic.id) item_count
+                  FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                  LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                  WHERE s.session_date BETWEEN ? AND ?
+                  GROUP BY s.id ORDER BY s.session_date,s.created_at""",(d1.isoformat(),d2.isoformat()))
+    if sessions:
+        it=[['Fecha','Tipo','Ciclo','Empleado','Hora local','Productos']]
+        for r in sessions:
+            it.append([r['session_date'],'Apertura' if r['session_type']=='OPENING' else 'Cierre','Semanal' if r['inventory_cycle']=='WEEKLY' else 'Diario',r['employee'] or 'Usuario',format_local_time(r['created_at']),str(int(r['item_count'] or 0))])
+        itt=Table(it,colWidths=[1.1*inch,1.0*inch,1.0*inch,2.2*inch,1.3*inch,3.0*inch],repeatRows=1); itt.setStyle(table_style('#454b54',7)); story.append(itt)
+    else:
+        story.append(P('No hay sesiones de inventario en el periodo.'))
+
+    story += [Spacer(1,8),Paragraph('Movimientos registrados',section_style)]
+    movements=q("""SELECT m.movement_date,m.movement_type,p.name product,c.name category,m.qty_base,m.qty_bottle_equiv,u.name employee,m.created_at
+                   FROM movements m JOIN products p ON p.id=m.product_id JOIN categories c ON c.id=p.category_id
+                   LEFT JOIN users u ON u.id=m.user_id
+                   WHERE m.movement_date BETWEEN ? AND ? ORDER BY m.created_at DESC LIMIT 50""",(d1.isoformat(),d2.isoformat()))
+    if movements:
+        labels={'SUPPLIER':'Proveedor','TRANSFER':'Traslado','PRUEBA':'Prueba','DESPERDICIO':'Desperdicio','CORTESIA':'Cortesía'}
+        mt=[['Fecha','Movimiento','Producto','Cantidad','Empleado','Hora']]
+        for r in movements:
+            if r['category']=='Cerveza': qty=f"{float(r['qty_base'] or 0):.0f} unid"
+            elif r['qty_bottle_equiv'] is not None: qty=f"{float(r['qty_bottle_equiv']):.2f} bot / {float(r['qty_base'] or 0):.2f} oz"
+            else: qty=f"{float(r['qty_base'] or 0):.2f} oz"
+            mt.append([r['movement_date'],labels.get(r['movement_type'],r['movement_type']),r['product'],qty,r['employee'] or 'Usuario',format_local_time(r['created_at'])])
+        mtt=Table(mt,colWidths=[.9*inch,1.1*inch,2.3*inch,1.5*inch,2.1*inch,1.7*inch],repeatRows=1); mtt.setStyle(table_style('#454b54',6.8)); story.append(mtt)
+    else:
+        story.append(P('No hay movimientos registrados en el periodo.'))
+
+    doc.build(story,onFirstPage=page_footer,onLaterPages=page_footer)
+    buf.seek(0)
+    return buf
+
 # --------------------------- Google authentication ---------------------------
 def secret_value(section, key, default=""):
     try:
@@ -917,6 +1303,17 @@ def secret_value(section, key, default=""):
         return default
 
 def normalized_email(v): return (v or "").strip().lower()
+
+def is_developer_user(user):
+    """Identifica la cuenta Developer/Owner configurada en Streamlit Secrets."""
+    dev_email=normalized_email(secret_value("app","bootstrap_admin_email"))
+    return bool(dev_email and user and normalized_email(user.get("email")) == dev_email)
+
+def can_download_executive_report(user):
+    """Developer/Owner siempre puede descargar; otros usuarios requieren autorización individual."""
+    if is_developer_user(user):
+        return True
+    return bool(user and int(user.get("active",0) or 0)==1 and int(user.get("report_access",0) or 0)==1)
 
 def google_identity():
     if not st.user.is_logged_in:
@@ -934,21 +1331,21 @@ def bootstrap_admin(identity):
         return
     u=one("SELECT * FROM users WHERE lower(email)=?",(admin_email,))
     if u:
-        ex("UPDATE users SET active=1,role='ADMIN',last_login_at=? WHERE id=?",(now_iso(),u['id']))
+        ex("UPDATE users SET active=1,role='ADMIN',report_access=1,last_login_at=? WHERE id=?",(now_iso(),u['id']))
         return
     legacy=one("SELECT * FROM users WHERE name='Admin' AND (email IS NULL OR email='') ORDER BY id LIMIT 1")
     if legacy:
-        ex("UPDATE users SET email=?,name=?,role='ADMIN',active=1,last_login_at=?,created_at=COALESCE(created_at,?) WHERE id=?",
+        ex("UPDATE users SET email=?,name=?,role='ADMIN',active=1,report_access=1,last_login_at=?,created_at=COALESCE(created_at,?) WHERE id=?",
            (admin_email,identity['name'] or 'Admin',now_iso(),now_iso(),legacy['id']))
     else:
-        ex("INSERT INTO users(name,pin_hash,email,role,active,last_login_at,created_at) VALUES(?,?,?,?,1,?,?)",
+        ex("INSERT INTO users(name,pin_hash,email,role,active,report_access,last_login_at,created_at) VALUES(?,?,?,?,1,1,?,?)",
            (identity['name'] or admin_email,'',admin_email,'ADMIN',now_iso(),now_iso()))
 
 def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.4.0 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.4.4 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -1492,17 +1889,34 @@ elif page=='Abastecimiento':
     st.caption("En licores sin presentación en ml no se genera una compra estimada: primero debe completarse la presentación para convertir oz a botellas con precisión.")
 
 elif page=='Reporte PDF':
-    page_header("Reportes", "Genera un reporte consolidado del período seleccionado.")
-    a,b=st.columns(2); d1=a.date_input("Desde",value=local_today()-timedelta(days=6),key='pdf1'); d2=b.date_input("Hasta",value=local_today(),key='pdf2')
-    if st.button("Generar reporte consolidado",type="primary"):
-        data=[r for r in consolidated(d1,d2) if r['Días completos']>0 or r['Consumo esperado']>0 or r['Ajustes']>0 or r['Alertas apertura']>0]
-        buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(letter),leftMargin=24,rightMargin=24,topMargin=24,bottomMargin=24); sty=getSampleStyleSheet()
-        story=[Paragraph("INVENTARIO LA RAMONA — REPORTE CONSOLIDADO",sty['Title']),Paragraph(f"Periodo: {d1} a {d2}",sty['Normal']),Spacer(1,10)]
-        tbl=[["Producto","Cat.","Inicial","Final","Entradas","Real","Esperado","Ajustes","Diferencia","Alertas","Estado"]]
-        for r in data: tbl.append([r['Producto'],r['Categoría'],f"{r['Inicial']:.2f}" if r['Inicial'] is not None else '—',f"{r['Final']:.2f}" if r['Final'] is not None else '—',f"{r['Entradas al bar']:.2f}",f"{r['Consumo real']:.2f}",f"{r['Consumo esperado']:.2f}",f"{r['Ajustes']:.2f}",f"{r['Diferencia no explicada']:+.2f}",r['Alertas apertura'],r['Estado'].replace('✅','').replace('⚠️','').replace('🔴','')])
-        t=Table(tbl,repeatRows=1,colWidths=[125,45,48,48,48,48,55,48,58,42,55]); t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E8E8E8')),('GRID',(0,0),(-1,-1),.25,colors.grey),('FONTSIZE',(0,0),(-1,-1),7),('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
-        story.append(t); doc.build(story); buf.seek(0)
-        st.download_button("Descargar PDF",buf,file_name=f"inventario_la_ramona_{d1}_{d2}.pdf",mime="application/pdf")
+    page_header("Reporte Ejecutivo", "Resumen gerencial para la propietaria, con métricas de decisión y detalle operativo.")
+    st.caption("La primera página resume el estado del periodo, consumo, ventas POS, exactitud, diferencias, alertas, costo estimado y necesidades de abastecimiento. Si faltan apertura/cierre, el reporte marca las métricas físicas como pendientes en lugar de inventar ceros.")
+    a,b=st.columns(2)
+    d1=a.date_input("Desde",value=local_today()-timedelta(days=6),key='pdf1')
+    d2=b.date_input("Hasta",value=local_today(),key='pdf2')
+    if d2<d1:
+        st.error("La fecha Hasta no puede ser anterior a Desde.")
+    else:
+        inv_preview=_report_inventory_status(d1,d2)
+        p1,p2,p3=st.columns(3)
+        p1.metric("Estado del periodo",inv_preview['state'])
+        p2.metric("Días comparables",inv_preview['complete_days'])
+        p3.metric("Productos contados",inv_preview['products_counted'])
+        can_download_report=can_download_executive_report(user)
+        if can_download_report:
+            if is_developer_user(user):
+                st.caption("🔒 Descarga habilitada para la cuenta Developer/Owner.")
+            else:
+                st.caption("✅ Descarga habilitada: tu cuenta tiene autorización individual para el Reporte Ejecutivo.")
+            if st.button("Generar reporte ejecutivo",type="primary"):
+                try:
+                    buf=build_executive_report_pdf(d1,d2)
+                    st.success("Reporte ejecutivo generado. La primera página está diseñada para toma de decisiones; las páginas siguientes conservan el detalle operativo.")
+                    st.download_button("Descargar Reporte Ejecutivo PDF",buf,file_name=f"la_ramona_reporte_ejecutivo_{d1}_{d2}.pdf",mime="application/pdf",width="stretch")
+                except Exception as e:
+                    st.error(f"No se pudo generar el reporte: {e}")
+        else:
+            st.info("🔒 Tu cuenta no tiene autorización para generar o descargar el Reporte Ejecutivo. El Developer/Owner puede habilitar este permiso individualmente desde Administración → Usuarios.")
 
 elif page=='Administración':
     page_header("Configuración y administración", "Productos, recetas, usuarios, importaciones y parámetros del sistema.")
@@ -1730,7 +2144,11 @@ elif page=='Administración':
         is_owner=normalized_email(user['email'])==owner_email
         assignable_roles=['STAFF','MANAGER','GENERAL_MANAGER','ADMIN'] if is_owner else ['STAFF','MANAGER','GENERAL_MANAGER']
         role=st.selectbox("Rol",assignable_roles,format_func=lambda x:ROLE_LABELS.get(x,x))
-        st.caption("MANAGER y MANAGER GENERAL pueden administrar productos, recetas, usuarios y configuración operativa. El reinicio total sigue reservado a ADMIN. Solo la cuenta Developer/Owner configurada puede otorgar o modificar el rol ADMIN.")
+        report_access_new=False
+        if is_owner:
+            report_access_new=st.checkbox("Autorizar generación y descarga del Reporte Ejecutivo al crear este usuario",value=False,key="new_user_report_access")
+            st.caption("Este permiso es independiente del rol. Para usarlo, el usuario también debe tener acceso a la sección Reporte PDF (MANAGER, MANAGER GENERAL o ADMIN).")
+        st.caption("MANAGER y MANAGER GENERAL pueden administrar productos, recetas, usuarios y configuración operativa. El reinicio total sigue reservado a ADMIN. Solo la cuenta Developer/Owner configurada puede otorgar o modificar el rol ADMIN y autorizar la descarga del Reporte Ejecutivo.")
         if st.button("Autorizar usuario",type="primary",width="stretch"):
             if not email or '@' not in email:
                 st.error("Ingresa un correo válido.")
@@ -1740,22 +2158,25 @@ elif page=='Administración':
                     st.error("Solo la cuenta Developer/Owner puede modificar un usuario ADMIN.")
                 elif existing:
                     ex("UPDATE users SET name=?,role=?,active=1 WHERE id=?",(un.strip() or existing['name'],role,existing['id']))
-                    st.success("Usuario actualizado y activado."); st.rerun()
+                    st.success("Usuario actualizado y activado. El permiso de Reporte Ejecutivo se conserva; puedes cambiarlo abajo en Gestionar usuario."); st.rerun()
                 else:
                     base_name=un.strip() or email.split('@')[0]
                     candidate=base_name; i=2
                     while one("SELECT 1 FROM users WHERE name=?",(candidate,)):
                         candidate=f"{base_name} {i}"; i+=1
-                    ex("INSERT INTO users(name,pin_hash,email,role,active,created_at) VALUES(?,?,?,?,1,?)",(candidate,'',email,role,now_iso()))
+                    ex("INSERT INTO users(name,pin_hash,email,role,active,report_access,created_at) VALUES(?,?,?,?,1,?,?)",(candidate,'',email,role,1 if (is_owner and report_access_new) else 0,now_iso()))
                     st.success("Correo autorizado. Ya puede entrar con Google."); st.rerun()
-        users_df=pd.read_sql_query("SELECT id ID,name Nombre,email Email,CASE role WHEN 'GENERAL_MANAGER' THEN 'MANAGER GENERAL' ELSE role END Rol,CASE active WHEN 1 THEN 'Activo' ELSE 'Bloqueado' END Estado,last_login_at 'Último acceso' FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY active DESC,role,name",con)
-        if not users_df.empty and 'Último acceso' in users_df.columns:
-            users_df['Último acceso']=users_df['Último acceso'].apply(lambda x: format_local_datetime(x, '%Y-%m-%d %I:%M %p') if pd.notna(x) and x else '—')
+        users_df=pd.read_sql_query("SELECT id ID,name Nombre,email Email,CASE role WHEN 'GENERAL_MANAGER' THEN 'MANAGER GENERAL' ELSE role END Rol,CASE active WHEN 1 THEN 'Activo' ELSE 'Bloqueado' END Estado,report_access '_report_access',last_login_at 'Último acceso' FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY active DESC,role,name",con)
+        if not users_df.empty:
+            users_df['Reporte Ejecutivo']=users_df.apply(lambda r: 'Developer/Owner' if normalized_email(r['Email'])==owner_email else ('Autorizado' if int(r['_report_access'] or 0)==1 else 'Sin acceso'),axis=1)
+            users_df=users_df.drop(columns=['_report_access'])
+            if 'Último acceso' in users_df.columns:
+                users_df['Último acceso']=users_df['Último acceso'].apply(lambda x: format_local_datetime(x, '%Y-%m-%d %I:%M %p') if pd.notna(x) and x else '—')
         st.dataframe(users_df,width="stretch",hide_index=True)
         if is_owner:
-            manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY name")
+            manageable=q("SELECT id,name,email,role,active,report_access FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY name")
         else:
-            manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' AND role<>'ADMIN' ORDER BY name")
+            manageable=q("SELECT id,name,email,role,active,report_access FROM users WHERE email IS NOT NULL AND email<>'' AND role<>'ADMIN' ORDER BY name")
         if manageable:
             labels={f"{r['name']} · {r['email']} · {ROLE_LABELS.get(r['role'],r['role'])} · {'Activo' if r['active'] else 'Bloqueado'}":r for r in manageable}
             sel=st.selectbox("Gestionar usuario",list(labels.keys()))
@@ -1777,6 +2198,24 @@ elif page=='Administración':
                 if target['id']==user['id'] and new_role!=target['role']:
                     st.warning("Estás cambiando tu propio rol. El cambio se aplicará inmediatamente al recargar.")
                 ex("UPDATE users SET role=? WHERE id=?",(new_role,target['id'])); st.success("Rol actualizado."); st.rerun()
+
+            if is_owner:
+                st.markdown("#### Acceso al Reporte Ejecutivo")
+                target_is_owner=normalized_email(target['email'])==owner_email
+                current_report_access=True if target_is_owner else bool(int(target['report_access'] or 0))
+                allow_report=st.checkbox(
+                    "Permitir generar y descargar el Reporte Ejecutivo",
+                    value=current_report_access,
+                    disabled=target_is_owner,
+                    key=f"report_access_{target['id']}"
+                )
+                if target_is_owner:
+                    st.caption("La cuenta Developer/Owner siempre tiene acceso y no puede perder este permiso.")
+                else:
+                    st.caption("Permiso individual administrado únicamente por Developer/Owner. Es independiente del rol del usuario.")
+                    if st.button("Guardar acceso al reporte",width="stretch",key=f"save_report_access_{target['id']}"):
+                        ex("UPDATE users SET report_access=? WHERE id=?",(1 if allow_report else 0,target['id']))
+                        st.success("Acceso al Reporte Ejecutivo actualizado."); st.rerun()
     with t4:
         st.subheader("Importar catálogo / recetas / ventas desde Excel")
         st.caption("Carga una exportación .xlsx del Google Sheet. Se importa solo información estructurada; los registros ambiguos se dejan para revisión y no se inventan datos.")
