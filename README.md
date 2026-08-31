@@ -1,4 +1,4 @@
-# Inventario La Ramona — V0.4.0
+# Inventario La Ramona — V0.4.4
 
 ## Dashboard operacional
 
@@ -178,3 +178,111 @@ Para pasar de V0.3.9 a V0.4.0 basta con reemplazar `app.py`.
 - La conversión maneja automáticamente horario de verano/invierno (EDT/EST).
 - Las fechas predeterminadas de Apertura, Cierre, POS, movimientos, Dashboard, reportes y backups ahora usan la fecha local de Ontario.
 - No modifica inventarios, recetas, permisos, POS ni lógica de diferencias de V0.4.0.
+
+
+## V0.4.2 — Reporte Ejecutivo para propietaria
+
+La V0.4.2 reemplaza el reporte PDF consolidado básico por un **Reporte Ejecutivo de Inventario** orientado a toma de decisiones.
+
+### Primera página: resumen gerencial
+
+Incluye:
+
+- Estado del periodo: completo, parcial o sin inventario físico.
+- Último registro de inventario, usuario y hora local de Ontario.
+- Consumo físico de licor en oz cuando existen días comparables.
+- Consumo físico de cerveza en unidades.
+- Cócteles vendidos.
+- Shots vendidos.
+- Exactitud promedio.
+- Productos con diferencia.
+- Alertas críticas.
+- Costo estimado de diferencias cuando existen costos configurados.
+- Productos contados.
+- Mayor diferencia comparable.
+- Productos con compra sugerida.
+- Lectura gerencial automática con los puntos que requieren atención.
+
+### Manejo de inventarios incompletos
+
+El reporte no interpreta como cero la información que todavía no puede calcularse.
+
+Si no existe apertura + cierre completos, las métricas físicas se muestran como **Pendiente** o **Sin datos**, mientras que las ventas POS disponibles continúan visibles. Esto evita generar falsas diferencias o una exactitud engañosa.
+
+### Páginas de detalle
+
+Después del resumen ejecutivo se incluyen:
+
+- Productos con diferencias que requieren atención.
+- Consumo real vs esperado por producto.
+- Ajustes autorizados.
+- Diferencia y exactitud por producto.
+- Costo estimado de la diferencia cuando el costo está configurado.
+- Ventas POS de cócteles, shots y cervezas.
+- Consumo teórico de licor por cócteles y shots.
+- Abastecimiento sugerido.
+- Sesiones de inventario con empleado y hora local.
+- Movimientos registrados en el periodo.
+
+### Diseño del PDF
+
+- Identidad visual de La Ramona.
+- Logo en la portada.
+- Resumen ejecutivo en la primera página.
+- Tablas gerenciales y operativas separadas.
+- Paginación y pie de página.
+- Fechas y horas mostradas en `America/Toronto`.
+
+### Sin cambios a la operación
+
+V0.4.2 modifica únicamente la generación del reporte y su interfaz de descarga. No cambia:
+
+- Apertura o cierre.
+- Dashboard V0.4.x.
+- POS / Ventas.
+- Recetas.
+- Inventario diario o semanal.
+- Productos.
+- Roles y permisos.
+- Abastecimiento de la aplicación.
+- Reinicio operativo.
+- Autenticación Google.
+- Configuración de backup.
+
+## Archivos a actualizar para V0.4.2
+
+Para pasar de V0.4.1 a V0.4.2 basta con reemplazar `app.py`.
+
+`README.md` actualiza la documentación. No cambian `requirements.txt`, assets ni Streamlit Secrets.
+
+
+## V0.4.3 — Descarga de reportes restringida al desarrollador
+
+La descarga del **Reporte Ejecutivo PDF** queda protegida por la identidad de la cuenta configurada en Streamlit Secrets como `app.bootstrap_admin_email`.
+
+- Solo ese correo exacto puede generar y descargar el PDF ejecutivo.
+- `MANAGER`, `MANAGER GENERAL` y otros usuarios `ADMIN` pueden seguir entrando a la sección **Reporte PDF** y consultar el resumen del periodo, pero no ven el botón de generación/descarga.
+- La protección no depende únicamente del rol `ADMIN`; se valida el correo autenticado contra el correo bootstrap del desarrollador.
+- No se requieren cambios en `requirements.txt`, assets ni estructura de base de datos.
+
+Para pasar de V0.4.2 a V0.4.3 basta con reemplazar `app.py`.
+
+## V0.4.4 — Autorización individual para Reporte Ejecutivo
+
+La descarga del **Reporte Ejecutivo PDF** sigue protegida, pero ahora el Developer/Owner puede autorizar usuarios específicos sin cambiar su rol.
+
+- La cuenta configurada en `app.bootstrap_admin_email` mantiene acceso permanente.
+- Se agrega el campo interno `report_access` a la tabla `users` mediante una migración automática y compatible con la base existente.
+- Desde **Administración → Usuarios → Gestionar usuario**, únicamente el Developer/Owner puede activar o revocar el permiso **Permitir generar y descargar el Reporte Ejecutivo**.
+- Al crear un usuario nuevo, el Developer/Owner también puede otorgar el permiso desde el mismo formulario.
+- El permiso es independiente del rol, pero para abrir la sección **Reporte PDF** el usuario debe tener un rol con acceso a esa sección: `MANAGER`, `MANAGER GENERAL` o `ADMIN`.
+- `MANAGER` y `MANAGER GENERAL` pueden seguir administrando usuarios, pero no pueden otorgar ni revocar este permiso especial.
+- En la tabla de usuarios aparece una columna **Reporte Ejecutivo** con los estados `Developer/Owner`, `Autorizado` o `Sin acceso`.
+- No se modifican inventarios, POS, Dashboard, recetas, movimientos, reportes, costos ni reinicio operativo.
+
+### Archivos a actualizar para V0.4.4
+
+Para pasar de V0.4.3 a V0.4.4 basta con reemplazar `app.py`. La migración de base de datos se ejecuta automáticamente al iniciar la aplicación.
+
+`README.md` solo actualiza la documentación. No cambian `requirements.txt`, assets ni Streamlit Secrets.
+
