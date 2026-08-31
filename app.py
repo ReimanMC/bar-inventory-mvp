@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.6"):
+def page_header(title, subtitle="", badge="V0.3.7"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -160,18 +160,18 @@ def init_db():
     con.executescript("""
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL DEFAULT '', email TEXT UNIQUE,
-      role TEXT NOT NULL CHECK(role IN ('STAFF','MANAGER','ADMIN')), active INTEGER DEFAULT 1,
+      role TEXT NOT NULL CHECK(role IN ('STAFF','MANAGER','GENERAL_MANAGER','ADMIN')), active INTEGER DEFAULT 1,
       last_login_at TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS categories(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, count_unit TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS products(
       id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL, name TEXT NOT NULL,
-      bottle_ml REAL, package_type TEXT DEFAULT 'Botella', active INTEGER DEFAULT 1,
+      bottle_ml REAL, package_type TEXT DEFAULT 'Botella', active INTEGER DEFAULT 1, daily_inventory INTEGER DEFAULT 0,
       UNIQUE(name,bottle_ml,package_type), FOREIGN KEY(category_id) REFERENCES categories(id));
     CREATE TABLE IF NOT EXISTS locations(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
     CREATE TABLE IF NOT EXISTS inventory_sessions(
       id INTEGER PRIMARY KEY, session_date TEXT NOT NULL, session_type TEXT NOT NULL,
-      user_id INTEGER, created_at TEXT NOT NULL, submitted INTEGER DEFAULT 1, notes TEXT,
+      user_id INTEGER, created_at TEXT NOT NULL, submitted INTEGER DEFAULT 1, notes TEXT, inventory_cycle TEXT DEFAULT 'DAILY',
       FOREIGN KEY(user_id) REFERENCES users(id));
     CREATE TABLE IF NOT EXISTS inventory_counts(
       id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
@@ -219,6 +219,45 @@ def init_db():
 
 init_db()
 
+# V0.3.7 migration: new GENERAL_MANAGER role, inventory frequency and daily-liquor flags.
+def ensure_v037_schema():
+    # Existing V0.3.x databases have a CHECK constraint that does not include GENERAL_MANAGER.
+    # Rebuild only the users table while preserving IDs so all historical references remain valid.
+    row=one("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
+    users_sql=(row['sql'] if row and row['sql'] else '')
+    if 'GENERAL_MANAGER' not in users_sql:
+        con.commit()
+        con.execute("PRAGMA foreign_keys=OFF")
+        try:
+            con.execute("BEGIN")
+            con.execute("""CREATE TABLE users_new(
+              id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL DEFAULT '', email TEXT UNIQUE,
+              role TEXT NOT NULL CHECK(role IN ('STAFF','MANAGER','GENERAL_MANAGER','ADMIN')), active INTEGER DEFAULT 1,
+              last_login_at TEXT, created_at TEXT)""")
+            con.execute("""INSERT INTO users_new(id,name,pin_hash,email,role,active,last_login_at,created_at)
+                           SELECT id,name,COALESCE(pin_hash,''),email,role,active,last_login_at,created_at FROM users""")
+            con.execute("DROP TABLE users")
+            con.execute("ALTER TABLE users_new RENAME TO users")
+            con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.execute("PRAGMA foreign_keys=ON")
+
+    pcols={r[1] for r in con.execute("PRAGMA table_info(products)").fetchall()}
+    if 'daily_inventory' not in pcols:
+        con.execute("ALTER TABLE products ADD COLUMN daily_inventory INTEGER DEFAULT 0")
+
+    scols={r[1] for r in con.execute("PRAGMA table_info(inventory_sessions)").fetchall()}
+    if 'inventory_cycle' not in scols:
+        con.execute("ALTER TABLE inventory_sessions ADD COLUMN inventory_cycle TEXT DEFAULT 'DAILY'")
+
+    con.commit()
+
+ensure_v037_schema()
+
 # V0.3.4 migration: preserve bottle-equivalent counts when ml is still pending.
 def ensure_v033_schema():
     cols={r[1] for r in con.execute("PRAGMA table_info(inventory_counts)").fetchall()}
@@ -249,6 +288,20 @@ def seed_catalog():
     for n in LIQUORS: con.execute("INSERT OR IGNORE INTO products(category_id,name,bottle_ml,package_type) VALUES(?,?,NULL,'Botella')",(cid_liq,n))
     con.commit()
 seed_catalog()
+
+def seed_daily_inventory_defaults():
+    """Mark the current seven main liquors once; admins can change this list later."""
+    if one("SELECT value FROM settings WHERE key='daily_inventory_defaults_seeded'"):
+        return
+    principal=[
+        'Jose Cuervo Silver','Jose Cuervo Gold','Triple Sec McGuinness','Mezcal Ilegal',
+        'Captain Morgan Dark','Captain Morgan White','Vodka True'
+    ]
+    for name in principal:
+        con.execute("UPDATE products SET daily_inventory=1 WHERE lower(name)=lower(?)",(name,))
+    con.execute("INSERT INTO settings(key,value) VALUES('daily_inventory_defaults_seeded','1')")
+    con.commit()
+seed_daily_inventory_defaults()
 
 def seed_sheet_history():
     """Carga una sola vez los registros históricos que pueden interpretarse con suficiente certeza
@@ -322,6 +375,22 @@ def products(cat=None, active=True):
     if cat: sql += " AND c.name=?"; ps.append(cat)
     return q(sql+" ORDER BY c.name,p.name,COALESCE(p.bottle_ml,0)",ps)
 
+def inventory_products(cycle='DAILY'):
+    """Products required for the selected physical inventory cycle.
+    DAILY = all beers + main liquors. WEEKLY = all beers + all liquors.
+    """
+    all_items=[p for p in products() if p['category'] in ('Cerveza','Licor')]
+    if cycle=='WEEKLY':
+        return all_items
+    return [p for p in all_items if p['category']=='Cerveza' or int(p['daily_inventory'] or 0)==1]
+
+def latest_opening_cycle(ds):
+    r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle FROM inventory_sessions
+             WHERE session_date=? AND session_type='OPENING' ORDER BY created_at DESC LIMIT 1""",(ds,))
+    return str(r['cycle']) if r else None
+
+ROLE_LABELS={'STAFF':'STAFF','MANAGER':'MANAGER','GENERAL_MANAGER':'MANAGER GENERAL','ADMIN':'ADMIN'}
+
 def product_label(p):
     ml = f" · {int(p['bottle_ml'])} ml" if p['bottle_ml'] else ""
     pkg = f" · {p['package_type']}" if p['package_type'] and p['package_type'] != 'Botella' else ""
@@ -342,10 +411,10 @@ def last_close(pid, lid, before_or_on=None):
     sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
     r=one(sql,ps); return (float(r['qty_base']),r['session_date']) if r else (None,None)
 
-def save_session(kind, counts, session_date=None, notes=""):
+def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY"):
     d=(session_date or date.today()).isoformat() if hasattr((session_date or date.today()),'isoformat') else str(session_date)
-    cur=con.execute("INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes) VALUES(?,?,?,?,?)",
-                    (d,kind,user['id'],now_iso(),notes)); sid=cur.lastrowid
+    cur=con.execute("INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle) VALUES(?,?,?,?,?,?)",
+                    (d,kind,user['id'],now_iso(),notes,inventory_cycle)); sid=cur.lastrowid
     for x in counts:
         con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
                        VALUES(?,?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
@@ -575,7 +644,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.3.4 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.3.7 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -602,12 +671,13 @@ with st.sidebar:
     st.image(LOGO_PATH, width=185)
     st.markdown("---")
     st.markdown(f"**{user['name']}**")
-    st.caption(f"{user['role']} · {user['email']}")
-    if user['role'] in ('MANAGER','ADMIN'):
+    st.caption(f"{ROLE_LABELS.get(user['role'],user['role'])} · {user['email']}")
+    if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages=['Dashboard','Apertura','Cierre','Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
     else:
         pages=['Apertura','Cierre','Recibir pedido','Trasladar productos']
-    if user['role']=='ADMIN': pages += ['Administración']
+    if user['role'] in ('GENERAL_MANAGER','ADMIN'):
+        pages += ['Administración']
     icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
     display=[f"{icons.get(p,'•')}  {p}" for p in pages]
     selected=st.radio("Navegación",display,label_visibility="collapsed")
@@ -617,10 +687,16 @@ with st.sidebar:
 
 # --------------------------- pages ---------------------------
 if page=='Apertura':
-    page_header("Apertura", "Conteo inicial del turno y comparación contra el último cierre.")
-    st.caption("Compara el conteo actual con el último cierre. Si no existe cierre anterior, el primer conteo se guarda como línea base y no genera alerta.")
+    page_header("Apertura", "Conteo inicial del turno con inventario diario o semanal.")
     d=st.date_input("Fecha de apertura",value=date.today())
-    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
+    cycle_label=st.radio("Tipo de inventario",['Diario','Semanal'],horizontal=True,key='opening_cycle')
+    cycle='DAILY' if cycle_label=='Diario' else 'WEEKLY'
+    if cycle=='DAILY':
+        st.caption("Inventario diario: todas las cervezas + licores principales. Los demás licores quedan fuera para agilizar el conteo.")
+    else:
+        st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
+    st.caption("Si no existe un cierre anterior comparable, el conteo se guarda como referencia sin generar una alerta falsa.")
+    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; ps=inventory_products(cycle)
     counts=[]; missing_obs=False
     for cat in ['Cerveza','Licor']:
         g=[p for p in ps if p['category']==cat]
@@ -628,33 +704,54 @@ if page=='Apertura':
         for p in g:
             prev,prev_bottles,prev_date=last_close_detail(p['id'],bar,d.isoformat())
             with st.expander(product_label(p),expanded=True):
+                # Secondary liquors are only counted weekly. Their prior weekly close is a reference,
+                # not a same-day continuity check, because sales occurred during the interval.
+                weekly_secondary=(cycle=='WEEKLY' and cat=='Licor' and int(p['daily_inventory'] or 0)==0)
                 if prev is None:
                     st.info("Primer inventario registrado para este producto. No existe cierre anterior para comparar.")
-                    res=bottle_count_input(p,f"op_{d}_{p['id']}",0); val=res['base']; var=None; obs=''; bottle_equiv=res['bottles']
+                    res=bottle_count_input(p,f"op_{cycle}_{d}_{p['id']}",0); val=res['base']; var=None; obs=''; bottle_equiv=res['bottles']
                 else:
                     if cat=='Licor' and not p['bottle_ml'] and prev_bottles is not None:
-                        st.caption(f"Cierre anterior ({prev_date}): **{prev_bottles:.2f} botellas** · ml pendiente")
+                        st.caption(f"Último cierre ({prev_date}): **{prev_bottles:.2f} botellas** · ml pendiente")
                     else:
-                        st.caption(f"Cierre anterior ({prev_date}): **{qty_fmt(p,prev)}**")
-                    res=bottle_count_input(p,f"op_{d}_{p['id']}",prev,prev_bottles); val=res['base']; bottle_equiv=res['bottles']; obs=''
-                    if cat=='Licor' and not p['bottle_ml']:
-                        var=(bottle_equiv-prev_bottles) if prev_bottles is not None else None; tol=.25; var_unit='botellas'
+                        st.caption(f"Último cierre ({prev_date}): **{qty_fmt(p,prev)}**")
+                    res=bottle_count_input(p,f"op_{cycle}_{d}_{p['id']}",prev,prev_bottles); val=res['base']; bottle_equiv=res['bottles']; obs=''
+                    if weekly_secondary:
+                        var=None
+                        st.caption("Licor de inventario semanal: el cierre anterior se muestra solo como referencia y no genera alerta automática por el intervalo entre conteos.")
                     else:
-                        var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
-                    if var is not None and abs(var)>tol:
-                        st.warning(f"Diferencia contra cierre anterior: {var:+.2f} {var_unit}")
-                        obs=st.text_input("Observación obligatoria",key=f"opobs_{d}_{p['id']}")
-                        missing_obs |= not bool(obs.strip())
-                    elif var is not None: st.caption(f"Diferencia: {var:+.2f} {var_unit} · dentro de tolerancia")
+                        if cat=='Licor' and not p['bottle_ml']:
+                            var=(bottle_equiv-prev_bottles) if prev_bottles is not None else None; tol=.25; var_unit='botellas'
+                        else:
+                            var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
+                        if var is not None and abs(var)>tol:
+                            st.warning(f"Diferencia contra cierre anterior: {var:+.2f} {var_unit}")
+                            obs=st.text_input("Observación obligatoria",key=f"opobs_{cycle}_{d}_{p['id']}")
+                            missing_obs |= not bool(obs.strip())
+                        elif var is not None: st.caption(f"Diferencia: {var:+.2f} {var_unit} · dentro de tolerancia")
                 counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv})
+    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label}")
     if st.button("Guardar apertura",type="primary",width="stretch"):
         if missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
-        else: save_session('OPENING',counts,d); st.success("Apertura guardada correctamente.")
+        else:
+            save_session('OPENING',counts,d,inventory_cycle=cycle)
+            st.success(f"Apertura {cycle_label.lower()} guardada correctamente.")
 
 elif page=='Cierre':
-    page_header("Cierre", "Conteo final, movimientos pendientes y ajustes del día.")
+    page_header("Cierre", "Conteo final con inventario diario o semanal y movimientos pendientes.")
     d=st.date_input("Fecha de cierre",value=date.today())
-    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']; ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
+    detected=latest_opening_cycle(d.isoformat())
+    options=['Diario','Semanal']; default_idx=1 if detected=='WEEKLY' else 0
+    cycle_label=st.radio("Tipo de inventario",options,index=default_idx,horizontal=True,key='closing_cycle')
+    cycle='DAILY' if cycle_label=='Diario' else 'WEEKLY'
+    if detected and cycle!=detected:
+        st.warning(f"La apertura más reciente de esta fecha fue {'semanal' if detected=='WEEKLY' else 'diaria'}. Revisa el tipo de inventario antes de guardar el cierre.")
+    if cycle=='DAILY':
+        st.caption("Inventario diario: todas las cervezas + licores principales.")
+    else:
+        st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
+    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
+    ps=inventory_products(cycle); all_ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
     counts=[]
     for cat in ['Cerveza','Licor']:
         g=[p for p in ps if p['category']==cat]
@@ -668,24 +765,27 @@ elif page=='Cierre':
                 if op is not None:
                     if cat=='Licor' and not p['bottle_ml'] and op_bottles is not None: st.caption(f"Apertura de hoy: **{op_bottles:.2f} botellas** · ml pendiente")
                     else: st.caption(f"Apertura de hoy: **{qty_fmt(p,op)}**")
-                res=bottle_count_input(p,f"cl_{d}_{p['id']}",default,default_bottles); val=res['base']
+                else:
+                    st.caption("No se encontró apertura de hoy para este producto; se usa el último cierre disponible como valor inicial sugerido.")
+                res=bottle_count_input(p,f"cl_{cycle}_{d}_{p['id']}",default,default_bottles); val=res['base']
                 counts.append({'pid':p['id'],'lid':bar,'qty':val,'bottle_equiv':res['bottles']})
+    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label}")
     st.divider(); pending=[]
     st.subheader("Movimientos pendientes del día")
-    st.caption("Solo registra aquí lo que todavía NO haya sido ingresado desde las opciones independientes.")
+    st.caption("Solo registra aquí lo que todavía NO haya sido ingresado desde las opciones independientes. Puedes seleccionar cualquier cerveza o licor, aunque no forme parte del conteo diario.")
     if st.toggle("¿Hoy se recibieron productos de proveedor que aún no han sido registrados?"):
         n=int(st.number_input("Número de productos recibidos",1,30,1,key='cl_sup_n')); supplier=st.text_input("Proveedor (opcional)",key='cl_sup_name'); ref=st.text_input("Factura / referencia (opcional)",key='cl_sup_ref')
-        mp={product_label(p):p for p in ps}
+        mp={product_label(p):p for p in all_ps}
         for i in range(n):
             nm=st.selectbox(f"Producto recibido {i+1}",list(mp),key=f'cl_sup_p{i}'); p=mp[nm]; mv=movement_qty_input(p,f'cl_sup_q{i}')
             if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append(('SUPPLIER',p['id'],mv['base'],mv['bottles'],None,wh,supplier,ref,''))
     if st.toggle("¿Hoy se trasladaron productos de bodega al bar que aún no han sido registrados?"):
-        n=int(st.number_input("Número de productos trasladados",1,30,1,key='cl_tr_n')); mp={product_label(p):p for p in ps}
+        n=int(st.number_input("Número de productos trasladados",1,30,1,key='cl_tr_n')); mp={product_label(p):p for p in all_ps}
         for i in range(n):
             nm=st.selectbox(f"Producto trasladado {i+1}",list(mp),key=f'cl_tr_p{i}'); p=mp[nm]; mv=movement_qty_input(p,f'cl_tr_q{i}')
             if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append(('TRANSFER',p['id'],mv['base'],mv['bottles'],wh,bar,None,None,''))
     if st.toggle("¿Hoy se realizaron pruebas, hubo desperdicios o se dieron cortesías?"):
-        n=int(st.number_input("¿Cuántos registros necesitas ingresar?",1,30,1,key='cl_adj_n')); mp={product_label(p):p for p in ps}
+        n=int(st.number_input("¿Cuántos registros necesitas ingresar?",1,30,1,key='cl_adj_n')); mp={product_label(p):p for p in all_ps}
         for i in range(n):
             c1,c2=st.columns([1,2]); typ=c1.selectbox(f"Tipo {i+1}",['Prueba','Desperdicio','Cortesía'],key=f'cl_adj_t{i}'); nm=c2.selectbox(f"Producto {i+1}",list(mp),key=f'cl_adj_p{i}'); p=mp[nm]
             mv=movement_qty_input(p,f'cl_adj_q{i}'); obs=st.text_input(f"Observación {i+1} (opcional)",key=f'cl_adj_o{i}')
@@ -693,10 +793,10 @@ elif page=='Cierre':
             if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append((typdb,p['id'],mv['base'],mv['bottles'],bar,None,None,None,obs))
     notes=st.text_area("Observaciones generales (opcional)")
     if st.button("Guardar cierre",type="primary",width="stretch"):
-        save_session('CLOSING',counts,d,notes)
+        save_session('CLOSING',counts,d,notes,inventory_cycle=cycle)
         for typ,pid,qty,beq,fr,to,sup,ref,obs in pending:
             create_movement(typ,pid,qty,fr,to,sup,ref,obs,d,bottle_equiv=beq)
-        st.success("Cierre y movimientos pendientes guardados correctamente.")
+        st.success(f"Cierre {cycle_label.lower()} y movimientos pendientes guardados correctamente.")
 
 elif page=='Recibir pedido':
     page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
@@ -731,22 +831,98 @@ elif page=='Trasladar productos':
             st.success("Traslado registrado.")
 
 elif page=='POS / Ventas':
-    page_header("POS / Ventas", "Registra ventas para calcular el consumo teórico por recetas y productos.")
-    st.caption("Puedes registrar ventas por día. La carga masiva desde Excel se encuentra en Administración.")
-    d=st.date_input("Fecha de ventas",value=date.today()); typ=st.selectbox("Tipo",['Cóctel','Shot','Cerveza','Botella de licor'])
-    cid=pid=None; ozunit=None
-    if typ=='Cóctel':
-        items=q("SELECT * FROM cocktails WHERE active=1 ORDER BY name"); mp={r['name']:r['id'] for r in items}; nm=st.selectbox("Cóctel",list(mp) if mp else ['— Sin cócteles —']); cid=mp.get(nm)
-    else:
-        cat='Cerveza' if typ=='Cerveza' else 'Licor'; items=products(cat); mp={product_label(r):r for r in items}; nm=st.selectbox("Producto",list(mp) if mp else ['— Sin productos —']); p=mp.get(nm); pid=p['id'] if p else None
-        if typ=='Shot': ozunit=st.number_input("Oz por shot",min_value=.25,step=.25,value=1.0)
-    qty=st.number_input("Unidades vendidas",min_value=0.0,step=1.0); obs=st.text_input("Observación (opcional)")
-    if st.button("Guardar venta",type="primary"):
-        if qty<=0 or not (cid or pid): st.error("Completa la venta.")
+    page_header("POS / Ventas", "Registra ventas de cócteles, shots, cervezas y botellas para calcular el consumo teórico.")
+    st.caption("Ingresa los totales vendidos del POS por fecha. Shots y cervezas quedan registrados directamente contra el producto correspondiente.")
+    d=st.date_input("Fecha de ventas",value=date.today(),key='pos_date')
+    tab_cocktail,tab_shot,tab_beer,tab_bottle=st.tabs(['🍹 Cócteles','🥃 Shots','🍺 Cervezas','🍾 Botellas de licor'])
+
+    with tab_cocktail:
+        items=q("SELECT * FROM cocktails WHERE active=1 ORDER BY name")
+        if not items:
+            st.info("No hay cócteles activos. Puedes crearlos en Administración → Cócteles / Recetas.")
         else:
-            ex("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-               (d.isoformat(),cid,pid,typ,qty,ozunit,user['id'],obs,now_iso()))
-            st.success("Venta guardada.")
+            mp={r['name']:r['id'] for r in items}
+            n=int(st.number_input("Número de cócteles con ventas",1,30,1,key='pos_c_n'))
+            rows=[]
+            for i in range(n):
+                c1,c2=st.columns([2,1])
+                nm=c1.selectbox(f"Cóctel {i+1}",list(mp),key=f'pos_c_name_{i}')
+                qty=float(c2.number_input(f"Cantidad {i+1}",min_value=0,step=1,value=0,key=f'pos_c_qty_{i}'))
+                if qty>0: rows.append((mp[nm],qty))
+            obs=st.text_input("Observación general (opcional)",key='pos_c_obs')
+            if st.button("Guardar ventas de cócteles",type='primary',width='stretch',key='save_pos_cocktails'):
+                if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
+                else:
+                    for cid,qty in rows:
+                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                    (d.isoformat(),cid,None,'Cóctel',qty,None,user['id'],obs,now_iso()))
+                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de cócteles guardadas: {len(rows)} registro(s).")
+
+    with tab_shot:
+        liquors=products('Licor')
+        if not liquors:
+            st.info("No hay licores activos.")
+        else:
+            mp={product_label(r):r for r in liquors}
+            n=int(st.number_input("Número de licores vendidos como shot",1,30,1,key='pos_s_n'))
+            rows=[]
+            for i in range(n):
+                c1,c2,c3=st.columns([2,1,1])
+                nm=c1.selectbox(f"Licor {i+1}",list(mp),key=f'pos_s_name_{i}'); prod=mp[nm]
+                qty=float(c2.number_input(f"Shots {i+1}",min_value=0,step=1,value=0,key=f'pos_s_qty_{i}'))
+                oz=float(c3.number_input(f"Oz/shot {i+1}",min_value=.25,step=.25,value=1.0,key=f'pos_s_oz_{i}'))
+                if qty>0: rows.append((prod['id'],qty,oz))
+            obs=st.text_input("Observación general (opcional)",key='pos_s_obs')
+            if st.button("Guardar ventas de shots",type='primary',width='stretch',key='save_pos_shots'):
+                if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
+                else:
+                    for pid,qty,oz in rows:
+                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                    (d.isoformat(),None,pid,'Shot',qty,oz,user['id'],obs,now_iso()))
+                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de shots guardadas: {len(rows)} registro(s).")
+
+    with tab_beer:
+        beers=products('Cerveza')
+        if not beers:
+            st.info("No hay cervezas activas.")
+        else:
+            st.caption("Escribe únicamente las unidades vendidas. Las cervezas en cero no generan registros.")
+            beer_rows=[]
+            cols=st.columns(2)
+            for i,p in enumerate(beers):
+                with cols[i%2]:
+                    qty=float(st.number_input(product_label(p),min_value=0,step=1,value=0,key=f'pos_b_qty_{p["id"]}'))
+                    if qty>0: beer_rows.append((p['id'],qty))
+            obs=st.text_input("Observación general (opcional)",key='pos_b_obs')
+            if st.button("Guardar ventas de cervezas",type='primary',width='stretch',key='save_pos_beers'):
+                if not beer_rows: st.error("Ingresa al menos una cantidad mayor que cero.")
+                else:
+                    for pid,qty in beer_rows:
+                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                    (d.isoformat(),None,pid,'Cerveza',qty,None,user['id'],obs,now_iso()))
+                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de cerveza guardadas: {len(beer_rows)} producto(s).")
+
+    with tab_bottle:
+        liquors=products('Licor')
+        if not liquors:
+            st.info("No hay licores activos.")
+        else:
+            mp={product_label(r):r for r in liquors}
+            n=int(st.number_input("Número de licores vendidos por botella",1,20,1,key='pos_l_n'))
+            rows=[]
+            for i in range(n):
+                c1,c2=st.columns([2,1])
+                nm=c1.selectbox(f"Licor {i+1}",list(mp),key=f'pos_l_name_{i}'); prod=mp[nm]
+                qty=float(c2.number_input(f"Botellas {i+1}",min_value=0,step=1,value=0,key=f'pos_l_qty_{i}'))
+                if qty>0: rows.append((prod['id'],qty))
+            obs=st.text_input("Observación general (opcional)",key='pos_l_obs')
+            if st.button("Guardar ventas por botella",type='primary',width='stretch',key='save_pos_bottles'):
+                if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
+                else:
+                    for pid,qty in rows:
+                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                    (d.isoformat(),None,pid,'Botella de licor',qty,None,user['id'],obs,now_iso()))
+                    con.commit(); backup_db_to_drive(); st.success(f"Ventas por botella guardadas: {len(rows)} registro(s).")
 
 elif page=='Dashboard':
     page_header("Dashboard Gerencial", "Resumen ejecutivo del inventario, consumo, diferencias y abastecimiento.")
@@ -907,13 +1083,25 @@ elif page=='Administración':
     with t1:
         st.subheader("Agregar / actualizar producto")
         cats=q("SELECT * FROM categories WHERE name IN ('Cerveza','Licor') ORDER BY name"); cm={r['name']:r['id'] for r in cats}; cat=st.selectbox("Categoría",list(cm)); name=st.text_input("Nombre del producto"); ml=st.number_input("Presentación (ml)",min_value=0.0,value=0.0,step=5.0); pkg=st.selectbox("Envase",['Botella','Lata','Otro'])
+        principal_new=st.checkbox("Incluir este licor en el inventario diario",value=False,disabled=(cat!='Licor'),key='new_daily_liquor')
         if st.button("Agregar producto",type="primary") and name.strip():
             try:
-                ex("INSERT INTO products(category_id,name,bottle_ml,package_type) VALUES(?,?,?,?)",(cm[cat],name.strip(),ml or None,pkg)); st.success("Producto agregado."); st.rerun()
+                ex("INSERT INTO products(category_id,name,bottle_ml,package_type,daily_inventory) VALUES(?,?,?,?,?)",(cm[cat],name.strip(),ml or None,pkg,1 if (cat=='Licor' and principal_new) else 0)); st.success("Producto agregado."); st.rerun()
             except sqlite3.IntegrityError: st.error("Ese producto con la misma presentación ya existe.")
         st.caption("La presentación en ml puede completarse más adelante. Mientras esté pendiente, el inventario de licor se guarda como botellas completas + fracción; al registrar los ml, la app convierte automáticamente esos conteos a oz. El costo es opcional.")
-        df=pd.read_sql_query("SELECT p.id ID,c.name Categoría,p.name Producto,p.bottle_ml 'ml',p.package_type Envase,p.unit_cost 'Costo por botella/unidad',p.active Activo FROM products p JOIN categories c ON c.id=p.category_id ORDER BY c.name,p.name",con)
+        df=pd.read_sql_query("SELECT p.id ID,c.name Categoría,p.name Producto,p.bottle_ml 'ml',p.package_type Envase,p.unit_cost 'Costo por botella/unidad',CASE WHEN c.name='Cerveza' THEN 'Diario' WHEN p.daily_inventory=1 THEN 'Principal · Diario' ELSE 'Semanal' END 'Frecuencia inventario',p.active Activo FROM products p JOIN categories c ON c.id=p.category_id ORDER BY c.name,p.name",con)
         st.dataframe(df,width="stretch",hide_index=True)
+        st.markdown("#### Licores principales del inventario diario")
+        st.caption("Las cervezas siempre son diarias. Selecciona aquí qué licores deben aparecer también en el inventario diario; los demás aparecerán únicamente cuando selecciones inventario semanal.")
+        liquor_rows=products('Licor')
+        liquor_map={product_label(r):r for r in liquor_rows}
+        selected_default=[label for label,r in liquor_map.items() if int(r['daily_inventory'] or 0)==1]
+        selected_daily=st.multiselect("Licores principales",list(liquor_map.keys()),default=selected_default,key='daily_liquors_multiselect')
+        if st.button("Guardar licores principales",width="stretch"):
+            con.execute("UPDATE products SET daily_inventory=0 WHERE category_id=(SELECT id FROM categories WHERE name='Licor')")
+            for label in selected_daily:
+                con.execute("UPDATE products SET daily_inventory=1 WHERE id=?",(liquor_map[label]['id'],))
+            con.commit(); backup_db_to_drive(); st.success("Lista de licores principales actualizada."); st.rerun()
         pid=st.number_input("ID del producto a actualizar",min_value=1,step=1); newml=st.number_input("Nuevo ml",min_value=0.0,step=5.0,key='updml'); newcost=st.number_input("Costo por botella/unidad ($, opcional)",min_value=0.0,step=.01,key='updcost')
         if st.button("Actualizar presentación / costo"):
             ex("UPDATE products SET bottle_ml=?,unit_cost=? WHERE id=?",(newml or None,newcost or None,int(pid)))
@@ -936,15 +1124,18 @@ elif page=='Administración':
         email=st.text_input("Correo Google / Gmail").strip().lower()
         un=st.text_input("Nombre del usuario")
         owner_email=normalized_email(secret_value('app','bootstrap_admin_email'))
-        assignable_roles=['STAFF','MANAGER','ADMIN'] if normalized_email(user['email'])==owner_email else ['STAFF','MANAGER']
-        role=st.selectbox("Rol",assignable_roles)
-        st.caption("Solo la cuenta Developer/Owner configurada puede otorgar el rol ADMIN.")
+        is_owner=normalized_email(user['email'])==owner_email
+        assignable_roles=['STAFF','MANAGER','GENERAL_MANAGER','ADMIN'] if is_owner else ['STAFF','MANAGER','GENERAL_MANAGER']
+        role=st.selectbox("Rol",assignable_roles,format_func=lambda x:ROLE_LABELS.get(x,x))
+        st.caption("MANAGER GENERAL puede administrar productos, recetas y usuarios. Solo la cuenta Developer/Owner configurada puede otorgar o modificar el rol ADMIN.")
         if st.button("Autorizar usuario",type="primary",width="stretch"):
             if not email or '@' not in email:
                 st.error("Ingresa un correo válido.")
             else:
                 existing=one("SELECT * FROM users WHERE lower(email)=?",(email,))
-                if existing:
+                if existing and existing['role']=='ADMIN' and not is_owner:
+                    st.error("Solo la cuenta Developer/Owner puede modificar un usuario ADMIN.")
+                elif existing:
                     ex("UPDATE users SET name=?,role=?,active=1 WHERE id=?",(un.strip() or existing['name'],role,existing['id']))
                     st.success("Usuario actualizado y activado."); st.rerun()
                 else:
@@ -954,11 +1145,14 @@ elif page=='Administración':
                         candidate=f"{base_name} {i}"; i+=1
                     ex("INSERT INTO users(name,pin_hash,email,role,active,created_at) VALUES(?,?,?,?,1,?)",(candidate,'',email,role,now_iso()))
                     st.success("Correo autorizado. Ya puede entrar con Google."); st.rerun()
-        users_df=pd.read_sql_query("SELECT id ID,name Nombre,email Email,role Rol,CASE active WHEN 1 THEN 'Activo' ELSE 'Bloqueado' END Estado,last_login_at 'Último acceso' FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY active DESC,role,name",con)
+        users_df=pd.read_sql_query("SELECT id ID,name Nombre,email Email,CASE role WHEN 'GENERAL_MANAGER' THEN 'MANAGER GENERAL' ELSE role END Rol,CASE active WHEN 1 THEN 'Activo' ELSE 'Bloqueado' END Estado,last_login_at 'Último acceso' FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY active DESC,role,name",con)
         st.dataframe(users_df,width="stretch",hide_index=True)
-        manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY name")
+        if is_owner:
+            manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' ORDER BY name")
+        else:
+            manageable=q("SELECT id,name,email,role,active FROM users WHERE email IS NOT NULL AND email<>'' AND role<>'ADMIN' ORDER BY name")
         if manageable:
-            labels={f"{r['name']} · {r['email']} · {r['role']} · {'Activo' if r['active'] else 'Bloqueado'}":r for r in manageable}
+            labels={f"{r['name']} · {r['email']} · {ROLE_LABELS.get(r['role'],r['role'])} · {'Activo' if r['active'] else 'Bloqueado'}":r for r in manageable}
             sel=st.selectbox("Gestionar usuario",list(labels.keys()))
             target=labels[sel]
             c1,c2=st.columns(2)
@@ -971,10 +1165,12 @@ elif page=='Administración':
             else:
                 if c1.button("Reactivar acceso",width="stretch"):
                     ex("UPDATE users SET active=1 WHERE id=?",(target['id'],)); st.success("Usuario reactivado."); st.rerun()
-            role_options=['STAFF','MANAGER','ADMIN'] if normalized_email(user['email'])==owner_email else ['STAFF','MANAGER']
-            if target['role']=='ADMIN' and 'ADMIN' not in role_options: role_options.append('ADMIN')
-            new_role=c2.selectbox("Cambiar rol",role_options,index=role_options.index(target['role']),key='manage_role')
+            role_options=['STAFF','MANAGER','GENERAL_MANAGER','ADMIN'] if is_owner else ['STAFF','MANAGER','GENERAL_MANAGER']
+            current_role=target['role'] if target['role'] in role_options else role_options[0]
+            new_role=c2.selectbox("Cambiar rol",role_options,index=role_options.index(current_role),format_func=lambda x:ROLE_LABELS.get(x,x),key='manage_role')
             if c2.button("Guardar rol",width="stretch"):
+                if target['id']==user['id'] and new_role!=target['role']:
+                    st.warning("Estás cambiando tu propio rol. El cambio se aplicará inmediatamente al recargar.")
                 ex("UPDATE users SET role=? WHERE id=?",(new_role,target['id'])); st.success("Rol actualizado."); st.rerun()
     with t4:
         st.subheader("Importar catálogo / recetas / ventas desde Excel")
@@ -1017,35 +1213,37 @@ elif page=='Administración':
             with open(DB,'rb') as fh:
                 st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{date.today().isoformat()}.db",mime="application/octet-stream",width="stretch")
         st.divider()
-        st.subheader("Inicio de operación / limpiar datos históricos")
-        st.caption("Esta herramienta deja la operación en cero eliminando únicamente datos transaccionales anteriores: inventarios, POS/ventas y movimientos. Conserva productos, categorías, presentaciones, recetas, usuarios, roles y configuración. El siguiente conteo será la nueva línea base.")
-        inv_sessions=one("SELECT COUNT(*) n FROM inventory_sessions")['n']
-        inv_counts=one("SELECT COUNT(*) n FROM inventory_counts")['n']
-        pos_rows=one("SELECT COUNT(*) n FROM pos_sales")['n']
-        mov_rows=one("SELECT COUNT(*) n FROM movements")['n']
-        st.info(f"Datos actuales: {inv_sessions} sesiones · {inv_counts} conteos · {pos_rows} registros POS/ventas · {mov_rows} movimientos.")
-        confirm_reset=st.text_input("Para confirmar escribe exactamente: INICIAR DESDE CERO",key="reset_inventory_confirm")
-        if st.button("Dejar operación en cero",type="secondary",width="stretch"):
-            if confirm_reset.strip() != "INICIAR DESDE CERO":
-                st.error("Confirmación incorrecta. Escribe exactamente: INICIAR DESDE CERO")
-            else:
-                try:
-                    # Limpiar exclusivamente datos operativos/transaccionales. Se preserva toda la estructura maestra.
-                    con.execute("DELETE FROM inventory_counts")
-                    con.execute("DELETE FROM inventory_sessions")
-                    con.execute("DELETE FROM pos_sales")
-                    con.execute("DELETE FROM movements")
-                    # Mantener la marca de seed para evitar que el histórico del Excel vuelva a insertarse al reiniciar.
-                    con.execute("INSERT INTO settings(key,value) VALUES('sheet_history_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'")
-                    con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
-                    con.commit()
-                    backup_db_to_drive()
-                    st.success("Operación reiniciada en cero. Se eliminaron inventarios, POS/ventas y movimientos anteriores. Productos, recetas, usuarios, roles y configuración permanecen intactos. El próximo conteo será la nueva línea base.")
-                    st.rerun()
-                except Exception as e:
-                    con.rollback()
-                    st.error(f"No se pudo limpiar los datos históricos: {e}")
-        st.divider()
+        if user['role']=='ADMIN':
+            st.subheader("Inicio de operación / limpiar datos históricos")
+            st.caption("Solo ADMIN puede ejecutar este reinicio. La herramienta elimina datos transaccionales anteriores: inventarios, POS/ventas y movimientos. Conserva productos, categorías, presentaciones, recetas, usuarios, roles y configuración.")
+            inv_sessions=one("SELECT COUNT(*) n FROM inventory_sessions")['n']
+            inv_counts=one("SELECT COUNT(*) n FROM inventory_counts")['n']
+            pos_rows=one("SELECT COUNT(*) n FROM pos_sales")['n']
+            mov_rows=one("SELECT COUNT(*) n FROM movements")['n']
+            st.info(f"Datos actuales: {inv_sessions} sesiones · {inv_counts} conteos · {pos_rows} registros POS/ventas · {mov_rows} movimientos.")
+            confirm_reset=st.text_input("Para confirmar escribe exactamente: INICIAR DESDE CERO",key="reset_inventory_confirm")
+            if st.button("Dejar operación en cero",type="secondary",width="stretch"):
+                if confirm_reset.strip() != "INICIAR DESDE CERO":
+                    st.error("Confirmación incorrecta. Escribe exactamente: INICIAR DESDE CERO")
+                else:
+                    try:
+                        con.execute("DELETE FROM inventory_counts")
+                        con.execute("DELETE FROM inventory_sessions")
+                        con.execute("DELETE FROM pos_sales")
+                        con.execute("DELETE FROM movements")
+                        con.execute("INSERT INTO settings(key,value) VALUES('sheet_history_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+                        con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
+                        con.commit()
+                        backup_db_to_drive()
+                        st.success("Operación reiniciada en cero. Se eliminaron inventarios, POS/ventas y movimientos anteriores. Productos, recetas, usuarios, roles y configuración permanecen intactos. El próximo conteo será la nueva línea base.")
+                        st.rerun()
+                    except Exception as e:
+                        con.rollback()
+                        st.error(f"No se pudo limpiar los datos históricos: {e}")
+            st.divider()
+        else:
+            st.info("El reinicio total de datos operativos está reservado para el rol ADMIN.")
+            st.divider()
         safety=st.number_input("Stock de seguridad para abastecimiento (%)",min_value=0,max_value=100,value=int(float(setting('safety_stock_pct','15'))),step=1)
         tb=st.number_input("Tolerancia cerveza (botellas)",min_value=0.0,value=float(setting('tolerance_beer','1')),step=.5)
         tl=st.number_input("Tolerancia licor (oz)",min_value=0.0,value=float(setting('tolerance_liquor','1')),step=.25)
