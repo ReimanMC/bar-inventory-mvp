@@ -1,58 +1,74 @@
-# Inventario La Ramona — V0.3.7
+# Inventario La Ramona — V0.3.8
 
-Actualización de roles, POS e inventario diario/semanal.
+Actualización enfocada únicamente en permisos de Administración y gestión de recetas. El resto de la V0.3.7 se mantiene sin cambios.
 
-## Cambios principales
+## 1. Administración para MANAGER y MANAGER GENERAL
 
-### 1. Nuevo rol MANAGER GENERAL
-- Nuevo rol interno: `GENERAL_MANAGER`.
-- Acceso a Dashboard, operación, POS, reportes y Administración.
-- Puede gestionar productos, recetas y usuarios.
-- Puede cambiar usuarios entre `STAFF`, `MANAGER` y `MANAGER GENERAL`.
-- El rol `ADMIN` continúa reservado para la cuenta Developer/Owner configurada.
-- El reinicio total de datos operativos sigue reservado a `ADMIN`.
+Los roles siguientes ahora pueden ver **Administración**:
 
-### 2. Cambio de rol de usuarios
-En **Administración → Usuarios** ahora se puede seleccionar un usuario y cambiar su rol.
+- `MANAGER`
+- `MANAGER GENERAL` (`GENERAL_MANAGER` internamente)
+- `ADMIN`
 
-### 3. POS / Ventas ampliado
-La sección POS ahora muestra pestañas independientes para:
-- Cócteles
-- Shots
-- Cervezas
-- Botellas de licor
+`STAFF` continúa sin acceso a Administración.
 
-Las ventas de shots se convierten a consumo esperado usando las oz por shot. Las cervezas se registran directamente por unidades vendidas.
+El **reinicio total de la operación** continúa protegido y visible únicamente para `ADMIN`. Un MANAGER o MANAGER GENERAL puede trabajar con productos, recetas, usuarios, importaciones y configuración operativa, pero no puede ejecutar el reinicio.
 
-### 4. Inventario diario y semanal
-Antes de realizar Apertura o Cierre se pregunta el tipo de inventario:
+## 2. Gestión de recetas de cócteles
 
-- **Diario:** todas las cervezas + licores principales.
-- **Semanal:** todas las cervezas + todos los licores activos.
+En **Administración → Cócteles / Recetas** se añadieron tres áreas claras:
 
-Los licores principales iniciales son:
-- Jose Cuervo Silver
-- Jose Cuervo Gold
-- Triple Sec McGuinness
-- Mezcal Ilegal
-- Captain Morgan Dark
-- Captain Morgan White
-- Vodka True
+### Crear / editar receta
+- Crear un cóctel nuevo.
+- Seleccionar un cóctel existente.
+- Definir cuántos licores contiene.
+- Seleccionar cada licor del catálogo.
+- Registrar la cantidad en **onzas (oz) de licor por cóctel**.
+- Guardar la receta completa o modificar una receta existente.
 
-Estos nombres corresponden al catálogo actual. La lista puede modificarse en cualquier momento.
+La receta guardada se utiliza automáticamente para calcular el consumo teórico cuando se registran ventas de ese cóctel en **POS / Ventas**.
 
-### 5. Licores principales configurables
-En **Administración → Productos → Licores principales del inventario diario** se puede añadir o quitar cualquier licor del conteo diario.
+### Importar recetas Excel
+Se puede cargar directamente un archivo `.xlsx` con recetas.
 
-Al crear un nuevo licor también existe la opción **Incluir este licor en el inventario diario**.
+La app:
+- muestra una vista previa;
+- permite seleccionar la hoja;
+- permite seleccionar las columnas correspondientes a **Cóctel**, **Licor** y **Oz**;
+- crea los cócteles que todavía no existan;
+- actualiza o agrega los ingredientes de las recetas;
+- informa las filas que no pudo asociar a un licor del catálogo, sin inventar equivalencias.
 
-### 6. Compatibilidad con la base existente
-La app migra automáticamente la base V0.3.x para añadir:
-- rol `GENERAL_MANAGER`;
-- campo `products.daily_inventory`;
-- campo `inventory_sessions.inventory_cycle`.
+Incluye equivalencias operativas conocidas del catálogo actual, por ejemplo:
+- Triple Sec → Triple Sec McGuinness
+- Mezcal → Mezcal Ilegal
+- Ron Negro → Captain Morgan Dark
+- Ron Blanco → Captain Morgan White
+- Vodake True / Vodka True → Vodka True
 
-No elimina productos, recetas, usuarios ni datos existentes durante esta migración.
+### Recetas guardadas
+Muestra:
+- cóctel;
+- licor;
+- oz de licor por cóctel;
+- total de oz de licor de cada cóctel.
+
+## 3. Sin cambios al resto de la operación
+
+Se conserva el comportamiento de V0.3.7 para:
+- inventario diario/semanal;
+- licores principales configurables;
+- cervezas diarias;
+- POS de cócteles, shots, cervezas y botellas;
+- Dashboard;
+- abastecimiento;
+- movimientos;
+- usuarios y roles;
+- autenticación;
+- reinicio de datos únicamente por ADMIN.
 
 ## Archivos a actualizar
-Para pasar de V0.3.6 a V0.3.7 solo es necesario reemplazar `app.py`. `requirements.txt`, assets y secrets no cambian.
+
+Para pasar de V0.3.7 a V0.3.8 basta con reemplazar `app.py`.
+
+`README.md` es solo documentación. No cambian `requirements.txt`, assets ni secrets.
