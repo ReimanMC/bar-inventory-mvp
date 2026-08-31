@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.7"):
+def page_header(title, subtitle="", badge="V0.3.8"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -389,6 +389,37 @@ def latest_opening_cycle(ds):
              WHERE session_date=? AND session_type='OPENING' ORDER BY created_at DESC LIMIT 1""",(ds,))
     return str(r['cycle']) if r else None
 
+def normalized_text(v):
+    """Normalize names for safe catalog matching without changing stored display names."""
+    txt=str(v or '').strip().lower()
+    txt=''.join(ch for ch in unicodedata.normalize('NFKD',txt) if not unicodedata.combining(ch))
+    txt=re.sub(r'[^a-z0-9]+',' ',txt)
+    return re.sub(r'\s+',' ',txt).strip()
+
+RECIPE_LIQUOR_ALIASES={
+    'triple sec':'Triple Sec McGuinness',
+    'mezcal':'Mezcal Ilegal',
+    'ron negro':'Captain Morgan Dark',
+    'ron oscuro':'Captain Morgan Dark',
+    'ron blanco':'Captain Morgan White',
+    'vodake true':'Vodka True',
+    'vodka true':'Vodka True',
+    'jose cuervo silver':'Jose Cuervo Silver',
+    'jose cuervo gold':'Jose Cuervo Gold',
+}
+
+def recipe_product_match(raw_name):
+    """Match a recipe liquor name to an active liquor product; ambiguous names are not guessed."""
+    key=normalized_text(raw_name)
+    if not key: return None
+    liquor_rows=products('Licor')
+    exact={normalized_text(r['name']):r for r in liquor_rows}
+    if key in exact: return exact[key]
+    alias=RECIPE_LIQUOR_ALIASES.get(key)
+    if alias:
+        return next((r for r in liquor_rows if normalized_text(r['name'])==normalized_text(alias)),None)
+    return None
+
 ROLE_LABELS={'STAFF':'STAFF','MANAGER':'MANAGER','GENERAL_MANAGER':'MANAGER GENERAL','ADMIN':'ADMIN'}
 
 def product_label(p):
@@ -676,7 +707,9 @@ with st.sidebar:
         pages=['Dashboard','Apertura','Cierre','Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
     else:
         pages=['Apertura','Cierre','Recibir pedido','Trasladar productos']
-    if user['role'] in ('GENERAL_MANAGER','ADMIN'):
+    # V0.3.8: MANAGER y MANAGER GENERAL pueden entrar a Administración.
+    # Las acciones críticas, como reiniciar la operación, continúan protegidas dentro de la página para ADMIN.
+    if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages += ['Administración']
     icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
     display=[f"{icons.get(p,'•')}  {p}" for p in pages]
@@ -1108,16 +1141,150 @@ elif page=='Administración':
             if newml>0: backfill_product_bottle_counts(int(pid))
             st.success("Producto actualizado. Si había conteos guardados por botellas, sus oz fueron recalculadas automáticamente."); st.rerun()
     with t2:
-        cn=st.text_input("Nombre del cóctel")
-        if st.button("Crear cóctel") and cn.strip():
-            try: ex("INSERT INTO cocktails(name) VALUES(?)",(cn.strip(),)); st.success("Cóctel creado."); st.rerun()
-            except sqlite3.IntegrityError: st.error("Ya existe.")
-        cs=q("SELECT * FROM cocktails WHERE active=1 ORDER BY name"); ls=products('Licor')
-        if cs and ls:
-            cmap={r['name']:r['id'] for r in cs}; lmap={product_label(r):r['id'] for r in ls}; c=st.selectbox("Cóctel",list(cmap),key='rc'); l=st.selectbox("Licor",list(lmap),key='rl'); oz=st.number_input("Oz por cóctel",min_value=.25,step=.25,value=1.0)
-            if st.button("Agregar / actualizar ingrediente"):
-                con.execute("INSERT INTO recipes(cocktail_id,product_id,oz_qty) VALUES(?,?,?) ON CONFLICT(cocktail_id,product_id) DO UPDATE SET oz_qty=excluded.oz_qty",(cmap[c],lmap[l],oz)); con.commit(); st.success("Receta actualizada.")
-        st.dataframe(pd.read_sql_query("SELECT c.name Cóctel,p.name Licor,r.oz_qty 'Oz por cóctel' FROM recipes r JOIN cocktails c ON c.id=r.cocktail_id JOIN products p ON p.id=r.product_id ORDER BY c.name,p.name",con),width="stretch",hide_index=True)
+        st.subheader("Cócteles y recetas")
+        st.caption("Las recetas se registran exclusivamente en onzas (oz) de licor por cóctel. Estas cantidades alimentan el consumo teórico del Dashboard cuando se registran las ventas del POS.")
+        recipe_manual,recipe_excel,recipe_list=st.tabs(['✍️ Crear / editar receta','📥 Importar recetas Excel','📋 Recetas guardadas'])
+
+        with recipe_manual:
+            st.markdown("#### 1. Crear un cóctel nuevo")
+            cnew1,cnew2=st.columns([3,1])
+            cn=cnew1.text_input("Nombre del cóctel",key='recipe_new_cocktail_name')
+            if cnew2.button("Crear cóctel",width='stretch',key='recipe_create_cocktail') and cn.strip():
+                try:
+                    ex("INSERT INTO cocktails(name) VALUES(?)",(cn.strip(),))
+                    st.success("Cóctel creado. Ya puedes registrar su receta.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Ese cóctel ya existe.")
+
+            cs=q("SELECT * FROM cocktails WHERE active=1 ORDER BY name")
+            ls=products('Licor')
+            if not cs:
+                st.info("Primero crea al menos un cóctel.")
+            elif not ls:
+                st.warning("No hay licores activos en el catálogo. Agrégalos primero en Administración → Productos.")
+            else:
+                st.markdown("#### 2. Crear o modificar la receta")
+                cmap={r['name']:r for r in cs}
+                cocktail_name=st.selectbox("Cóctel",list(cmap.keys()),key='recipe_cocktail_select')
+                cocktail=cmap[cocktail_name]
+                current=q("""SELECT r.product_id,r.oz_qty,p.name product_name,p.bottle_ml,p.package_type
+                             FROM recipes r JOIN products p ON p.id=r.product_id
+                             WHERE r.cocktail_id=? ORDER BY p.name""",(cocktail['id'],))
+                if current:
+                    st.caption("Receta actual: " + " · ".join(f"{r['product_name']} {float(r['oz_qty']):g} oz" for r in current))
+                else:
+                    st.caption("Este cóctel todavía no tiene una receta registrada.")
+
+                liquor_by_label={product_label(r):r for r in ls}
+                liquor_labels=list(liquor_by_label.keys())
+                current_by_pos=list(current)
+                default_n=max(1,len(current_by_pos))
+                ingredient_count=int(st.number_input("Número de licores en la receta",min_value=1,max_value=12,value=default_n,step=1,key=f"recipe_n_{cocktail['id']}"))
+                recipe_rows=[]
+                for i in range(ingredient_count):
+                    c1,c2=st.columns([3,1])
+                    default_label=liquor_labels[0]
+                    default_oz=1.0
+                    if i < len(current_by_pos):
+                        saved=current_by_pos[i]
+                        saved_row=next((r for r in ls if r['id']==saved['product_id']),None)
+                        if saved_row:
+                            default_label=product_label(saved_row)
+                        default_oz=float(saved['oz_qty'])
+                    idx=liquor_labels.index(default_label) if default_label in liquor_labels else 0
+                    label=c1.selectbox(f"Licor {i+1}",liquor_labels,index=idx,key=f"recipe_liq_{cocktail['id']}_{i}")
+                    oz=float(c2.number_input(f"Oz {i+1}",min_value=0.05,max_value=20.0,value=default_oz,step=0.25,format='%.2f',key=f"recipe_oz_{cocktail['id']}_{i}"))
+                    recipe_rows.append((liquor_by_label[label]['id'],oz,label))
+
+                st.caption("Guardar receta completa reemplaza la receta anterior de este cóctel por los ingredientes mostrados arriba.")
+                if st.button("Guardar receta completa",type='primary',width='stretch',key=f"save_full_recipe_{cocktail['id']}"):
+                    ids=[x[0] for x in recipe_rows]
+                    if len(ids)!=len(set(ids)):
+                        st.error("Un mismo licor aparece más de una vez. Selecciona cada licor una sola vez y suma sus onzas en un único ingrediente.")
+                    else:
+                        try:
+                            con.execute("DELETE FROM recipes WHERE cocktail_id=?",(cocktail['id'],))
+                            for pid,oz,_ in recipe_rows:
+                                con.execute("INSERT INTO recipes(cocktail_id,product_id,oz_qty) VALUES(?,?,?)",(cocktail['id'],pid,oz))
+                            con.commit(); backup_db_to_drive()
+                            st.success("Receta guardada correctamente en onzas de licor.")
+                            st.rerun()
+                        except Exception as e:
+                            con.rollback(); st.error(f"No se pudo guardar la receta: {e}")
+
+        with recipe_excel:
+            st.markdown("#### Importar varias recetas desde Excel")
+            st.caption("Puedes cargar un archivo .xlsx con una fila por ingrediente. Después seleccionas las columnas que corresponden a Cóctel, Licor y Oz; así no dependemos de nombres de columnas específicos.")
+            recipe_file=st.file_uploader("Archivo de recetas (.xlsx)",type=['xlsx'],key='recipe_excel_upload')
+            if recipe_file:
+                try:
+                    rxls=pd.ExcelFile(recipe_file)
+                    rsheet=st.selectbox("Hoja con las recetas",rxls.sheet_names,key='recipe_sheet_select')
+                    rdf=pd.read_excel(rxls,rsheet)
+                    rdf=rdf.dropna(how='all')
+                    if rdf.empty:
+                        st.warning("La hoja seleccionada está vacía.")
+                    else:
+                        st.dataframe(rdf.head(20),width='stretch',hide_index=True)
+                        cols=[str(c) for c in rdf.columns]
+                        def guess_col(words,fallback=0):
+                            for j,col in enumerate(cols):
+                                k=normalized_text(col)
+                                if any(w in k for w in words): return j
+                            return min(fallback,len(cols)-1)
+                        ic=guess_col(['coctel','cocktail','drink'],0)
+                        il=guess_col(['licor','liquor','spirit','ingrediente'],1 if len(cols)>1 else 0)
+                        io=guess_col(['oz','onza','ounce'],2 if len(cols)>2 else 0)
+                        a,b,cx=st.columns(3)
+                        cocktail_col=a.selectbox("Columna Cóctel",cols,index=ic,key='recipe_col_cocktail')
+                        liquor_col=b.selectbox("Columna Licor",cols,index=il,key='recipe_col_liquor')
+                        oz_col=cx.selectbox("Columna Oz",cols,index=io,key='recipe_col_oz')
+                        if st.button("Importar recetas seleccionadas",type='primary',width='stretch',key='recipe_excel_import'):
+                            imported=0; skipped=[]
+                            try:
+                                for row_idx,row in rdf.iterrows():
+                                    cocktail_raw=str(row.get(cocktail_col,'') or '').strip()
+                                    liquor_raw=str(row.get(liquor_col,'') or '').strip()
+                                    oz_raw=pd.to_numeric(row.get(oz_col),errors='coerce')
+                                    if not cocktail_raw and not liquor_raw: continue
+                                    if not cocktail_raw or not liquor_raw or pd.isna(oz_raw) or float(oz_raw)<=0:
+                                        skipped.append(f"Fila {row_idx+2}: faltan Cóctel, Licor u Oz válido")
+                                        continue
+                                    pmatch=recipe_product_match(liquor_raw)
+                                    if not pmatch:
+                                        skipped.append(f"Fila {row_idx+2}: licor no encontrado en catálogo → {liquor_raw}")
+                                        continue
+                                    con.execute("INSERT OR IGNORE INTO cocktails(name) VALUES(?)",(cocktail_raw,))
+                                    cock=one("SELECT id FROM cocktails WHERE lower(name)=lower(?) ORDER BY id LIMIT 1",(cocktail_raw,))
+                                    con.execute("""INSERT INTO recipes(cocktail_id,product_id,oz_qty) VALUES(?,?,?)
+                                                   ON CONFLICT(cocktail_id,product_id) DO UPDATE SET oz_qty=excluded.oz_qty""",
+                                                (cock['id'],pmatch['id'],float(oz_raw)))
+                                    imported+=1
+                                con.commit(); backup_db_to_drive()
+                                if imported: st.success(f"Importación terminada: {imported} ingredientes de receta guardados/actualizados.")
+                                if skipped:
+                                    st.warning(f"{len(skipped)} filas no se importaron para evitar inventar equivalencias.")
+                                    with st.expander("Ver filas pendientes de revisión"):
+                                        for msg in skipped[:100]: st.write("• "+msg)
+                                if imported and not skipped: st.rerun()
+                            except Exception as e:
+                                con.rollback(); st.error(f"No se pudo completar la importación: {e}")
+                except Exception as e:
+                    st.error(f"No se pudo leer el archivo de recetas: {e}")
+
+        with recipe_list:
+            recipe_df=pd.read_sql_query("""SELECT c.name 'Cóctel',p.name 'Licor',r.oz_qty 'Oz de licor por cóctel'
+                                         FROM recipes r JOIN cocktails c ON c.id=r.cocktail_id
+                                         JOIN products p ON p.id=r.product_id
+                                         WHERE c.active=1 ORDER BY c.name,p.name""",con)
+            if recipe_df.empty:
+                st.info("Todavía no hay recetas guardadas.")
+            else:
+                st.dataframe(recipe_df,width='stretch',hide_index=True)
+                totals=recipe_df.groupby('Cóctel',as_index=False)['Oz de licor por cóctel'].sum().rename(columns={'Oz de licor por cóctel':'Total oz de licor'})
+                st.markdown("#### Total de licor por cóctel")
+                st.dataframe(totals,width='stretch',hide_index=True)
     with t3:
         st.subheader("Usuarios autorizados")
         st.caption("Solo los correos de esta lista con estado Activo pueden entrar con Google. Compartir el enlace no da acceso.")
@@ -1127,7 +1294,7 @@ elif page=='Administración':
         is_owner=normalized_email(user['email'])==owner_email
         assignable_roles=['STAFF','MANAGER','GENERAL_MANAGER','ADMIN'] if is_owner else ['STAFF','MANAGER','GENERAL_MANAGER']
         role=st.selectbox("Rol",assignable_roles,format_func=lambda x:ROLE_LABELS.get(x,x))
-        st.caption("MANAGER GENERAL puede administrar productos, recetas y usuarios. Solo la cuenta Developer/Owner configurada puede otorgar o modificar el rol ADMIN.")
+        st.caption("MANAGER y MANAGER GENERAL pueden administrar productos, recetas, usuarios y configuración operativa. El reinicio total sigue reservado a ADMIN. Solo la cuenta Developer/Owner configurada puede otorgar o modificar el rol ADMIN.")
         if st.button("Autorizar usuario",type="primary",width="stretch"):
             if not email or '@' not in email:
                 st.error("Ingresa un correo válido.")
@@ -1242,7 +1409,7 @@ elif page=='Administración':
                         st.error(f"No se pudo limpiar los datos históricos: {e}")
             st.divider()
         else:
-            st.info("El reinicio total de datos operativos está reservado para el rol ADMIN.")
+            st.info("Puedes usar las demás opciones de Administración. El reinicio total de datos operativos está reservado exclusivamente para ADMIN.")
             st.divider()
         safety=st.number_input("Stock de seguridad para abastecimiento (%)",min_value=0,max_value=100,value=int(float(setting('safety_stock_pct','15'))),step=1)
         tb=st.number_input("Tolerancia cerveza (botellas)",min_value=0.0,value=float(setting('tolerance_beer','1')),step=.5)
