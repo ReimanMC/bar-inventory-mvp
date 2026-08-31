@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.4"):
+def page_header(title, subtitle="", badge="V0.3.5"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -1016,6 +1016,30 @@ elif page=='Administración':
         if os.path.exists(DB):
             with open(DB,'rb') as fh:
                 st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{date.today().isoformat()}.db",mime="application/octet-stream",width="stretch")
+        st.divider()
+        st.subheader("Inicio de operación / limpiar inventarios anteriores")
+        st.caption("Esta herramienta elimina únicamente las sesiones y conteos de inventario anteriores. Conserva productos, categorías, presentaciones, recetas, usuarios, roles, configuración, POS/ventas y movimientos. El siguiente conteo quedará como nueva línea base.")
+        inv_sessions=one("SELECT COUNT(*) n FROM inventory_sessions")['n']
+        inv_counts=one("SELECT COUNT(*) n FROM inventory_counts")['n']
+        st.info(f"Actualmente hay {inv_sessions} sesiones de inventario y {inv_counts} conteos almacenados.")
+        confirm_reset=st.text_input("Para confirmar escribe exactamente: INICIAR DESDE CERO",key="reset_inventory_confirm")
+        if st.button("Eliminar inventarios anteriores",type="secondary",width="stretch"):
+            if confirm_reset.strip() != "INICIAR DESDE CERO":
+                st.error("Confirmación incorrecta. Escribe exactamente: INICIAR DESDE CERO")
+            else:
+                try:
+                    # Borrar primero los conteos por la relación FK y luego las sesiones.
+                    con.execute("DELETE FROM inventory_counts")
+                    con.execute("DELETE FROM inventory_sessions")
+                    # Se conserva sheet_history_seeded para impedir que el historial importado se vuelva a cargar al reiniciar la app.
+                    con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
+                    con.commit()
+                    backup_db_to_drive()
+                    st.success("Inventarios anteriores eliminados. Catálogo, usuarios, recetas, configuración, movimientos y POS se conservaron. El próximo conteo será la nueva línea base.")
+                    st.rerun()
+                except Exception as e:
+                    con.rollback()
+                    st.error(f"No se pudo limpiar el historial de inventarios: {e}")
         st.divider()
         safety=st.number_input("Stock de seguridad para abastecimiento (%)",min_value=0,max_value=100,value=int(float(setting('safety_stock_pct','15'))),step=1)
         tb=st.number_input("Tolerancia cerveza (botellas)",min_value=0.0,value=float(setting('tolerance_beer','1')),step=.5)
