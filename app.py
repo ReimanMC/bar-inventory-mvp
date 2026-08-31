@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.9"):
+def page_header(title, subtitle="", badge="V0.4.0"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -636,6 +636,234 @@ def daily_trend(d1,d2,category):
             out.append({'Fecha':dd.isoformat(),'Consumo real':max(real,0),'Consumo esperado':max(expected,0)})
     return pd.DataFrame(out)
 
+
+# --------------------------- Dashboard operacional V0.4.0 ---------------------------
+def _latest_count_record(ds, pid, kind, bar_id):
+    return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
+                        s.created_at,s.inventory_cycle,u.name employee
+                 FROM inventory_counts ic
+                 JOIN inventory_sessions s ON s.id=ic.session_id
+                 LEFT JOIN users u ON u.id=s.user_id
+                 WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
+                 ORDER BY s.created_at DESC LIMIT 1""",(ds,kind,pid,bar_id))
+
+def _latest_cycle_for_date(ds):
+    r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle FROM inventory_sessions
+             WHERE session_date=? ORDER BY created_at DESC LIMIT 1""",(ds,))
+    return str(r['cycle']) if r else 'DAILY'
+
+def _count_text(p, base, bottle_equiv=None):
+    if base is None and bottle_equiv is None:
+        return '—'
+    if p['category']=='Cerveza':
+        return f"{float(base or 0):.0f} botellas"
+    beq=bottle_equiv
+    boz=bottle_oz(p)
+    if beq is None and boz and base is not None:
+        beq=float(base)/boz
+    if beq is not None and base is not None and p['bottle_ml']:
+        return f"{float(beq):.2f} bot · {float(base):.2f} oz"
+    if beq is not None:
+        return f"{float(beq):.2f} bot · ⚠ ml pendiente"
+    return f"{float(base or 0):.2f} oz"
+
+def _base_expected_text(p, base):
+    if base is None:
+        return '—'
+    if p['category']=='Cerveza':
+        return f"{float(base):.0f} botellas"
+    boz=bottle_oz(p)
+    if boz:
+        return f"{float(base)/boz:.2f} bot · {float(base):.2f} oz"
+    return f"{float(base):.2f} oz"
+
+def _difference_state(p, diff, registered=True):
+    if not registered:
+        return ('PENDING','⏳ Pendiente','—')
+    if diff is None:
+        return ('OK','🟢 Registrado','—')
+    tol=float(setting('tolerance_beer','1')) if p['category']=='Cerveza' else float(setting('tolerance_liquor','1'))
+    ad=abs(float(diff))
+    unit='bot' if p['category']=='Cerveza' else 'oz'
+    diff_text=f"{float(diff):+.2f} {unit}"
+    if ad<=tol:
+        return ('OK','🟢 OK',diff_text)
+    if ad<=tol*3:
+        return ('REVIEW','🟡 Revisar',diff_text)
+    return ('ALERT','🔴 Alerta',diff_text)
+
+def today_inventory_snapshot(target_date=None):
+    target_date=target_date or date.today()
+    ds=target_date.isoformat()
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    cycle=_latest_cycle_for_date(ds)
+    required=inventory_products(cycle)
+    rows=[]
+    for p in required:
+        op=_latest_count_record(ds,p['id'],'OPENING',bar_id)
+        cl=_latest_count_record(ds,p['id'],'CLOSING',bar_id)
+        rec=cl or op
+        registered=rec is not None
+        expected_stock=None
+        diff=None
+        basis=''
+        if cl is not None and op is not None:
+            # Conteo esperado al cierre = apertura + entradas - ventas teóricas - ajustes autorizados.
+            expected_stock=float(op['qty_base'] or 0)+transfers_in(ds,p['id'],bar_id)-expected_sales(ds,p['id'],p)-adjustments(ds,p['id'],bar_id)
+            diff=float(cl['qty_base'] or 0)-expected_stock
+            basis='Cierre vs esperado'
+        elif op is not None:
+            # Para apertura usamos la diferencia ya calculada contra el cierre anterior.
+            # En licores sin ml la diferencia puede estar expresada en botellas; no la convertimos de forma ficticia.
+            if p['category']=='Licor' and not p['bottle_ml']:
+                diff=None
+                expected_stock=None
+                basis='Apertura registrada · ml pendiente'
+            elif op['variance'] is not None:
+                diff=float(op['variance'])
+                expected_stock=float(op['previous_qty']) if op['previous_qty'] is not None else None
+                basis='Apertura vs cierre anterior'
+            else:
+                basis='Línea base / apertura'
+        state_code,state_label,diff_text=_difference_state(p,diff,registered)
+        rows.append({
+            'Producto':p['name'],'Tipo':p['category'],
+            'Conteo actual':_count_text(p, float(rec['qty_base']) if rec else None, float(rec['qty_bottle_equiv']) if rec and rec['qty_bottle_equiv'] is not None else None),
+            'Esperado':_base_expected_text(p,expected_stock),
+            'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente',
+            'Base comparación':basis,'Empleado':rec['employee'] if rec else '—','Hora':(rec['created_at'][11:16] if rec and rec['created_at'] else '—'),
+            '_state':state_code,'_diff':diff,'_p':p,'_pid':p['id'],'_registered':registered,
+            '_has_opening':op is not None,'_has_closing':cl is not None
+        })
+    return rows,cycle
+
+def _inventory_progress_today(snapshot):
+    total=len(snapshot); registered=sum(1 for r in snapshot if r['_registered'])
+    open_done=any(r['_has_opening'] for r in snapshot)
+    close_done=any(r['_has_closing'] for r in snapshot)
+    if total==0:
+        state='Sin productos configurados'
+    elif close_done and registered==total:
+        state='Completado'
+    elif registered>0:
+        state='En progreso'
+    else:
+        state='Sin iniciar'
+    return total,registered,open_done,close_done,state
+
+def _category_progress(snapshot, category):
+    rows=[r for r in snapshot if r['Tipo']==category]
+    total=len(rows); done=sum(1 for r in rows if r['_registered'])
+    if total==0: return 'No configurados'
+    if done==0: return f'Pendientes · 0/{total}'
+    if done<total: return f'En progreso · {done}/{total}'
+    return f'Registradas · {done}/{total}'
+
+def _last_inventory_activity(ds):
+    return one("""SELECT s.created_at,u.name employee,s.session_type,s.inventory_cycle,COUNT(ic.id) item_count
+                  FROM inventory_sessions s
+                  LEFT JOIN users u ON u.id=s.user_id
+                  LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                  WHERE s.session_date=?
+                  GROUP BY s.id
+                  ORDER BY s.created_at DESC LIMIT 1""",(ds,))
+
+def recent_activity(limit=8):
+    items=[]
+    # Inventarios
+    for r in q("""SELECT s.created_at,u.name employee,s.session_type,s.inventory_cycle,COUNT(ic.id) qty
+                  FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                  LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                  GROUP BY s.id ORDER BY s.created_at DESC LIMIT 20"""):
+        kind='Apertura' if r['session_type']=='OPENING' else 'Cierre'
+        cycle='semanal' if str(r['inventory_cycle'])=='WEEKLY' else 'diario'
+        items.append((r['created_at'],r['employee'] or 'Usuario',f"{kind} {cycle} · {int(r['qty'] or 0)} productos"))
+    # POS agrupado por guardado/tipo
+    for r in q("""SELECT ps.created_at,u.name employee,ps.sale_type,SUM(ps.quantity) qty
+                  FROM pos_sales ps LEFT JOIN users u ON u.id=ps.user_id
+                  GROUP BY ps.created_at,ps.user_id,ps.sale_type ORDER BY ps.created_at DESC LIMIT 20"""):
+        items.append((r['created_at'],r['employee'] or 'Usuario',f"POS {r['sale_type']} · {float(r['qty'] or 0):g}"))
+    # Movimientos
+    labels={'SUPPLIER':'Recepción proveedor','TRANSFER':'Traslado Bodega → Bar','PRUEBA':'Prueba','DESPERDICIO':'Desperdicio','CORTESIA':'Cortesía'}
+    for r in q("""SELECT m.created_at,u.name employee,m.movement_type,p.name product,m.qty_base,m.qty_bottle_equiv
+                  FROM movements m LEFT JOIN users u ON u.id=m.user_id JOIN products p ON p.id=m.product_id
+                  ORDER BY m.created_at DESC LIMIT 20"""):
+        items.append((r['created_at'],r['employee'] or 'Usuario',f"{labels.get(r['movement_type'],r['movement_type'])} · {r['product']}"))
+    items=[x for x in items if x[0]]
+    items.sort(key=lambda x:x[0],reverse=True)
+    out=[]
+    for created,employee,action in items[:limit]:
+        try: when=datetime.fromisoformat(created).strftime('%m-%d %H:%M')
+        except Exception: when=str(created)
+        out.append({'Fecha / hora':when,'Usuario':employee,'Acción':action})
+    return out
+
+def period_inventory_performance(d1,d2):
+    """Comparación real vs esperado únicamente en días con apertura y cierre.
+    Evita generar falsas diferencias cuando existe POS pero el inventario físico todavía está incompleto.
+    """
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    rows=[]
+    for p in products():
+        if p['category'] not in ('Cerveza','Licor'): continue
+        real=expected=adj=0.0; complete=0
+        for dd in date_range(d1,d2):
+            ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar_id); cl=session_qty(ds,p['id'],'CLOSING',bar_id)
+            if op is None or cl is None:
+                continue
+            real += op + transfers_in(ds,p['id'],bar_id) - cl
+            expected += expected_sales(ds,p['id'],p)
+            adj += adjustments(ds,p['id'],bar_id)
+            complete += 1
+        diff=real-(expected+adj) if complete else None
+        state_code,state_label,diff_text=_difference_state(p,diff,complete>0)
+        rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':real,'Consumo esperado':expected,
+                     'Ajustes':adj,'Diferencia':diff,'Días completos':complete,'Estado':state_label,'_state':state_code,
+                     '_p':p,'_diff_text':diff_text})
+    return rows
+
+def cocktail_sales_summary(d1,d2):
+    rows=q("""SELECT c.id,c.name,COALESCE(SUM(CASE WHEN ps.sale_type='Cóctel' THEN ps.quantity ELSE 0 END),0) sold,
+                     COALESCE((SELECT SUM(r.oz_qty) FROM recipes r WHERE r.cocktail_id=c.id),0) recipe_oz
+              FROM cocktails c
+              LEFT JOIN pos_sales ps ON ps.cocktail_id=c.id AND ps.sale_date BETWEEN ? AND ?
+              WHERE c.active=1 GROUP BY c.id,c.name ORDER BY sold DESC,c.name""",(d1.isoformat(),d2.isoformat()))
+    out=[]
+    for r in rows:
+        sold=float(r['sold'] or 0); recipe_oz=float(r['recipe_oz'] or 0)
+        if recipe_oz<=0 and sold>0: code,label='ALERT','🔴 Sin receta'
+        elif recipe_oz<=0: code,label='PENDING','⏳ Receta pendiente'
+        else: code,label='OK','🟢 OK'
+        out.append({'Cóctel':r['name'],'Vendidos':sold,'Oz licor / cóctel':recipe_oz if recipe_oz>0 else None,
+                    'Consumo teórico':sold*recipe_oz,'Estado':label,'_state':code})
+    return out
+
+def shot_sales_summary(d1,d2):
+    rows=q("""SELECT p.name,SUM(ps.quantity) sold,
+                     SUM(ps.quantity*COALESCE(ps.oz_per_unit,0)) total_oz
+              FROM pos_sales ps JOIN products p ON p.id=ps.product_id
+              WHERE ps.sale_type='Shot' AND ps.sale_date BETWEEN ? AND ?
+              GROUP BY p.id,p.name ORDER BY sold DESC,p.name""",(d1.isoformat(),d2.isoformat()))
+    out=[]
+    for r in rows:
+        sold=float(r['sold'] or 0); total=float(r['total_oz'] or 0)
+        out.append({'Licor':r['name'],'Shots vendidos':sold,'Oz / shot promedio':(total/sold if sold else 0),
+                    'Consumo teórico':total,'Estado':'🟢 OK','_state':'OK'})
+    return out
+
+def beer_sales_summary(d1,d2):
+    rows=q("""SELECT p.name,SUM(ps.quantity) sold FROM pos_sales ps JOIN products p ON p.id=ps.product_id
+              WHERE ps.sale_type='Cerveza' AND ps.sale_date BETWEEN ? AND ?
+              GROUP BY p.id,p.name ORDER BY sold DESC,p.name""",(d1.isoformat(),d2.isoformat()))
+    return [{'Cerveza':r['name'],'Vendidas':float(r['sold'] or 0)} for r in rows]
+
+def _status_filter(rows,status):
+    if status=='Todos': return rows
+    if status=='Con alerta': return [r for r in rows if r.get('_state') in ('ALERT','REVIEW')]
+    if status=='Pendientes': return [r for r in rows if r.get('_state')=='PENDING']
+    if status=='OK': return [r for r in rows if r.get('_state')=='OK']
+    return rows
+
 # --------------------------- Google authentication ---------------------------
 def secret_value(section, key, default=""):
     try:
@@ -675,7 +903,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.3.7 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.4.0 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -958,104 +1186,223 @@ elif page=='POS / Ventas':
                     con.commit(); backup_db_to_drive(); st.success(f"Ventas por botella guardadas: {len(rows)} registro(s).")
 
 elif page=='Dashboard':
-    page_header("Dashboard Gerencial", "Resumen ejecutivo del inventario, consumo, diferencias y abastecimiento.")
-    period=st.selectbox("Periodo",['Hoy','7 días','14 días','28 días','Personalizado'],index=1)
-    if period=='Hoy': d1=d2=date.today()
-    elif period=='7 días': d2=date.today(); d1=d2-timedelta(days=6)
-    elif period=='14 días': d2=date.today(); d1=d2-timedelta(days=13)
-    elif period=='28 días': d2=date.today(); d1=d2-timedelta(days=27)
+    page_header("Dashboard Operacional", "Inventario, ventas, diferencias, alertas y actividad en una sola vista.")
+
+    # Un botón explícito evita que una sesión gerencial abierta quede mostrando datos antiguos
+    # después de que otro usuario registre información desde otro dispositivo.
+    top_refresh,top_note=st.columns([1,4])
+    if top_refresh.button("🔄 Actualizar datos",width='stretch',key='dash_refresh'):
+        st.rerun()
+    top_note.caption(f"Última actualización de esta vista: {datetime.now().strftime('%I:%M:%S %p')}")
+
+    f1,f2,f3=st.columns([1.15,1.45,1.3])
+    period=f1.selectbox("Periodo",['Hoy','7 días','Semana','Mes','Personalizado'],index=0,key='dash_period_v4')
+    category_view=f2.selectbox("Ver",['General','Licores','Cervezas','Cócteles','Shots'],index=0,key='dash_category_v4')
+    status_view=f3.selectbox("Estado",['Todos','Con alerta','Pendientes','OK'],index=0,key='dash_status_v4')
+    if period=='Hoy':
+        d1=d2=date.today()
+    elif period=='7 días':
+        d2=date.today(); d1=d2-timedelta(days=6)
+    elif period=='Semana':
+        d2=date.today(); d1=d2-timedelta(days=d2.weekday())
+    elif period=='Mes':
+        d2=date.today(); d1=d2.replace(day=1)
     else:
-        a,b=st.columns(2); d1=a.date_input("Desde",value=date.today()-timedelta(days=6),key='dash1'); d2=b.date_input("Hasta",value=date.today(),key='dash2')
-    if d2<d1: st.error("La fecha final no puede ser anterior a la inicial."); st.stop()
+        a,b=st.columns(2)
+        d1=a.date_input("Desde",value=date.today()-timedelta(days=6),key='dash1_v4')
+        d2=b.date_input("Hasta",value=date.today(),key='dash2_v4')
+    if d2<d1:
+        st.error("La fecha final no puede ser anterior a la inicial."); st.stop()
 
-    data=consolidated(d1,d2)
-    with_data=[r for r in data if r['Días completos']>0 or r['Consumo esperado']>0 or r['Ajustes']>0 or r['Alertas apertura']>0]
-    alerts=[r for r in with_data if r['Estado']!='✅ OK']; ok=[r for r in with_data if r['Estado']=='✅ OK']
-    liq_oz=sum(max(float(r['Consumo real'] or 0),0) for r in with_data if r['Categoría']=='Licor')
-    beer_units=sum(max(float(r['Consumo real'] or 0),0) for r in with_data if r['Categoría']=='Cerveza')
-    accuracies=[product_accuracy(r) for r in with_data]; accuracies=[x for x in accuracies if x is not None]
-    accuracy=sum(accuracies)/len(accuracies) if accuracies else None
-    known_costs=[difference_cost(r) for r in with_data]; known_costs=[x for x in known_costs if x is not None]
-    diff_cost=sum(known_costs) if known_costs else None
+    today_snapshot,cycle=today_inventory_snapshot(date.today())
+    total_required,registered_today,open_done,close_done,inventory_state=_inventory_progress_today(today_snapshot)
+    current_alerts=[r for r in today_snapshot if r['_state']=='ALERT']
+    current_reviews=[r for r in today_snapshot if r['_state']=='REVIEW']
+    last_act=_last_inventory_activity(date.today().isoformat())
 
-    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
-    coverage=[]
-    days=max((d2-d1).days+1,1)
-    for r in with_data:
-        daily=max(float(r['Consumo real'] or 0),0)/max(r['Días completos'],1) if r['Días completos'] else 0
-        if daily>0:
-            stock=max(current_stock(r['_pid'],bar)+current_stock(r['_pid'],wh),0)
-            coverage.append((stock/daily,r['Producto']))
-    critical=min(coverage,key=lambda x:x[0],default=None)
+    beer_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cerveza' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
+    cocktails_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cóctel' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
+    shots_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Shot' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
 
-    k1,k2,k3=st.columns(3)
-    k1.metric("Consumo del periodo",f"{liq_oz:,.1f} oz licor",delta=f"{beer_units:,.0f} cervezas/unid")
-    k2.metric("Exactitud promedio",f"{accuracy:.1f}%" if accuracy is not None else "—")
-    k3.metric("Productos con alerta",len(alerts),delta=f"{len(ok)} sin alerta")
-    k4,k5,k6=st.columns(3)
-    worst=max(with_data,key=lambda r:abs(r['Diferencia no explicada']),default=None)
-    k4.metric("Mayor diferencia",f"{abs(worst['Diferencia no explicada']):.2f} {worst['_unit']}" if worst else "—",delta=worst['Producto'] if worst else None)
-    k5.metric("Costo estimado diferencias",f"${diff_cost:,.2f}" if diff_cost is not None else "Pendiente costos")
-    k6.metric("Cobertura crítica",f"{critical[0]:.1f} días" if critical else "—",delta=critical[1] if critical else None)
-
-    st.caption("Exactitud = cercanía entre consumo físico y consumo explicado por POS/recetas/ajustes. El costo de diferencias aparece cuando se registre el costo por botella/unidad.")
-
-    st.markdown('<div class="ramona-section">🚨 Alertas importantes</div>', unsafe_allow_html=True)
-    if alerts:
-        for r in sorted(alerts,key=lambda x:(-abs(x['Diferencia no explicada']),-x['Alertas apertura']))[:8]:
-            unit=r['_unit']; diff=r['Diferencia no explicada']
-            st.warning(f"{r['Producto']} · diferencia no explicada {diff:+.2f} {unit} · alertas apertura: {r['Alertas apertura']}")
+    perf=period_inventory_performance(d1,d2)
+    perf_complete=[r for r in perf if r['Días completos']>0]
+    worst=max(perf_complete,key=lambda r:abs(float(r['Diferencia'] or 0)),default=None)
+    if not worst:
+        current_comp=[r for r in today_snapshot if r['_diff'] is not None]
+        worst=max(current_comp,key=lambda r:abs(float(r['_diff'] or 0)),default=None)
+        worst_text=(worst['Diferencia'] if worst else '—')
+        worst_name=(worst['Producto'] if worst else 'Sin diferencia comparable')
     else:
-        st.success("No hay alertas de inventario para el periodo seleccionado.")
+        unit='bot' if worst['Categoría']=='Cerveza' else 'oz'
+        worst_text=f"{float(worst['Diferencia']):+.2f} {unit}"
+        worst_name=worst['Producto']
 
-    st.markdown('<div class="ramona-section">📦 Resumen por producto</div>', unsafe_allow_html=True)
-    show=[]
-    for r in with_data:
-        p=r['_p']
-        show.append({
-            'Producto':r['Producto'], 'Categoría':r['Categoría'],
-            'Consumo real':oz_and_bottles_text(p,r['Consumo real']),
-            'Consumo esperado':oz_and_bottles_text(p,r['Consumo esperado']),
-            'Diferencia':oz_and_bottles_text(p,abs(r['Diferencia no explicada'])),
-            'Aperturas con alerta':r['Alertas apertura'],'Estado':r['Estado']})
-    if show: st.dataframe(pd.DataFrame(show),width="stretch",hide_index=True)
-    else: st.info("No hay días completos de apertura+cierre ni ventas/ajustes en este rango.")
+    # KPIs operacionales
+    k1,k2,k3,k4,k5,k6=st.columns(6)
+    k1.metric("Inventario de hoy",inventory_state,delta=('Semanal' if cycle=='WEEKLY' else 'Diario'))
+    k2.metric("Productos registrados",f"{registered_today} / {total_required}",delta=f"{(registered_today/total_required*100):.0f}%" if total_required else '—')
+    k3.metric("Alertas críticas",len(current_alerts),delta=f"{len(current_reviews)} por revisar")
+    k4.metric("Mayor diferencia",worst_text,delta=worst_name)
+    k5.metric("Cervezas vendidas",f"{float(beer_sold or 0):,.0f}",delta=period)
+    k6.metric("Cócteles vendidos",f"{float(cocktails_sold or 0):,.0f}",delta=f"{float(shots_sold or 0):,.0f} shots")
 
-    c1,c2=st.columns(2)
-    with c1:
-        st.subheader("🔥 Top consumo")
-        top=sorted(with_data,key=lambda r:max(float(r['Consumo real'] or 0),0),reverse=True)[:5]
-        if top:
-            st.dataframe(pd.DataFrame([{'Producto':r['Producto'],'Consumo':oz_and_bottles_text(r['_p'],r['Consumo real'])} for r in top]),width="stretch",hide_index=True)
-    with c2:
-        st.subheader("⚠️ Top diferencias")
-        topd=sorted(with_data,key=lambda r:abs(float(r['Diferencia no explicada'] or 0)),reverse=True)[:5]
-        if topd:
-            st.dataframe(pd.DataFrame([{'Producto':r['Producto'],'Diferencia':f"{r['Diferencia no explicada']:+.2f} {r['_unit']}",'Estado':r['Estado']} for r in topd]),width="stretch",hide_index=True)
+    # Estado de inventario + alertas + actividad
+    s1,s2,s3=st.columns([1.05,1.15,1.15])
+    with s1:
+        st.markdown('<div class="ramona-section">📋 Estado de inventario</div>',unsafe_allow_html=True)
+        opening_txt='✅ Registrada' if open_done else '⏳ Pendiente'
+        closing_txt='✅ Registrado' if close_done else '⏳ Pendiente'
+        status_rows=[
+            {'Área':'Cervezas','Estado':_category_progress(today_snapshot,'Cerveza')},
+            {'Área':'Licores principales' if cycle=='DAILY' else 'Licores','Estado':_category_progress(today_snapshot,'Licor')},
+            {'Área':'Apertura','Estado':opening_txt},
+            {'Área':'Cierre','Estado':closing_txt},
+        ]
+        if last_act:
+            status_rows.append({'Área':'Último registro','Estado':f"{last_act['employee']} · {last_act['created_at'][11:16]}"})
+        st.dataframe(pd.DataFrame(status_rows),width='stretch',hide_index=True)
+    with s2:
+        st.markdown('<div class="ramona-section">🚨 Alertas prioritarias</div>',unsafe_allow_html=True)
+        priority=[r for r in today_snapshot if r['_state'] in ('ALERT','REVIEW')]
+        if priority:
+            pr=[]
+            for r in sorted(priority,key=lambda x:abs(float(x['_diff'] or 0)),reverse=True)[:6]:
+                pr.append({'Producto':r['Producto'],'Diferencia':r['Diferencia'],'Estado':r['Alerta']})
+            st.dataframe(pd.DataFrame(pr),width='stretch',hide_index=True)
+        else:
+            st.success("No hay diferencias con alerta en el inventario registrado hoy.")
+    with s3:
+        st.markdown('<div class="ramona-section">🕒 Actividad reciente</div>',unsafe_allow_html=True)
+        acts=recent_activity(7)
+        if acts: st.dataframe(pd.DataFrame(acts),width='stretch',hide_index=True)
+        else: st.info("Todavía no hay actividad registrada.")
 
-    st.markdown('<div class="ramona-section">📈 Tendencia: consumo real vs esperado</div>', unsafe_allow_html=True)
-    t1,t2=st.tabs(["Licores (oz)","Cervezas (unidades)"])
-    with t1:
-        t=daily_trend(d1,d2,'Licor')
-        if len(t): st.line_chart(t.set_index('Fecha'),width="stretch")
-        else: st.info("Sin datos suficientes de licores para graficar.")
-    with t2:
-        t=daily_trend(d1,d2,'Cerveza')
-        if len(t): st.line_chart(t.set_index('Fecha'),width="stretch")
-        else: st.info("Sin datos suficientes de cerveza para graficar.")
+    # -------- filtros de vista --------
+    if category_view in ('General','Licores','Cervezas'):
+        st.markdown('<div class="ramona-section">📦 Detalle de inventario actual</div>',unsafe_allow_html=True)
+        physical=today_snapshot
+        if category_view=='Licores': physical=[r for r in physical if r['Tipo']=='Licor']
+        elif category_view=='Cervezas': physical=[r for r in physical if r['Tipo']=='Cerveza']
+        physical=_status_filter(physical,status_view)
+        if physical:
+            cols=['Producto','Tipo','Conteo actual','Esperado','Diferencia','Alerta','Estado','Empleado','Hora']
+            st.dataframe(pd.DataFrame([{c:r[c] for c in cols} for r in physical]),width='stretch',hide_index=True)
+            st.caption("Un producto no contado aparece como Pendiente y no genera una diferencia falsa. El cierre se compara contra stock esperado; la apertura, contra el cierre anterior cuando existe una referencia comparable.")
+        else:
+            st.info("No hay productos que coincidan con los filtros seleccionados.")
 
-    st.divider(); st.markdown('<div class="ramona-section">Detalle para auditoría</div>', unsafe_allow_html=True)
-    mode=st.selectbox("Mostrar",['Solo alertas de apertura','Aperturas','Cierres','Ambos'])
-    if mode=='Solo alertas de apertura':
-        df=pd.read_sql_query("""SELECT s.session_date Fecha,p.name Producto,ROUND(ic.previous_qty,2) 'Cierre anterior',ROUND(ic.qty_base,2) Apertura,ROUND(ic.variance,2) Diferencia,COALESCE(ic.observation,'') Observación,u.name Empleado
-                              FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id JOIN products p ON p.id=ic.product_id JOIN users u ON u.id=s.user_id
-                              WHERE s.session_type='OPENING' AND s.session_date BETWEEN ? AND ? AND ABS(COALESCE(ic.variance,0))>0 ORDER BY s.session_date DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat()))
+        # Rendimiento del periodo solo con días físicamente comparables.
+        st.markdown('<div class="ramona-section">📊 Consumo físico vs consumo explicado</div>',unsafe_allow_html=True)
+        perf_view=perf
+        if category_view=='Licores': perf_view=[r for r in perf if r['Categoría']=='Licor']
+        elif category_view=='Cervezas': perf_view=[r for r in perf if r['Categoría']=='Cerveza']
+        perf_view=[r for r in perf_view if r['Días completos']>0]
+        if status_view!='Todos': perf_view=_status_filter(perf_view,status_view)
+        if perf_view:
+            perf_show=[]
+            for r in perf_view:
+                p=r['_p']; unit='unid' if r['Categoría']=='Cerveza' else 'oz'
+                perf_show.append({'Producto':r['Producto'],'Tipo':r['Categoría'],
+                                  'Consumo real':f"{r['Consumo real']:.2f} {unit}",
+                                  'Consumo esperado':f"{r['Consumo esperado']:.2f} {unit}",
+                                  'Ajustes':f"{r['Ajustes']:.2f} {unit}",
+                                  'Diferencia':r['_diff_text'],'Estado':r['Estado'],'Días completos':r['Días completos']})
+            st.dataframe(pd.DataFrame(perf_show),width='stretch',hide_index=True)
+        else:
+            st.info("Aún no hay días completos de apertura + cierre en este periodo. Las ventas pueden existir, pero no se convierten en una diferencia física hasta tener ambos conteos.")
+
+        if category_view=='Cervezas':
+            st.markdown('<div class="ramona-section">🍺 Ventas de cervezas POS</div>',unsafe_allow_html=True)
+            bsum=beer_sales_summary(d1,d2)
+            if bsum: st.dataframe(pd.DataFrame(bsum),width='stretch',hide_index=True)
+            else: st.info("No hay ventas de cerveza registradas en el periodo.")
+
+        # Tendencias: separadas por unidad para no mezclar oz con unidades.
+        if category_view in ('General','Licores'):
+            st.markdown('<div class="ramona-section">📈 Tendencia de licores (oz)</div>',unsafe_allow_html=True)
+            lt=daily_trend(d1,d2,'Licor')
+            if len(lt): st.line_chart(lt.set_index('Fecha'),width='stretch')
+            else: st.info("Sin datos suficientes de licores para graficar.")
+        if category_view in ('General','Cervezas'):
+            st.markdown('<div class="ramona-section">📈 Tendencia de cervezas (unidades)</div>',unsafe_allow_html=True)
+            bt=daily_trend(d1,d2,'Cerveza')
+            if len(bt): st.line_chart(bt.set_index('Fecha'),width='stretch')
+            else: st.info("Sin datos suficientes de cerveza para graficar.")
+
+        if category_view=='General':
+            st.markdown('<div class="ramona-section">🛒 Abastecimiento rápido</div>',unsafe_allow_html=True)
+            bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh_id=one("SELECT id FROM locations WHERE name='Bodega'")['id']
+            safety=float(setting('safety_stock_pct','15'))/100
+            days_period=max((d2-d1).days+1,1)
+            buy_rows=[]
+            for r in perf:
+                if r['Días completos']<=0: continue
+                p=r['_p']; daily=max(float(r['Consumo real'] or 0),0)/r['Días completos']; target=daily*7*(1+safety)
+                stock=max(current_stock(p['id'],bar_id)+current_stock(p['id'],wh_id),0); need=max(target-stock,0)
+                if need<=0: continue
+                if p['category']=='Licor':
+                    boz=bottle_oz(p); action=(f"Comprar {math.ceil(need/boz)} bot" if boz else '⚠ Falta ml')
+                else: action=f"Comprar {math.ceil(need)} unid"
+                buy_rows.append({'Producto':p['name'],'Necesidad':oz_and_bottles_text(p,need).replace('\n',' · '),'Acción sugerida':action})
+            if buy_rows:
+                st.dataframe(pd.DataFrame(buy_rows[:8]),width='stretch',hide_index=True)
+            else:
+                st.success("No hay necesidad de compra calculable con los días completos del periodo.")
+
+    elif category_view=='Cócteles':
+        st.markdown('<div class="ramona-section">🍹 Cócteles</div>',unsafe_allow_html=True)
+        rows=cocktail_sales_summary(d1,d2)
+        rows=_status_filter(rows,status_view)
+        if rows:
+            show=[]
+            for r in rows:
+                show.append({'Cóctel':r['Cóctel'],'Vendidos':f"{r['Vendidos']:.0f}",
+                             'Oz licor / cóctel':f"{r['Oz licor / cóctel']:.2f}" if r['Oz licor / cóctel'] is not None else '—',
+                             'Consumo teórico':f"{r['Consumo teórico']:.2f} oz",'Estado':r['Estado']})
+            st.dataframe(pd.DataFrame(show),width='stretch',hide_index=True)
+            sold_rows=[r for r in rows if r['Vendidos']>0]
+            if sold_rows:
+                chart=pd.DataFrame({'Cóctel':[r['Cóctel'] for r in sold_rows],'Vendidos':[r['Vendidos'] for r in sold_rows]}).set_index('Cóctel')
+                st.bar_chart(chart,width='stretch')
+        else:
+            st.info("No hay cócteles que coincidan con los filtros.")
+        st.caption("Si un cóctel tiene ventas pero no tiene receta, aparece como alerta porque no es posible explicar su consumo de licor.")
+
+    elif category_view=='Shots':
+        st.markdown('<div class="ramona-section">🥃 Shots</div>',unsafe_allow_html=True)
+        rows=shot_sales_summary(d1,d2)
+        rows=_status_filter(rows,status_view)
+        if rows:
+            show=[{'Licor':r['Licor'],'Shots vendidos':f"{r['Shots vendidos']:.0f}",
+                   'Oz / shot promedio':f"{r['Oz / shot promedio']:.2f}",
+                   'Consumo teórico':f"{r['Consumo teórico']:.2f} oz",'Estado':r['Estado']} for r in rows]
+            st.dataframe(pd.DataFrame(show),width='stretch',hide_index=True)
+            chart=pd.DataFrame({'Licor':[r['Licor'] for r in rows],'Shots vendidos':[r['Shots vendidos'] for r in rows]}).set_index('Licor')
+            st.bar_chart(chart,width='stretch')
+        else:
+            st.info("No hay ventas de shots que coincidan con los filtros en el periodo.")
+
+    st.divider()
+    st.markdown('<div class="ramona-section">🔎 Detalle para auditoría</div>',unsafe_allow_html=True)
+    audit_mode=st.selectbox("Mostrar",['Actividad de inventario','Aperturas','Cierres','Ambos'],key='dash_audit_v4')
+    if audit_mode=='Actividad de inventario':
+        df=pd.read_sql_query("""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
+                                      ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) Diferencia,
+                                      COALESCE(ic.observation,'') Observación,u.name Empleado
+                               FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+                               JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
+                               WHERE s.session_date BETWEEN ? AND ? ORDER BY s.created_at DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat()))
     else:
-        types={'Aperturas':['OPENING'],'Cierres':['CLOSING'],'Ambos':['OPENING','CLOSING']}[mode]; placeholders=','.join('?'*len(types))
-        df=pd.read_sql_query(f"""SELECT s.session_date Fecha,s.session_type Tipo,p.name Producto,ROUND(ic.qty_base,2) Conteo,COALESCE(ic.observation,'') Observación,u.name Empleado
-                              FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id JOIN products p ON p.id=ic.product_id JOIN users u ON u.id=s.user_id
-                              WHERE s.session_date BETWEEN ? AND ? AND s.session_type IN ({placeholders}) ORDER BY s.session_date DESC,s.session_type,p.name""",con,params=(d1.isoformat(),d2.isoformat(),*types))
-    st.dataframe(df,width="stretch",hide_index=True)
+        types={'Aperturas':['OPENING'],'Cierres':['CLOSING'],'Ambos':['OPENING','CLOSING']}[audit_mode]
+        placeholders=','.join('?'*len(types))
+        df=pd.read_sql_query(f"""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
+                                       ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) Diferencia,
+                                       COALESCE(ic.observation,'') Observación,u.name Empleado
+                                FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+                                JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
+                                WHERE s.session_date BETWEEN ? AND ? AND s.session_type IN ({placeholders})
+                                ORDER BY s.created_at DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat(),*types))
+    st.dataframe(df,width='stretch',hide_index=True)
 
 elif page=='Abastecimiento':
     page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
