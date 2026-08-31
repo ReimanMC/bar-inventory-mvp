@@ -70,7 +70,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.3.8"):
+def page_header(title, subtitle="", badge="V0.3.9"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -1135,11 +1135,53 @@ elif page=='Administración':
             for label in selected_daily:
                 con.execute("UPDATE products SET daily_inventory=1 WHERE id=?",(liquor_map[label]['id'],))
             con.commit(); backup_db_to_drive(); st.success("Lista de licores principales actualizada."); st.rerun()
-        pid=st.number_input("ID del producto a actualizar",min_value=1,step=1); newml=st.number_input("Nuevo ml",min_value=0.0,step=5.0,key='updml'); newcost=st.number_input("Costo por botella/unidad ($, opcional)",min_value=0.0,step=.01,key='updcost')
-        if st.button("Actualizar presentación / costo"):
-            ex("UPDATE products SET bottle_ml=?,unit_cost=? WHERE id=?",(newml or None,newcost or None,int(pid)))
-            if newml>0: backfill_product_bottle_counts(int(pid))
-            st.success("Producto actualizado. Si había conteos guardados por botellas, sus oz fueron recalculadas automáticamente."); st.rerun()
+        st.markdown("#### Actualizar presentación / costo")
+        st.caption("Selecciona el producto por su nombre. Ya no necesitas recordar ni escribir el ID interno.")
+        update_rows=products(active=False)
+        if not update_rows:
+            st.info("No hay productos registrados para actualizar.")
+        else:
+            def update_product_label(r):
+                ml_txt=f"{int(r['bottle_ml'])} ml" if r['bottle_ml'] else "ml pendiente"
+                state_txt="" if int(r['active'] or 0)==1 else " · Inactivo"
+                return f"{r['name']} · {r['category']} · {ml_txt}{state_txt}"
+
+            update_map={update_product_label(r):r for r in update_rows}
+            selected_product_label=st.selectbox(
+                "Producto a actualizar",
+                list(update_map.keys()),
+                key='update_product_select'
+            )
+            selected_product=update_map[selected_product_label]
+            pid=int(selected_product['id'])
+            current_ml=float(selected_product['bottle_ml'] or 0.0)
+            current_cost=float(selected_product['unit_cost'] or 0.0)
+
+            info1,info2,info3=st.columns(3)
+            info1.metric("Categoría",selected_product['category'])
+            info2.metric("Presentación actual",f"{current_ml:g} ml" if current_ml>0 else "Pendiente")
+            info3.metric("Costo actual",f"${current_cost:,.2f}" if current_cost>0 else "Pendiente")
+
+            newml=st.number_input(
+                "Nuevo ml",
+                min_value=0.0,
+                value=current_ml,
+                step=5.0,
+                key=f'updml_{pid}'
+            )
+            newcost=st.number_input(
+                "Costo por botella/unidad ($, opcional)",
+                min_value=0.0,
+                value=current_cost,
+                step=.01,
+                key=f'updcost_{pid}'
+            )
+            if st.button("Actualizar presentación / costo",key='update_product_button'):
+                ex("UPDATE products SET bottle_ml=?,unit_cost=? WHERE id=?",(newml or None,newcost or None,pid))
+                if newml>0:
+                    backfill_product_bottle_counts(pid)
+                st.success(f"{selected_product['name']} actualizado. Si había conteos guardados por botellas, sus oz fueron recalculadas automáticamente.")
+                st.rerun()
     with t2:
         st.subheader("Cócteles y recetas")
         st.caption("Las recetas se registran exclusivamente en onzas (oz) de licor por cóctel. Estas cantidades alimentan el consumo teórico del Dashboard cuando se registran las ventas del POS.")
