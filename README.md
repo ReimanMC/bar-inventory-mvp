@@ -1,178 +1,40 @@
-# Inventario La Ramona — V0.4.5
+# Inventario La Ramona — V0.4.6
 
-## Objetivo de esta versión
+## Corrección de reconciliación de inventario
 
-V0.4.5 corrige la lógica de comparación del inventario y elimina el concepto ambiguo de **“Esperado”** en las vistas gerenciales.
+V0.4.6 corrige la interpretación de salida física, venta por conteo, POS y alertas en toda la aplicación.
 
-La comparación operativa ahora sigue esta lógica:
+### Fórmula operativa
 
-**Consumo físico = Apertura + Entradas al Bar − Cierre**
+- **Salida física** = Apertura + Entradas al bar − Cierre.
+- La salida física nunca se presenta como un número negativo.
+- Si el cierre supera Apertura + Entradas, la aplicación muestra **0 como salida física** y crea una incidencia de **stock aumentado sin entrada registrada**, para revisar conteo o movimientos.
+- **Ajustes autorizados** incluyen Pruebas, Desperdicios, Cortesías y Roturas / botellas quebradas.
+- **Venta por conteo** = max(Salida física − Ajustes autorizados, 0).
+- **Diferencia** = Venta por conteo − Ventas POS / recetas.
 
-**Venta por conteo = Consumo físico − Ajustes autorizados**
+### Interpretación de la diferencia
 
-Los ajustes autorizados incluyen:
+- **0**: el conteo y el POS coinciden dentro de la tolerancia.
+- **Positiva**: el inventario físico indica más ventas/salidas que las registradas en POS; puede existir venta no registrada u otra salida no documentada.
+- **Negativa**: el POS registra más ventas que las explicadas por el conteo físico; requiere revisar conteo, POS o movimientos.
+- Se generan alertas en **ambos sentidos** cuando la diferencia absoluta supera la tolerancia configurada.
+- Si el POS todavía no fue confirmado, la comparación permanece como **Pendiente POS**, salvo que exista una incidencia física independiente (por ejemplo, stock aumentado sin una entrada registrada).
 
-- Pruebas.
-- Desperdicios.
-- Cortesías.
+### Unidades de licor
 
-Luego:
+Los licores continúan analizándose en **onzas**, pero se muestran también como **botellas equivalentes** cuando la presentación en ml está configurada. Compras, recepción de proveedores y venta de botellas continúan operándose en botellas.
 
-**Diferencia = Venta por conteo − Venta explicada por POS**
+### Guía durante el conteo
 
-La alerta se genera únicamente a partir de esta última diferencia.
+- En **Apertura**, cada producto muestra de forma destacada la **BASE PARA APERTURA**, tomada del último cierre anterior disponible.
+- En **Cierre**, cada producto muestra la **BASE PARA CIERRE**, tomada de la apertura del mismo día.
+- Durante el cierre se muestra una estimación de Salida física, Ajustes registrados y Venta por conteo antes de guardar.
 
-Ejemplo cerveza:
+### Dashboard y reporte ejecutivo
 
-- Apertura Corona: 150.
-- Cierre Corona: 120.
-- Ajustes: 0.
-- Venta por conteo: 30.
-- POS: 30.
-- Diferencia: 0.
-- Estado: OK.
+El Dashboard y el PDF utilizan la misma lógica de reconciliación. Se reemplaza el concepto ambiguo de “Esperado” por comparación directa entre **Venta por conteo** y **Ventas POS / recetas**, e incluyen una columna de **Incidencia física** para identificar aumentos de stock no explicados o ajustes inconsistentes.
 
-Si el POS registra 27, la diferencia es +3 y el producto pasa a revisión/alerta según la tolerancia configurada.
+## Compatibilidad
 
-## POS pendiente no genera falsas alertas
-
-Para evitar interpretar como cero un POS que todavía no se ha ingresado, la aplicación incorpora confirmación de las cuatro secciones POS:
-
-- Cócteles.
-- Shots.
-- Cervezas.
-- Botellas de licor.
-
-Cada sección puede guardarse con ventas o confirmarse explícitamente en **0 ventas**.
-
-Mientras el POS necesario no esté confirmado, el producto muestra:
-
-**Pendiente POS**
-
-En ese estado no se calcula diferencia ni se genera alerta.
-
-Para cerveza basta con tener confirmado el POS de cervezas. Para licor, la comparación queda disponible cuando están confirmados Cócteles + Shots + Botellas de licor, porque las tres fuentes pueden consumir licor.
-
-## Licores: oz + botellas equivalentes
-
-El control interno de licor continúa realizándose en **onzas**, porque las recetas, shots y consumo teórico se manejan en oz.
-
-Sin embargo, las vistas por producto muestran simultáneamente:
-
-- Oz.
-- Botellas equivalentes.
-
-Ejemplo:
-
-`19.00 oz · 0.75 bot`
-
-Esto se aplica en el Dashboard y en el detalle del Reporte Ejecutivo para:
-
-- Consumo físico.
-- Ajustes.
-- Venta por conteo.
-- Venta explicada por POS/recetas.
-- Diferencia.
-
-Si la presentación en ml todavía no está configurada, la aplicación conserva las oz disponibles pero no inventa una equivalencia en botellas.
-
-## Compras, proveedores y ventas de botellas
-
-Las operaciones comerciales de producto completo siguen expresándose en botellas:
-
-- Recepción de proveedor: botellas completas + fracción cuando corresponda al conteo físico.
-- Traslado Bodega → Bar: botellas + fracción.
-- Venta directa de botella de licor en POS: número de botellas.
-- Recomendación de abastecimiento: botellas completas redondeadas hacia arriba.
-
-En Abastecimiento, el stock y consumo de licor se presentan en **oz + botellas equivalentes**, pero la acción sugerida de compra se mantiene en **botellas completas**.
-
-## Dashboard V0.4.5
-
-La tabla principal cambia a:
-
-- Producto.
-- Tipo.
-- Apertura.
-- Cierre.
-- Entradas.
-- Consumo físico.
-- Ajustes.
-- Venta por conteo.
-- Ventas POS / recetas.
-- Diferencia.
-- Alerta.
-- Empleado.
-- Hora.
-
-Ya no existe la columna **Esperado**.
-
-Los estados relevantes son:
-
-- OK.
-- Revisar.
-- Alerta.
-- Pendiente apertura.
-- Pendiente cierre.
-- Pendiente POS.
-- Falta ml.
-
-Las gráficas del Dashboard también cambian de **consumo real vs esperado** a **venta por conteo vs POS**.
-
-## Reporte Ejecutivo
-
-El reporte PDF utiliza la misma lógica del Dashboard.
-
-Los productos con atención muestran:
-
-- Consumo físico.
-- Ajustes.
-- Venta por conteo.
-- POS/recetas.
-- Diferencia.
-- Estado.
-
-Para licores, cada valor por producto se presenta en oz + botellas equivalentes.
-
-Si falta confirmar el POS, el reporte informa que la comparación está pendiente y no genera una alerta falsa.
-
-También se corrigió la proporción del logo de La Ramona en el PDF: el logo conserva su relación de aspecto original y ya no se fuerza horizontal o verticalmente.
-
-## Exactitud
-
-La exactitud deja de medir consumo físico contra un “esperado”. Ahora se calcula sobre la comparación relevante:
-
-**Venta por conteo vs Venta POS**
-
-Por tanto, desperdicios, pruebas y cortesías correctamente registrados no reducen artificialmente la exactitud.
-
-## Reinicio de operación
-
-El reinicio total de datos operativos continúa restringido a ADMIN/Owner y ahora también elimina las confirmaciones POS (`pos_batches`) además de:
-
-- Inventarios.
-- Conteos.
-- POS.
-- Movimientos operativos.
-
-No elimina productos, recetas, usuarios, roles, configuración ni estructura de la aplicación.
-
-## Migración
-
-No se requiere modificar manualmente la base de datos.
-
-V0.4.5 crea automáticamente la tabla `pos_batches` si no existe. Los registros POS anteriores continúan siendo reconocidos cuando contienen ventas; para categorías sin ventas históricas puede ser necesario usar la nueva opción **Confirmar 0 ventas** antes de realizar una comparación definitiva.
-
-## Archivos a actualizar
-
-Para pasar de V0.4.4 a V0.4.5:
-
-- Reemplazar `app.py`.
-- Actualizar `README.md` de forma opcional para mantener la documentación sincronizada.
-
-No cambian:
-
-- `requirements.txt`.
-- Assets.
-- Streamlit Secrets.
-- Configuración OAuth.
+No requiere cambios en `requirements.txt`, OAuth, Secrets ni reinicio de base de datos. Los registros existentes se recalculan con la nueva lógica al visualizar Dashboard y reportes.
