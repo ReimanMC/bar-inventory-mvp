@@ -73,7 +73,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.6"):
+def page_header(title, subtitle="", badge="V0.4.7"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -745,7 +745,7 @@ def daily_trend(d1,d2,category):
         if complete: out.append({'Fecha':ds,'Venta por conteo':count_sale,'Ventas POS':(pos_sale if pos_ready else None)})
     return pd.DataFrame(out)
 
-# --------------------------- Dashboard operacional V0.4.6 ---------------------------
+# --------------------------- Dashboard operacional V0.4.7 ---------------------------
 def _latest_count_record(ds, pid, kind, bar_id):
     return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
                         s.created_at,s.inventory_cycle,u.name employee
@@ -861,6 +861,17 @@ def _last_inventory_activity(ds):
                   WHERE s.session_date=?
                   GROUP BY s.id
                   ORDER BY s.created_at DESC LIMIT 1""",(ds,))
+
+def _latest_inventory_date_in_period(d1,d2):
+    """Última fecha con inventario dentro del periodo seleccionado."""
+    r=one("SELECT MAX(session_date) ds FROM inventory_sessions WHERE session_date BETWEEN ? AND ?",
+          (d1.isoformat(),d2.isoformat()))
+    if not r or not r['ds']:
+        return None
+    try:
+        return datetime.strptime(str(r['ds']),'%Y-%m-%d').date()
+    except Exception:
+        return None
 
 def recent_activity(limit=8):
     items=[]
@@ -1731,11 +1742,16 @@ elif page=='Dashboard':
     if d2<d1:
         st.error("La fecha final no puede ser anterior a la inicial."); st.stop()
 
-    today_snapshot,cycle=today_inventory_snapshot(local_today())
-    total_required,registered_today,open_done,close_done,inventory_state=_inventory_progress_today(today_snapshot)
-    current_alerts=[r for r in today_snapshot if r['_state']=='ALERT']
-    current_reviews=[r for r in today_snapshot if r['_state']=='REVIEW']
-    last_act=_last_inventory_activity(local_today().isoformat())
+    # El bloque operacional debe respetar el periodo seleccionado. Si el periodo
+    # incluye varios días, usamos como referencia el último día que realmente tenga
+    # un inventario registrado, en vez de forzar siempre la fecha de hoy.
+    latest_inventory_date=_latest_inventory_date_in_period(d1,d2)
+    snapshot_date=latest_inventory_date or d2
+    period_snapshot,cycle=today_inventory_snapshot(snapshot_date)
+    total_required,registered_period,open_done,close_done,inventory_state=_inventory_progress_today(period_snapshot)
+    current_alerts=[r for r in period_snapshot if r['_state']=='ALERT']
+    current_reviews=[r for r in period_snapshot if r['_state']=='REVIEW']
+    last_act=_last_inventory_activity(snapshot_date.isoformat()) if latest_inventory_date else None
 
     beer_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cerveza' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
     cocktails_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Cóctel' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
@@ -1745,7 +1761,7 @@ elif page=='Dashboard':
     perf_complete=[r for r in perf if r['Días completos']>0 and r['Diferencia'] is not None]
     worst=max(perf_complete,key=lambda r:abs(float(r['Diferencia'] or 0)),default=None)
     if not worst:
-        current_comp=[r for r in today_snapshot if r['_diff'] is not None]
+        current_comp=[r for r in period_snapshot if r['_diff'] is not None]
         worst=max(current_comp,key=lambda r:abs(float(r['_diff'] or 0)),default=None)
         worst_text=(worst['Diferencia'] if worst else '—')
         worst_name=(worst['Producto'] if worst else 'Sin diferencia comparable')
@@ -1756,8 +1772,10 @@ elif page=='Dashboard':
 
     # KPIs operacionales
     k1,k2,k3,k4,k5,k6=st.columns(6)
-    k1.metric("Inventario de hoy",inventory_state,delta=('Semanal' if cycle=='WEEKLY' else 'Diario'))
-    k2.metric("Productos registrados",f"{registered_today} / {total_required}",delta=f"{(registered_today/total_required*100):.0f}%" if total_required else '—')
+    inv_kpi_label='Inventario de hoy' if d1==d2==local_today() else 'Último inventario'
+    inv_kpi_delta=((snapshot_date.strftime('%d/%m/%Y')+' · '+('Semanal' if cycle=='WEEKLY' else 'Diario')) if latest_inventory_date else 'Sin registros en el periodo')
+    k1.metric(inv_kpi_label,inventory_state,delta=inv_kpi_delta)
+    k2.metric("Productos registrados",f"{registered_period} / {total_required}",delta=f"{(registered_period/total_required*100):.0f}%" if total_required else '—')
     k3.metric("Alertas críticas",len(current_alerts),delta=f"{len(current_reviews)} por revisar")
     k4.metric("Mayor diferencia",worst_text,delta=worst_name)
     k5.metric("Cervezas vendidas",f"{float(beer_sold or 0):,.0f}",delta=period)
@@ -1766,15 +1784,15 @@ elif page=='Dashboard':
     # Estado de inventario + alertas + actividad
     s1,s2,s3=st.columns([1.05,1.15,1.15])
     with s1:
-        st.markdown('<div class="ramona-section">📋 Estado de inventario</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ramona-section">📋 Estado de inventario · {snapshot_date.strftime("%d/%m/%Y")}</div>',unsafe_allow_html=True)
         opening_txt='✅ Registrada' if open_done else '⏳ Pendiente'
         closing_txt='✅ Registrado' if close_done else '⏳ Pendiente'
-        ds_today=local_today().isoformat()
-        beer_pos_ok=pos_group_submitted(ds_today,'BEER')
-        liquor_pos_done=sum(1 for g in ('COCKTAIL','SHOT','LIQUOR_BOTTLE') if pos_group_submitted(ds_today,g))
+        ds_reference=snapshot_date.isoformat()
+        beer_pos_ok=pos_group_submitted(ds_reference,'BEER')
+        liquor_pos_done=sum(1 for g in ('COCKTAIL','SHOT','LIQUOR_BOTTLE') if pos_group_submitted(ds_reference,g))
         status_rows=[
-            {'Área':'Cervezas','Estado':_category_progress(today_snapshot,'Cerveza')},
-            {'Área':'Licores principales' if cycle=='DAILY' else 'Licores','Estado':_category_progress(today_snapshot,'Licor')},
+            {'Área':'Cervezas','Estado':_category_progress(period_snapshot,'Cerveza')},
+            {'Área':'Licores principales' if cycle=='DAILY' else 'Licores','Estado':_category_progress(period_snapshot,'Licor')},
             {'Área':'Apertura','Estado':opening_txt},
             {'Área':'Cierre','Estado':closing_txt},
             {'Área':'POS cervezas','Estado':'✅ Confirmado' if beer_pos_ok else '⏳ Pendiente'},
@@ -1785,14 +1803,14 @@ elif page=='Dashboard':
         st.dataframe(pd.DataFrame(status_rows),width='stretch',hide_index=True)
     with s2:
         st.markdown('<div class="ramona-section">🚨 Alertas prioritarias</div>',unsafe_allow_html=True)
-        priority=[r for r in today_snapshot if r['_state'] in ('ALERT','REVIEW')]
+        priority=[r for r in period_snapshot if r['_state'] in ('ALERT','REVIEW')]
         if priority:
             pr=[]
             for r in sorted(priority,key=lambda x:max(abs(float(x['_diff'] or 0)),float(x.get('_stock_gain') or 0),float(x.get('_adjustment_excess') or 0)),reverse=True)[:6]:
                 pr.append({'Producto':r['Producto'],'Diferencia':r['Diferencia'],'Incidencia':r.get('Incidencia física','—'),'Estado':r['Alerta']})
             st.dataframe(pd.DataFrame(pr),width='stretch',hide_index=True)
         else:
-            st.success("No hay diferencias con alerta entre venta por conteo y POS en el inventario comparable de hoy.")
+            st.success("No hay diferencias con alerta entre venta por conteo y POS en el inventario de referencia seleccionado.")
     with s3:
         st.markdown('<div class="ramona-section">🕒 Actividad reciente</div>',unsafe_allow_html=True)
         acts=recent_activity(7)
@@ -1801,8 +1819,8 @@ elif page=='Dashboard':
 
     # -------- filtros de vista --------
     if category_view in ('General','Licores','Cervezas'):
-        st.markdown('<div class="ramona-section">📦 Detalle de inventario actual</div>',unsafe_allow_html=True)
-        physical=today_snapshot
+        st.markdown(f'<div class="ramona-section">📦 Detalle de inventario · {snapshot_date.strftime("%d/%m/%Y")}</div>',unsafe_allow_html=True)
+        physical=period_snapshot
         if category_view=='Licores': physical=[r for r in physical if r['Tipo']=='Licor']
         elif category_view=='Cervezas': physical=[r for r in physical if r['Tipo']=='Cerveza']
         physical=_status_filter(physical,status_view)
@@ -1813,7 +1831,7 @@ elif page=='Dashboard':
                 rr=dict(r); rr['Salida física']=rr.get('Consumo físico','—')
                 display_rows.append({c:rr[c] for c in cols})
             st.dataframe(pd.DataFrame(display_rows),width='stretch',hide_index=True)
-            st.caption("Salida física = apertura + entradas al bar − cierre (nunca se muestra negativa). Venta por conteo = salida física − ajustes autorizados. Diferencia = venta por conteo − POS; puede ser positiva o negativa y genera revisión en ambos sentidos. Si el cierre supera apertura + entradas, se marca como aumento de stock no explicado.")
+            st.caption(f"Vista física correspondiente al último inventario registrado dentro del periodo: {snapshot_date.strftime('%d/%m/%Y')}. Salida física = apertura + entradas al bar − cierre (nunca se muestra negativa). Venta por conteo = salida física − ajustes autorizados. Diferencia = venta por conteo − POS; puede ser positiva o negativa y genera revisión en ambos sentidos. Si el cierre supera apertura + entradas, se marca como aumento de stock no explicado.")
         else:
             st.info("No hay productos que coincidan con los filtros seleccionados.")
 
@@ -1937,7 +1955,8 @@ elif page=='Dashboard':
 elif page=='Abastecimiento':
     page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
     st.caption("En licores, el control operativo se mantiene en oz y botellas equivalentes; las compras a proveedores se recomiendan siempre en botellas completas. En cerveza, las compras se expresan en unidades.")
-    lookback=int(st.selectbox("Histórico para estimar consumo",[14,21,28,42,56],index=2,format_func=lambda x:f"Últimos {x} días")); safety=float(setting('safety_stock_pct','15'))/100
+    lookback=int(st.selectbox("Histórico para estimar consumo",[7,14,21,28,42,56],index=0,format_func=lambda x:f"Últimos {x} días")); safety=float(setting('safety_stock_pct','15'))/100
+    st.caption("La recomendación de compra se proyecta para los próximos 7 días. Por defecto se usa el consumo de los últimos 7 días y puedes ampliar el histórico cuando necesites una tendencia más estable.")
     d2=local_today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     rows=[]; products_to_buy=0; total_buy_units=0
     for r in data:
