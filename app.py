@@ -73,7 +73,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.4"):
+def page_header(title, subtitle="", badge="V0.4.5"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -228,6 +228,10 @@ def init_db():
       id INTEGER PRIMARY KEY, sale_date TEXT NOT NULL, cocktail_id INTEGER, product_id INTEGER,
       sale_type TEXT NOT NULL, quantity REAL NOT NULL, oz_per_unit REAL,
       user_id INTEGER, observation TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS pos_batches(
+      id INTEGER PRIMARY KEY, sale_date TEXT NOT NULL, sale_group TEXT NOT NULL,
+      user_id INTEGER, note TEXT, created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id));
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS legacy_rows(
       id INTEGER PRIMARY KEY, source_sheet TEXT, source_row INTEGER, raw_text TEXT,
@@ -569,18 +573,54 @@ def adjustments(d,pid,bar_id):
     return float(r['x'] or 0)
 
 def expected_sales(d,pid,p):
+    """Venta explicada por POS. Cerveza=unidades; licor=oz."""
     total=0.0
-    # Direct product sales: beer count = bottles, liquor uses oz_per_unit when provided; bottle liquor converts ml when known.
     rows=q("SELECT sale_type,quantity,oz_per_unit FROM pos_sales WHERE sale_date=? AND product_id=?",(d,pid))
     for r in rows:
-        if p['category']=='Cerveza': total += float(r['quantity'])
-        elif r['oz_per_unit'] is not None: total += float(r['quantity'])*float(r['oz_per_unit'])
-        elif r['sale_type']=='Botella de licor' and p['bottle_ml']: total += float(r['quantity'])*(float(p['bottle_ml'])/ML_PER_OZ)
-    # Cocktail recipes
+        if p['category']=='Cerveza':
+            total += float(r['quantity'])
+        elif r['oz_per_unit'] is not None:
+            total += float(r['quantity'])*float(r['oz_per_unit'])
+        elif r['sale_type']=='Botella de licor' and p['bottle_ml']:
+            total += float(r['quantity'])*(float(p['bottle_ml'])/ML_PER_OZ)
     rr=q("""SELECT ps.quantity,r.oz_qty FROM pos_sales ps JOIN recipes r ON r.cocktail_id=ps.cocktail_id
-            WHERE ps.sale_date=? AND r.product_id=?""",(d,pid))
+            WHERE ps.sale_date=? AND ps.sale_type='Cóctel' AND r.product_id=?""",(d,pid))
     total += sum(float(x['quantity'])*float(x['oz_qty']) for x in rr)
     return total
+
+
+def record_pos_batch(d,sale_group,note=""):
+    ds=d.isoformat() if hasattr(d,'isoformat') else str(d)
+    con.execute("INSERT INTO pos_batches(sale_date,sale_group,user_id,note,created_at) VALUES(?,?,?,?,?)",
+                (ds,sale_group,user['id'],note,now_iso()))
+    con.commit(); backup_db_to_drive()
+
+
+def pos_group_submitted(ds,sale_group):
+    if one("SELECT 1 FROM pos_batches WHERE sale_date=? AND sale_group=? LIMIT 1",(ds,sale_group)):
+        return True
+    mapping={'BEER':'Cerveza','COCKTAIL':'Cóctel','SHOT':'Shot','LIQUOR_BOTTLE':'Botella de licor'}
+    stype=mapping.get(sale_group)
+    return bool(stype and one("SELECT 1 FROM pos_sales WHERE sale_date=? AND sale_type=? LIMIT 1",(ds,stype)))
+
+
+def pos_comparison_ready(ds,p):
+    if p['category']=='Cerveza':
+        return pos_group_submitted(ds,'BEER')
+    if p['category']=='Licor':
+        return all(pos_group_submitted(ds,g) for g in ('COCKTAIL','SHOT','LIQUOR_BOTTLE'))
+    return False
+
+
+def dual_qty_text(p,qty,signed=False,beer_label='unid'):
+    """Licor siempre en oz + botellas equivalentes; cerveza en unidades."""
+    if qty is None: return '—'
+    v=float(qty); plus='+' if signed and v>0 else ''
+    if p['category']=='Cerveza': return f"{plus}{v:.0f} {beer_label}"
+    boz=bottle_oz(p)
+    if not boz: return f"{plus}{v:.2f} oz · ⚠ Falta ml"
+    b=v/boz; bplus='+' if signed and b>0 else ''
+    return f"{plus}{v:.2f} oz · {bplus}{b:.2f} bot"
 
 def opening_variance(d,pid,bar_id):
     r=one("""SELECT ic.variance FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
@@ -599,28 +639,26 @@ def consolidated(d1,d2):
     rows=[]
     for p in products():
         if p['category'] not in ('Cerveza','Licor'): continue
-        real=expected=adj=trans=0.0; days_complete=0; open_alerts=0; open_var_sum=0.0
+        physical=pos_total=adj=trans=count_sales=0.0; days_complete=days_pos=0
         first_open=last_close_val=None
         for dd in date_range(d1,d2):
             ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar); cl=session_qty(ds,p['id'],'CLOSING',bar)
-            ti=transfers_in(ds,p['id'],bar); av=adjustments(ds,p['id'],bar); ev=expected_sales(ds,p['id'],p)
-            expected += ev; adj += av; trans += ti
+            ti=transfers_in(ds,p['id'],bar); av=adjustments(ds,p['id'],bar)
             if op is not None and first_open is None: first_open=op
             if cl is not None: last_close_val=cl
             if op is not None and cl is not None:
-                real += op + ti - cl; days_complete += 1
-            ov=opening_variance(ds,p['id'],bar)
-            tol=float(setting('tolerance_beer','1')) if p['category']=='Cerveza' else float(setting('tolerance_liquor','1'))
-            if ov is not None and abs(ov)>tol: open_alerts += 1; open_var_sum += ov
-        explained=expected+adj; diff=real-explained
-        tol=float(setting('tolerance_beer','1')) if p['category']=='Cerveza' else float(setting('tolerance_liquor','1'))
-        status='✅ OK' if abs(diff)<=tol and open_alerts==0 else ('🔴 Revisar' if abs(diff)>tol*3 or open_alerts>=2 else '⚠️ Revisar')
-        rows.append({
-            'Producto':product_label(p),'Categoría':p['category'],'Inicial':first_open,'Final':last_close_val,
-            'Entradas al bar':trans,'Consumo real':real,'Consumo esperado':expected,'Ajustes':adj,
-            'Diferencia no explicada':diff,'Alertas apertura':open_alerts,'Estado':status,'Días completos':days_complete,
-            '_pid':p['id'],'_unit':unit_label(p),'_p':p
-        })
+                day_physical=float(op)+ti-float(cl); day_count_sale=day_physical-av
+                physical+=day_physical; adj+=av; trans+=ti; count_sales+=day_count_sale; days_complete+=1
+                if pos_comparison_ready(ds,p): pos_total+=expected_sales(ds,p['id'],p); days_pos+=1
+        pos_ready=days_complete>0 and days_pos==days_complete
+        diff=(count_sales-pos_total) if pos_ready else None
+        state_code,state_label,diff_text=_difference_state(p,diff,days_complete>0,pos_ready=pos_ready)
+        rows.append({'Producto':product_label(p),'Categoría':p['category'],'Inicial':first_open,'Final':last_close_val,
+            'Entradas al bar':trans,'Consumo real':physical,'Consumo físico':physical,'Ajustes':adj,
+            'Venta por conteo':count_sales,'Ventas POS':pos_total,'Consumo esperado':pos_total,
+            'Diferencia no explicada':diff,'Diferencia':diff,'Estado':state_label,'Días completos':days_complete,
+            'Días POS completos':days_pos,'_state':state_code,'_diff_text':diff_text,
+            '_pid':p['id'],'_unit':unit_label(p),'_p':p})
     return rows
 
 def current_stock(pid, location_id):
@@ -653,27 +691,26 @@ def difference_cost(r):
     return (diff/boz*float(cost)) if boz else None
 
 def product_accuracy(r):
-    real=abs(float(r['Consumo real'] or 0)); diff=abs(float(r['Diferencia no explicada'] or 0))
-    if real<=0: return None
-    return max(0.0,min(100.0,(1.0-diff/real)*100.0))
+    base=abs(float(r.get('Venta por conteo',r.get('Consumo real',0)) or 0))
+    diffv=r.get('Diferencia no explicada',r.get('Diferencia'))
+    if diffv is None or base<=0: return None
+    return max(0.0,min(100.0,(1.0-abs(float(diffv))/base)*100.0))
 
 def daily_trend(d1,d2,category):
-    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
-    out=[]
+    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; out=[]
     for dd in date_range(d1,d2):
-        real=expected=0.0; complete=False
+        count_sale=pos_sale=0.0; complete=False; pos_ready=True; ds=dd.isoformat()
         for p in products(category):
-            op=session_qty(dd.isoformat(),p['id'],'OPENING',bar); cl=session_qty(dd.isoformat(),p['id'],'CLOSING',bar)
+            op=session_qty(ds,p['id'],'OPENING',bar); cl=session_qty(ds,p['id'],'CLOSING',bar)
             if op is not None and cl is not None:
-                real += op + transfers_in(dd.isoformat(),p['id'],bar) - cl
-                complete=True
-            expected += expected_sales(dd.isoformat(),p['id'],p)
-        if complete or expected>0:
-            out.append({'Fecha':dd.isoformat(),'Consumo real':max(real,0),'Consumo esperado':max(expected,0)})
+                physical=float(op)+transfers_in(ds,p['id'],bar)-float(cl)
+                count_sale += physical-adjustments(ds,p['id'],bar); complete=True
+                if pos_comparison_ready(ds,p): pos_sale += expected_sales(ds,p['id'],p)
+                else: pos_ready=False
+        if complete: out.append({'Fecha':ds,'Venta por conteo':count_sale,'Ventas POS':(pos_sale if pos_ready else None)})
     return pd.DataFrame(out)
 
-
-# --------------------------- Dashboard operacional V0.4.2 ---------------------------
+# --------------------------- Dashboard operacional V0.4.5 ---------------------------
 def _latest_count_record(ds, pid, kind, bar_id):
     return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
                         s.created_at,s.inventory_cycle,u.name employee
@@ -713,70 +750,46 @@ def _base_expected_text(p, base):
         return f"{float(base)/boz:.2f} bot · {float(base):.2f} oz"
     return f"{float(base):.2f} oz"
 
-def _difference_state(p, diff, registered=True):
-    if not registered:
-        return ('PENDING','⏳ Pendiente','—')
-    if diff is None:
-        return ('OK','🟢 Registrado','—')
+def _difference_state(p, diff, registered=True, pos_ready=True):
+    if not registered: return ('PENDING','⏳ Pendiente','—')
+    if not pos_ready: return ('PENDING','🔵 Pendiente POS','—')
+    if diff is None: return ('PENDING','⏳ Pendiente','—')
     tol=float(setting('tolerance_beer','1')) if p['category']=='Cerveza' else float(setting('tolerance_liquor','1'))
-    ad=abs(float(diff))
-    unit='bot' if p['category']=='Cerveza' else 'oz'
-    diff_text=f"{float(diff):+.2f} {unit}"
-    if ad<=tol:
-        return ('OK','🟢 OK',diff_text)
-    if ad<=tol*3:
-        return ('REVIEW','🟡 Revisar',diff_text)
+    ad=abs(float(diff)); diff_text=dual_qty_text(p,diff,signed=True)
+    if ad<=tol: return ('OK','🟢 OK',diff_text)
+    if ad<=tol*3: return ('REVIEW','🟡 Revisar',diff_text)
     return ('ALERT','🔴 Alerta',diff_text)
 
 def today_inventory_snapshot(target_date=None):
-    target_date=target_date or local_today()
-    ds=target_date.isoformat()
-    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
-    cycle=_latest_cycle_for_date(ds)
-    required=inventory_products(cycle)
+    target_date=target_date or local_today(); ds=target_date.isoformat()
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']; cycle=_latest_cycle_for_date(ds)
     rows=[]
-    for p in required:
-        op=_latest_count_record(ds,p['id'],'OPENING',bar_id)
-        cl=_latest_count_record(ds,p['id'],'CLOSING',bar_id)
-        rec=cl or op
-        registered=rec is not None
-        expected_stock=None
-        diff=None
-        basis=''
-        if cl is not None and op is not None:
-            # Sin presentación en ml no podemos mezclar botellas físicas con consumo teórico en oz.
-            if p['category']=='Licor' and not p['bottle_ml']:
-                expected_stock=None
-                diff=None
-                basis='Cierre registrado · ml pendiente'
-            else:
-                # Conteo esperado al cierre = apertura + entradas - ventas teóricas - ajustes autorizados.
-                expected_stock=float(op['qty_base'] or 0)+transfers_in(ds,p['id'],bar_id)-expected_sales(ds,p['id'],p)-adjustments(ds,p['id'],bar_id)
-                diff=float(cl['qty_base'] or 0)-expected_stock
-                basis='Cierre vs esperado'
-        elif op is not None:
-            # Para apertura usamos la diferencia ya calculada contra el cierre anterior.
-            # En licores sin ml la diferencia puede estar expresada en botellas; no la convertimos de forma ficticia.
-            if p['category']=='Licor' and not p['bottle_ml']:
-                diff=None
-                expected_stock=None
-                basis='Apertura registrada · ml pendiente'
-            elif op['variance'] is not None:
-                diff=float(op['variance'])
-                expected_stock=float(op['previous_qty']) if op['previous_qty'] is not None else None
-                basis='Apertura vs cierre anterior'
-            else:
-                basis='Línea base / apertura'
-        state_code,state_label,diff_text=_difference_state(p,diff,registered)
-        rows.append({
-            'Producto':p['name'],'Tipo':p['category'],
-            'Conteo actual':_count_text(p, float(rec['qty_base']) if rec else None, float(rec['qty_bottle_equiv']) if rec and rec['qty_bottle_equiv'] is not None else None),
-            'Esperado':_base_expected_text(p,expected_stock),
-            'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente',
-            'Base comparación':basis,'Empleado':rec['employee'] if rec else '—','Hora':(format_local_time(rec['created_at']) if rec and rec['created_at'] else '—'),
-            '_state':state_code,'_diff':diff,'_p':p,'_pid':p['id'],'_registered':registered,
-            '_has_opening':op is not None,'_has_closing':cl is not None
-        })
+    for p in inventory_products(cycle):
+        op=_latest_count_record(ds,p['id'],'OPENING',bar_id); cl=_latest_count_record(ds,p['id'],'CLOSING',bar_id); rec=cl or op
+        registered=rec is not None; physical=adj=count_sale=pos_sale=diff=None; ready=False
+        if op is None:
+            state_code,state_label,diff_text=('PENDING','⏳ Pendiente apertura','—'); basis='Sin apertura'
+        elif cl is None:
+            state_code,state_label,diff_text=('PENDING','⏳ Pendiente cierre','—'); basis='Apertura registrada · cierre pendiente'
+        elif p['category']=='Licor' and not p['bottle_ml']:
+            state_code,state_label,diff_text=('PENDING','⚠ Falta ml','—'); basis='Cierre registrado · falta ml'
+        else:
+            entries=transfers_in(ds,p['id'],bar_id); physical=float(op['qty_base'] or 0)+entries-float(cl['qty_base'] or 0)
+            adj=adjustments(ds,p['id'],bar_id); count_sale=physical-adj; ready=pos_comparison_ready(ds,p)
+            if ready: pos_sale=expected_sales(ds,p['id'],p); diff=count_sale-pos_sale; basis='Venta por conteo vs POS'
+            else: basis='Cierre completo · POS pendiente'
+            state_code,state_label,diff_text=_difference_state(p,diff,True,pos_ready=ready)
+        entries=transfers_in(ds,p['id'],bar_id) if op is not None else None
+        rows.append({'Producto':p['name'],'Tipo':p['category'],
+            'Apertura':_count_text(p,float(op['qty_base']) if op else None,float(op['qty_bottle_equiv']) if op and op['qty_bottle_equiv'] is not None else None),
+            'Cierre':_count_text(p,float(cl['qty_base']) if cl else None,float(cl['qty_bottle_equiv']) if cl and cl['qty_bottle_equiv'] is not None else None),
+            'Entradas':dual_qty_text(p,entries) if entries is not None else '—','Consumo físico':dual_qty_text(p,physical),
+            'Ajustes':dual_qty_text(p,adj),'Venta por conteo':dual_qty_text(p,count_sale),
+            'Ventas POS / recetas':dual_qty_text(p,pos_sale) if ready else ('Pendiente POS' if cl is not None else '—'),
+            'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente','Base comparación':basis,
+            'Empleado':rec['employee'] if rec else '—','Hora':format_local_time(rec['created_at']) if rec and rec['created_at'] else '—',
+            '_state':state_code,'_diff':diff,'_p':p,'_pid':p['id'],'_registered':registered,'_has_opening':op is not None,
+            '_has_closing':cl is not None,'_pos_ready':ready,'_physical':physical,'_adjustments':adj,'_count_sale':count_sale,'_pos_sale':pos_sale})
     return rows,cycle
 
 def _inventory_progress_today(snapshot):
@@ -841,33 +854,26 @@ def recent_activity(limit=8):
     return out
 
 def period_inventory_performance(d1,d2):
-    """Comparación real vs esperado únicamente en días con apertura y cierre.
-    Evita generar falsas diferencias cuando existe POS pero el inventario físico todavía está incompleto.
-    """
-    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
-    rows=[]
+    """Venta por conteo = apertura + entradas - cierre - ajustes. Diferencia = venta por conteo - POS."""
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']; rows=[]
     for p in products():
         if p['category'] not in ('Cerveza','Licor'): continue
-        # Para licor sin ml aún no existe una conversión válida de botellas a oz; no fabricamos diferencias.
         if p['category']=='Licor' and not p['bottle_ml']:
-            rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':0.0,'Consumo esperado':0.0,
-                         'Ajustes':0.0,'Diferencia':None,'Días completos':0,'Estado':'⏳ Falta ml','_state':'PENDING',
-                         '_p':p,'_diff_text':'—'})
-            continue
-        real=expected=adj=0.0; complete=0
+            rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':0.0,'Consumo físico':0.0,'Ajustes':0.0,
+                         'Venta por conteo':0.0,'Ventas POS':0.0,'Consumo esperado':0.0,'Diferencia':None,'Días completos':0,
+                         'Días POS completos':0,'Estado':'⚠ Falta ml','_state':'PENDING','_p':p,'_diff_text':'—'}); continue
+        physical=adj=count_sale=pos_sale=0.0; complete=pos_complete=0
         for dd in date_range(d1,d2):
             ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar_id); cl=session_qty(ds,p['id'],'CLOSING',bar_id)
-            if op is None or cl is None:
-                continue
-            real += op + transfers_in(ds,p['id'],bar_id) - cl
-            expected += expected_sales(ds,p['id'],p)
-            adj += adjustments(ds,p['id'],bar_id)
-            complete += 1
-        diff=real-(expected+adj) if complete else None
-        state_code,state_label,diff_text=_difference_state(p,diff,complete>0)
-        rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':real,'Consumo esperado':expected,
-                     'Ajustes':adj,'Diferencia':diff,'Días completos':complete,'Estado':state_label,'_state':state_code,
-                     '_p':p,'_diff_text':diff_text})
+            if op is None or cl is None: continue
+            day_physical=float(op)+transfers_in(ds,p['id'],bar_id)-float(cl); day_adj=adjustments(ds,p['id'],bar_id)
+            physical+=day_physical; adj+=day_adj; count_sale+=day_physical-day_adj; complete+=1
+            if pos_comparison_ready(ds,p): pos_sale+=expected_sales(ds,p['id'],p); pos_complete+=1
+        ready=complete>0 and pos_complete==complete; diff=(count_sale-pos_sale) if ready else None
+        state_code,state_label,diff_text=_difference_state(p,diff,complete>0,pos_ready=ready)
+        rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':physical,'Consumo físico':physical,'Ajustes':adj,
+                     'Venta por conteo':count_sale,'Ventas POS':pos_sale,'Consumo esperado':pos_sale,'Diferencia':diff,'Días completos':complete,
+                     'Días POS completos':pos_complete,'Estado':state_label,'_state':state_code,'_p':p,'_diff_text':diff_text})
     return rows
 
 def cocktail_sales_summary(d1,d2):
@@ -961,11 +967,12 @@ def _report_accuracy(perf_rows):
     vals=[]
     for r in perf_rows:
         if r['Días completos']<=0 or r['Diferencia'] is None: continue
-        real=abs(float(r['Consumo real'] or 0))
-        if real<=0: continue
-        vals.append(max(0.0,min(100.0,(1.0-abs(float(r['Diferencia']))/real)*100.0)))
-    return (sum(vals)/len(vals)) if vals else None
-
+        base=abs(float(r.get('Venta por conteo',0) or 0)); diff=abs(float(r['Diferencia'] or 0))
+        if base<=0:
+            if diff<=1e-9: vals.append(100.0)
+            continue
+        vals.append(max(0.0,min(100.0,(1.0-diff/base)*100.0)))
+    return sum(vals)/len(vals) if vals else None
 
 def _report_difference_cost(perf_row):
     p=perf_row['_p']; cost=p['unit_cost']
@@ -1015,10 +1022,13 @@ def _report_observations(perf, inv_status, cocktails, shots, beers, replenishmen
         notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) completo(s) de {inv_status['active_days']} día(s) con actividad. Las métricas físicas usan solo días comparables.")
     else:
         notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) con apertura y cierre comparables.")
+    pending_pos=[r for r in perf if r.get('Días completos',0)>r.get('Días POS completos',0)]
+    if pending_pos:
+        notes.append(f"Hay {len(pending_pos)} producto(s) con inventario físico comparable pero POS aún pendiente de confirmar; no generan alerta hasta completar el POS.")
     if alerts or reviews:
-        notes.append(f"Se identificaron {len(alerts)} alerta(s) crítica(s) y {len(reviews)} producto(s) para revisar por diferencia de inventario.")
+        notes.append(f"Se identificaron {len(alerts)} alerta(s) crítica(s) y {len(reviews)} producto(s) para revisar al comparar venta por conteo contra POS.")
     elif comparable:
-        notes.append('No se detectaron diferencias por encima de las tolerancias configuradas en los productos comparables.')
+        notes.append('No se detectaron diferencias por encima de las tolerancias al comparar venta por conteo contra POS.')
     recipe_alerts=[r for r in cocktails if r['Vendidos']>0 and r['_state']=='ALERT']
     if recipe_alerts:
         notes.append(f"Hay {len(recipe_alerts)} cóctel(es) con ventas y sin receta completa; su consumo teórico de licor no puede explicarse correctamente.")
@@ -1047,10 +1057,12 @@ def build_executive_report_pdf(d1,d2):
 
     liquor_rows=[r for r in comparable if r['Categoría']=='Licor']
     beer_rows=[r for r in comparable if r['Categoría']=='Cerveza']
-    liquor_real=sum(float(r['Consumo real'] or 0) for r in liquor_rows)
-    liquor_expected=sum(float(r['Consumo esperado'] or 0) for r in liquor_rows)
-    beer_real=sum(float(r['Consumo real'] or 0) for r in beer_rows)
-    beer_expected=sum(float(r['Consumo esperado'] or 0) for r in beer_rows)
+    liquor_real=sum(float(r['Consumo físico'] or 0) for r in liquor_rows)
+    liquor_count_sale=sum(float(r['Venta por conteo'] or 0) for r in liquor_rows)
+    liquor_pos=sum(float(r['Ventas POS'] or 0) for r in liquor_rows)
+    beer_real=sum(float(r['Consumo físico'] or 0) for r in beer_rows)
+    beer_count_sale=sum(float(r['Venta por conteo'] or 0) for r in beer_rows)
+    beer_expected=sum(float(r['Ventas POS'] or 0) for r in beer_rows)
     cocktail_sold=sum(float(r['Vendidos'] or 0) for r in cocktails)
     cocktail_oz=sum(float(r['Consumo teórico'] or 0) for r in cocktails)
     shot_sold=sum(float(r['Shots vendidos'] or 0) for r in shots)
@@ -1094,13 +1106,12 @@ def build_executive_report_pdf(d1,d2):
     def state_text(r): return _pdf_state_label(r.get('_state'))
     def diff_text(r):
         if r.get('Diferencia') is None: return '-'
-        unit='unid' if r['Categoría']=='Cerveza' else 'oz'
-        return f"{float(r['Diferencia']):+.2f} {unit}"
+        return dual_qty_text(r['_p'],r['Diferencia'],signed=True).replace('⚠','')
     def cost_text(r):
         v=_report_difference_cost(r)
         return f"${v:,.2f}" if v is not None else '-'
     def accuracy_text(r):
-        real=abs(float(r['Consumo real'] or 0)); diff=abs(float(r['Diferencia'] or 0)) if r['Diferencia'] is not None else None
+        real=abs(float(r.get('Venta por conteo',0) or 0)); diff=abs(float(r['Diferencia'] or 0)) if r['Diferencia'] is not None else None
         if not real or diff is None: return '-'
         return f"{max(0.0,min(100.0,(1-diff/real)*100)):.1f}%"
 
@@ -1127,7 +1138,11 @@ def build_executive_report_pdf(d1,d2):
     # Cabecera
     header=[]
     if os.path.exists(LOGO_PATH):
-        try: header.append(RLImage(LOGO_PATH,width=1.55*inch,height=.72*inch))
+        try:
+            logo=RLImage(LOGO_PATH)
+            ratio=(float(logo.imageHeight)/float(logo.imageWidth)) if logo.imageWidth else .46
+            logo.drawWidth=1.55*inch; logo.drawHeight=logo.drawWidth*ratio
+            header.append(logo)
         except Exception: header.append(P('LA RAMONA',title_style))
     else: header.append(P('LA RAMONA',title_style))
     head_text=[Paragraph('REPORTE EJECUTIVO DE INVENTARIO',title_style),
@@ -1151,8 +1166,8 @@ def build_executive_report_pdf(d1,d2):
     if largest:
         largest_txt=f"{largest['Producto']} ({diff_text(largest)})"
     kpis=[
-        ('Consumo licor',f'{liquor_real:.1f} oz' if physical_available and liquor_rows else 'Pendiente'),
-        ('Cervezas consumidas',f'{beer_real:.0f} unid' if physical_available and beer_rows else 'Pendiente'),
+        ('Venta por conteo licor',f'{liquor_count_sale:.1f} oz' if physical_available and liquor_rows else 'Pendiente'),
+        ('Venta por conteo cerveza',f'{beer_count_sale:.0f} unid' if physical_available and beer_rows else 'Pendiente'),
         ('Cócteles vendidos',f'{cocktail_sold:.0f}'),
         ('Shots vendidos',f'{shot_sold:.0f}'),
         ('Exactitud promedio',f'{accuracy:.1f}%' if accuracy is not None else 'Sin datos'),
@@ -1176,8 +1191,8 @@ def build_executive_report_pdf(d1,d2):
     story.append(Paragraph('Resumen comercial y de consumo',section_style))
     summary_data=[
         [P('Indicador',small_style),P('Resultado',small_style),P('Indicador',small_style),P('Resultado',small_style)],
-        [P('Consumo físico de licor'),P(f'{liquor_real:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre'),P('Consumo esperado de licor'),P(f'{liquor_expected:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre')],
-        [P('Consumo físico de cerveza'),P(f'{beer_real:.0f} unidades' if physical_available and beer_rows else 'Pendiente de cierre'),P('Cervezas vendidas POS'),P(f'{beer_pos:.0f}')],
+        [P('Salida física de licor'),P(f'{liquor_real:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre'),P('Venta conteo / POS-recetas licor'),P(f'{liquor_count_sale:.2f} / {liquor_pos:.2f} oz' if physical_available and liquor_rows else 'Pendiente')],
+        [P('Salida física de cerveza'),P(f'{beer_real:.0f} unidades' if physical_available and beer_rows else 'Pendiente de cierre'),P('Venta por conteo / POS cerveza'),P(f'{beer_count_sale:.0f} / {beer_pos:.0f}' if physical_available and beer_rows else 'Pendiente')],
         [P('Cócteles vendidos'),P(f'{cocktail_sold:.0f}'),P('Licor teórico en cócteles'),P(f'{cocktail_oz:.2f} oz')],
         [P('Shots vendidos'),P(f'{shot_sold:.0f}'),P('Licor teórico en shots'),P(f'{shot_oz:.2f} oz')],
         [P('Productos contados'),P(f"{inv_status['products_counted']}"),P('Mayor diferencia'),P(largest_txt)],
@@ -1192,29 +1207,29 @@ def build_executive_report_pdf(d1,d2):
         story.append(Paragraph(f"• {_pdf_clean(note)}",body_style))
 
     # -------- detalle --------
-    story += [PageBreak(),Paragraph('Detalle gerencial y operativo',title_style),Paragraph('Productos con atención prioritaria y detalle de los días físicamente comparables.',subtitle_style),Spacer(1,7)]
+    story += [PageBreak(),Paragraph('Detalle gerencial y operativo',title_style),Paragraph('Productos con atención prioritaria al comparar venta por conteo contra POS.',subtitle_style),Spacer(1,7)]
     story.append(Paragraph('Productos que requieren atención',section_style))
     if attention:
-        att=[['Producto','Tipo','Real','Esperado','Ajustes','Diferencia','Estado','Costo est.']]
+        att=[['Producto','Tipo','Físico','Ajustes','Venta conteo','POS/recetas','Diferencia','Estado']]
         for r in attention[:10]:
-            unit='unid' if r['Categoría']=='Cerveza' else 'oz'
-            att.append([_pdf_clean(r['Producto']),r['Categoría'],f"{float(r['Consumo real']):.2f} {unit}",f"{float(r['Consumo esperado']):.2f} {unit}",f"{float(r['Ajustes']):.2f} {unit}",diff_text(r),state_text(r),cost_text(r)])
-        t=Table(att,colWidths=[1.55*inch,.62*inch,.83*inch,.87*inch,.72*inch,.85*inch,.72*inch,.78*inch],repeatRows=1)
+            p=r['_p']
+            att.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(dual_qty_text(p,r['Consumo físico'])),_pdf_clean(dual_qty_text(p,r['Ajustes'])),_pdf_clean(dual_qty_text(p,r['Venta por conteo'])),_pdf_clean(dual_qty_text(p,r['Ventas POS'])),diff_text(r),state_text(r)])
+        t=Table(att,colWidths=[1.35*inch,.55*inch,1.25*inch,1.15*inch,1.35*inch,1.35*inch,1.15*inch,.75*inch],repeatRows=1)
         t.setStyle(table_style('#9f3f32',6.8)); story.append(t)
     else:
         msg='No hay diferencias calculables todavía.' if not physical_available else 'No hay productos por encima de las tolerancias configuradas.'
         story.append(P(msg))
 
-    story += [Spacer(1,8),Paragraph('Detalle de inventario comparable',section_style),Paragraph('Solo se calculan consumo, diferencias y exactitud para días con apertura y cierre completos.',subtitle_style),Spacer(1,5)]
+    story += [Spacer(1,8),Paragraph('Detalle de inventario comparable',section_style),Paragraph('La diferencia compara venta por conteo contra POS solo cuando apertura, cierre y POS relevante están completos.',subtitle_style),Spacer(1,5)]
     if comparable:
-        detail=[['Producto','Tipo','Real','Esperado','Ajustes','Diferencia','Exactitud','Estado','Días','Costo est.']]
+        detail=[['Producto','Tipo','Físico','Ajustes','Venta conteo','POS/recetas','Diferencia','Exact.','Estado','Días']]
         for r in sorted(comparable,key=lambda x:(x['Categoría'],x['Producto'])):
-            unit='unid' if r['Categoría']=='Cerveza' else 'oz'
-            detail.append([_pdf_clean(r['Producto']),r['Categoría'],f"{float(r['Consumo real']):.2f} {unit}",f"{float(r['Consumo esperado']):.2f} {unit}",f"{float(r['Ajustes']):.2f}",diff_text(r),accuracy_text(r),state_text(r),str(r['Días completos']),cost_text(r)])
-        dt=Table(detail,colWidths=[1.55*inch,.6*inch,.82*inch,.82*inch,.62*inch,.82*inch,.7*inch,.66*inch,.4*inch,.7*inch],repeatRows=1)
+            p=r['_p']
+            detail.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(dual_qty_text(p,r['Consumo físico'])),_pdf_clean(dual_qty_text(p,r['Ajustes'])),_pdf_clean(dual_qty_text(p,r['Venta por conteo'])),_pdf_clean(dual_qty_text(p,r['Ventas POS'])),diff_text(r),accuracy_text(r),state_text(r),str(r['Días completos'])])
+        dt=Table(detail,colWidths=[1.2*inch,.5*inch,1.25*inch,1.1*inch,1.25*inch,1.25*inch,1.1*inch,.55*inch,.65*inch,.35*inch],repeatRows=1)
         dt.setStyle(table_style('#252a31',6.6)); story.append(dt)
     else:
-        story.append(P('No hay días comparables de apertura + cierre en el periodo seleccionado.'))
+        story.append(P('No hay productos con apertura + cierre + POS completo para comparar en el periodo seleccionado.'))
 
     story += [Spacer(1,9),Paragraph('Ventas POS y consumo teórico',section_style)]
     sales_summary=[['Categoría','Ventas','Consumo teórico / referencia','Producto más vendido']]
@@ -1559,7 +1574,10 @@ elif page=='POS / Ventas':
                     for cid,qty in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),cid,None,'Cóctel',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de cócteles guardadas: {len(rows)} registro(s).")
+                    con.commit(); record_pos_batch(d,'COCKTAIL',obs); st.success(f"Ventas de cócteles guardadas: {len(rows)} registro(s). POS de cócteles confirmado.")
+
+        if st.button('Confirmar 0 ventas de cócteles',key='pos_c_zero',width='stretch'):
+            record_pos_batch(d,'COCKTAIL','Confirmado sin ventas'); st.success('POS de cócteles confirmado en cero.')
 
     with tab_shot:
         liquors=products('Licor')
@@ -1582,7 +1600,10 @@ elif page=='POS / Ventas':
                     for pid,qty,oz in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Shot',qty,oz,user['id'],obs,now_iso()))
-                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de shots guardadas: {len(rows)} registro(s).")
+                    con.commit(); record_pos_batch(d,'SHOT',obs); st.success(f"Ventas de shots guardadas: {len(rows)} registro(s). POS de shots confirmado.")
+
+        if st.button('Confirmar 0 ventas de shots',key='pos_s_zero',width='stretch'):
+            record_pos_batch(d,'SHOT','Confirmado sin ventas'); st.success('POS de shots confirmado en cero.')
 
     with tab_beer:
         beers=products('Cerveza')
@@ -1603,7 +1624,10 @@ elif page=='POS / Ventas':
                     for pid,qty in beer_rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Cerveza',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); backup_db_to_drive(); st.success(f"Ventas de cerveza guardadas: {len(beer_rows)} producto(s).")
+                    con.commit(); record_pos_batch(d,'BEER',obs); st.success(f"Ventas de cerveza guardadas: {len(beer_rows)} producto(s). POS de cervezas confirmado.")
+
+        if st.button('Confirmar 0 ventas de cervezas',key='pos_b_zero',width='stretch'):
+            record_pos_batch(d,'BEER','Confirmado sin ventas'); st.success('POS de cervezas confirmado en cero.')
 
     with tab_bottle:
         liquors=products('Licor')
@@ -1625,7 +1649,10 @@ elif page=='POS / Ventas':
                     for pid,qty in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Botella de licor',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); backup_db_to_drive(); st.success(f"Ventas por botella guardadas: {len(rows)} registro(s).")
+                    con.commit(); record_pos_batch(d,'LIQUOR_BOTTLE',obs); st.success(f"Ventas por botella guardadas: {len(rows)} registro(s). POS de botellas confirmado.")
+
+        if st.button('Confirmar 0 ventas de botellas de licor',key='pos_l_zero',width='stretch'):
+            record_pos_batch(d,'LIQUOR_BOTTLE','Confirmado sin ventas'); st.success('POS de botellas de licor confirmado en cero.')
 
 elif page=='Dashboard':
     page_header("Dashboard Operacional", "Inventario, ventas, diferencias, alertas y actividad en una sola vista.")
@@ -1667,7 +1694,7 @@ elif page=='Dashboard':
     shots_sold=one("SELECT COALESCE(SUM(quantity),0) x FROM pos_sales WHERE sale_type='Shot' AND sale_date BETWEEN ? AND ?",(d1.isoformat(),d2.isoformat()))['x']
 
     perf=period_inventory_performance(d1,d2)
-    perf_complete=[r for r in perf if r['Días completos']>0]
+    perf_complete=[r for r in perf if r['Días completos']>0 and r['Diferencia'] is not None]
     worst=max(perf_complete,key=lambda r:abs(float(r['Diferencia'] or 0)),default=None)
     if not worst:
         current_comp=[r for r in today_snapshot if r['_diff'] is not None]
@@ -1694,11 +1721,16 @@ elif page=='Dashboard':
         st.markdown('<div class="ramona-section">📋 Estado de inventario</div>',unsafe_allow_html=True)
         opening_txt='✅ Registrada' if open_done else '⏳ Pendiente'
         closing_txt='✅ Registrado' if close_done else '⏳ Pendiente'
+        ds_today=local_today().isoformat()
+        beer_pos_ok=pos_group_submitted(ds_today,'BEER')
+        liquor_pos_done=sum(1 for g in ('COCKTAIL','SHOT','LIQUOR_BOTTLE') if pos_group_submitted(ds_today,g))
         status_rows=[
             {'Área':'Cervezas','Estado':_category_progress(today_snapshot,'Cerveza')},
             {'Área':'Licores principales' if cycle=='DAILY' else 'Licores','Estado':_category_progress(today_snapshot,'Licor')},
             {'Área':'Apertura','Estado':opening_txt},
             {'Área':'Cierre','Estado':closing_txt},
+            {'Área':'POS cervezas','Estado':'✅ Confirmado' if beer_pos_ok else '⏳ Pendiente'},
+            {'Área':'POS licor','Estado':f"{'✅ Confirmado' if liquor_pos_done==3 else '⏳ Pendiente'} · {liquor_pos_done}/3 secciones"},
         ]
         if last_act:
             status_rows.append({'Área':'Último registro','Estado':f"{last_act['employee']} · {format_local_time(last_act['created_at'])}"})
@@ -1712,7 +1744,7 @@ elif page=='Dashboard':
                 pr.append({'Producto':r['Producto'],'Diferencia':r['Diferencia'],'Estado':r['Alerta']})
             st.dataframe(pd.DataFrame(pr),width='stretch',hide_index=True)
         else:
-            st.success("No hay diferencias con alerta en el inventario registrado hoy.")
+            st.success("No hay diferencias con alerta entre venta por conteo y POS en el inventario comparable de hoy.")
     with s3:
         st.markdown('<div class="ramona-section">🕒 Actividad reciente</div>',unsafe_allow_html=True)
         acts=recent_activity(7)
@@ -1727,14 +1759,14 @@ elif page=='Dashboard':
         elif category_view=='Cervezas': physical=[r for r in physical if r['Tipo']=='Cerveza']
         physical=_status_filter(physical,status_view)
         if physical:
-            cols=['Producto','Tipo','Conteo actual','Esperado','Diferencia','Alerta','Estado','Empleado','Hora']
+            cols=['Producto','Tipo','Apertura','Cierre','Entradas','Consumo físico','Ajustes','Venta por conteo','Ventas POS / recetas','Diferencia','Alerta','Empleado','Hora']
             st.dataframe(pd.DataFrame([{c:r[c] for c in cols} for r in physical]),width='stretch',hide_index=True)
-            st.caption("Un producto no contado aparece como Pendiente y no genera una diferencia falsa. El cierre se compara contra stock esperado; la apertura, contra el cierre anterior cuando existe una referencia comparable.")
+            st.caption("Venta por conteo = apertura + entradas al bar − cierre − ajustes autorizados. La alerta solo se genera cuando el POS relevante fue confirmado; si no, aparece Pendiente POS.")
         else:
             st.info("No hay productos que coincidan con los filtros seleccionados.")
 
         # Rendimiento del periodo solo con días físicamente comparables.
-        st.markdown('<div class="ramona-section">📊 Consumo físico vs consumo explicado</div>',unsafe_allow_html=True)
+        st.markdown('<div class="ramona-section">📊 Venta por conteo vs POS</div>',unsafe_allow_html=True)
         perf_view=perf
         if category_view=='Licores': perf_view=[r for r in perf if r['Categoría']=='Licor']
         elif category_view=='Cervezas': perf_view=[r for r in perf if r['Categoría']=='Cerveza']
@@ -1743,15 +1775,16 @@ elif page=='Dashboard':
         if perf_view:
             perf_show=[]
             for r in perf_view:
-                p=r['_p']; unit='unid' if r['Categoría']=='Cerveza' else 'oz'
+                p=r['_p']
                 perf_show.append({'Producto':r['Producto'],'Tipo':r['Categoría'],
-                                  'Consumo real':f"{r['Consumo real']:.2f} {unit}",
-                                  'Consumo esperado':f"{r['Consumo esperado']:.2f} {unit}",
-                                  'Ajustes':f"{r['Ajustes']:.2f} {unit}",
-                                  'Diferencia':r['_diff_text'],'Estado':r['Estado'],'Días completos':r['Días completos']})
+                                  'Consumo físico':dual_qty_text(p,r['Consumo físico']),
+                                  'Ajustes':dual_qty_text(p,r['Ajustes']),
+                                  'Venta por conteo':dual_qty_text(p,r['Venta por conteo']),
+                                  'Ventas POS / recetas':dual_qty_text(p,r['Ventas POS']) if r['Días POS completos']==r['Días completos'] else 'Pendiente POS',
+                                  'Diferencia':r['_diff_text'],'Estado':r['Estado'],'Días físicos':r['Días completos'],'Días POS':r['Días POS completos']})
             st.dataframe(pd.DataFrame(perf_show),width='stretch',hide_index=True)
         else:
-            st.info("Aún no hay días completos de apertura + cierre en este periodo. Las ventas pueden existir, pero no se convierten en una diferencia física hasta tener ambos conteos.")
+            st.info("Aún no hay días completos de apertura + cierre en este periodo. La diferencia solo se calcula cuando también está confirmado el POS relevante.")
 
         if category_view=='Cervezas':
             st.markdown('<div class="ramona-section">🍺 Ventas de cervezas POS</div>',unsafe_allow_html=True)
@@ -1761,12 +1794,12 @@ elif page=='Dashboard':
 
         # Tendencias: separadas por unidad para no mezclar oz con unidades.
         if category_view in ('General','Licores'):
-            st.markdown('<div class="ramona-section">📈 Tendencia de licores (oz)</div>',unsafe_allow_html=True)
+            st.markdown('<div class="ramona-section">📈 Venta por conteo vs POS · licores</div>',unsafe_allow_html=True)
             lt=daily_trend(d1,d2,'Licor')
             if len(lt): st.line_chart(lt.set_index('Fecha'),width='stretch')
             else: st.info("Sin datos suficientes de licores para graficar.")
         if category_view in ('General','Cervezas'):
-            st.markdown('<div class="ramona-section">📈 Tendencia de cervezas (unidades)</div>',unsafe_allow_html=True)
+            st.markdown('<div class="ramona-section">📈 Venta por conteo vs POS · cervezas</div>',unsafe_allow_html=True)
             bt=daily_trend(d1,d2,'Cerveza')
             if len(bt): st.line_chart(bt.set_index('Fecha'),width='stretch')
             else: st.info("Sin datos suficientes de cerveza para graficar.")
@@ -1829,7 +1862,7 @@ elif page=='Dashboard':
     audit_mode=st.selectbox("Mostrar",['Actividad de inventario','Aperturas','Cierres','Ambos'],key='dash_audit_v4')
     if audit_mode=='Actividad de inventario':
         df=pd.read_sql_query("""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
-                                      ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) Diferencia,
+                                      ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) [Var. apertura],
                                       COALESCE(ic.observation,'') Observación,u.name Empleado
                                FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
                                JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
@@ -1838,7 +1871,7 @@ elif page=='Dashboard':
         types={'Aperturas':['OPENING'],'Cierres':['CLOSING'],'Ambos':['OPENING','CLOSING']}[audit_mode]
         placeholders=','.join('?'*len(types))
         df=pd.read_sql_query(f"""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
-                                       ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) Diferencia,
+                                       ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) [Var. apertura],
                                        COALESCE(ic.observation,'') Observación,u.name Empleado
                                 FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
                                 JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
@@ -1850,7 +1883,7 @@ elif page=='Dashboard':
 
 elif page=='Abastecimiento':
     page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
-    st.caption("Consumo en oz para operación y su equivalente en botellas para compras. La recomendación usa consumo real reciente + stock de seguridad − stock disponible.")
+    st.caption("En licores, el control operativo se mantiene en oz y botellas equivalentes; las compras a proveedores se recomiendan siempre en botellas completas. En cerveza, las compras se expresan en unidades.")
     lookback=int(st.selectbox("Histórico para estimar consumo",[14,21,28,42,56],index=2,format_func=lambda x:f"Últimos {x} días")); safety=float(setting('safety_stock_pct','15'))/100
     d2=local_today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     rows=[]; products_to_buy=0; total_buy_units=0
@@ -1890,7 +1923,7 @@ elif page=='Abastecimiento':
 
 elif page=='Reporte PDF':
     page_header("Reporte Ejecutivo", "Resumen gerencial para la propietaria, con métricas de decisión y detalle operativo.")
-    st.caption("La primera página resume el estado del periodo, consumo, ventas POS, exactitud, diferencias, alertas, costo estimado y necesidades de abastecimiento. Si faltan apertura/cierre, el reporte marca las métricas físicas como pendientes en lugar de inventar ceros.")
+    st.caption("La primera página resume venta por conteo, ventas POS, diferencias, alertas, exactitud y abastecimiento. En licores se muestran oz y botellas equivalentes. Si falta cierre o confirmación POS, la comparación queda pendiente en lugar de generar alertas falsas.")
     a,b=st.columns(2)
     d1=a.date_input("Desde",value=local_today()-timedelta(days=6),key='pdf1')
     d2=b.date_input("Hasta",value=local_today(),key='pdf2')
@@ -2274,6 +2307,7 @@ elif page=='Administración':
                         con.execute("DELETE FROM inventory_counts")
                         con.execute("DELETE FROM inventory_sessions")
                         con.execute("DELETE FROM pos_sales")
+                        con.execute("DELETE FROM pos_batches")
                         con.execute("DELETE FROM movements")
                         con.execute("INSERT INTO settings(key,value) VALUES('sheet_history_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'")
                         con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
