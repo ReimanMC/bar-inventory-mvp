@@ -73,7 +73,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.7"):
+def page_header(title, subtitle="", badge="V0.4.8"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -207,7 +207,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS inventory_sessions(
       id INTEGER PRIMARY KEY, session_date TEXT NOT NULL, session_type TEXT NOT NULL,
       user_id INTEGER, created_at TEXT NOT NULL, submitted INTEGER DEFAULT 1, notes TEXT, inventory_cycle TEXT DEFAULT 'DAILY',
-      FOREIGN KEY(user_id) REFERENCES users(id));
+      paired_opening_session_id INTEGER,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(paired_opening_session_id) REFERENCES inventory_sessions(id));
     CREATE TABLE IF NOT EXISTS inventory_counts(
       id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
       location_id INTEGER NOT NULL, qty_base REAL NOT NULL, previous_qty REAL,
@@ -307,6 +309,27 @@ def ensure_v033_schema():
     con.commit()
 ensure_v033_schema()
 
+# V0.4.8 migration: preserve the exact opening session used by a closing.
+def ensure_v048_schema():
+    scols={r[1] for r in con.execute("PRAGMA table_info(inventory_sessions)").fetchall()}
+    if 'paired_opening_session_id' not in scols:
+        con.execute("ALTER TABLE inventory_sessions ADD COLUMN paired_opening_session_id INTEGER")
+    # Read-path indexes only; no historical rows are modified or deleted.
+    con.execute("CREATE INDEX IF NOT EXISTS idx_inv_sessions_date_type_cycle_created ON inventory_sessions(session_date,session_type,inventory_cycle,created_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_inv_counts_session_product_location ON inventory_counts(session_id,product_id,location_id)")
+    # Safe metadata backfill for existing closings: link each one to the latest opening
+    # of the same date/cycle that existed when the closing was saved. Counts remain untouched.
+    con.execute("""UPDATE inventory_sessions AS c
+                 SET paired_opening_session_id=(
+                    SELECT o.id FROM inventory_sessions o
+                    WHERE o.session_date=c.session_date AND o.session_type='OPENING'
+                      AND COALESCE(o.inventory_cycle,'DAILY')=COALESCE(c.inventory_cycle,'DAILY')
+                      AND o.created_at<=c.created_at
+                    ORDER BY o.created_at DESC,o.id DESC LIMIT 1)
+                 WHERE c.session_type='CLOSING' AND c.paired_opening_session_id IS NULL""")
+    con.commit()
+ensure_v048_schema()
+
 # ---------------------- catalog seed from current sheet ----------------------
 BEERS = ["Corona","Corona Sunbrew","XX","Negra","Especial","Sol","Coors","Molson"]
 LIQUORS = [
@@ -404,6 +427,8 @@ def seed_sheet_history():
     con.execute("INSERT INTO settings(key,value) VALUES('sheet_history_seeded','1')")
     con.commit()
 seed_sheet_history()
+# Backfill pairing metadata for any rows seeded on a brand-new database.
+ensure_v048_schema()
 
 # --------------------------- helpers ---------------------------
 def setting(k, default):
@@ -482,10 +507,17 @@ def last_close(pid, lid, before_or_on=None):
     sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
     r=one(sql,ps); return (float(r['qty_base']),r['session_date']) if r else (None,None)
 
-def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY"):
+def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY", paired_opening_session_id=None):
+    """Append-only inventory session. V0.4.8 never overwrites earlier counts.
+
+    Closing sessions can store the exact opening session used as their baseline.
+    This keeps reconciliation stable even when daily/weekly counts or corrections are
+    entered at different hours on the same date.
+    """
     d=(session_date or local_today()).isoformat() if hasattr((session_date or local_today()),'isoformat') else str(session_date)
-    cur=con.execute("INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle) VALUES(?,?,?,?,?,?)",
-                    (d,kind,user['id'],now_iso(),notes,inventory_cycle)); sid=cur.lastrowid
+    cur=con.execute("""INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle,paired_opening_session_id)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (d,kind,user['id'],now_iso(),notes,inventory_cycle,paired_opening_session_id)); sid=cur.lastrowid
     for x in counts:
         con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
                        VALUES(?,?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
@@ -563,6 +595,177 @@ def session_qty(d, pid, kind, lid):
              WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
              ORDER BY s.created_at DESC LIMIT 1""",(d,kind,pid,lid))
     return float(r['qty_base']) if r else None
+
+# ---------------------- V0.4.8 session-safe reconciliation ----------------------
+def _inventory_session(ds, kind, cycle=None, before_created_at=None):
+    """Latest immutable session matching date/type/cycle.
+
+    before_created_at is used to ensure a closing can only be paired to an opening
+    that existed before that closing was saved.
+    """
+    sql="""SELECT s.*,u.name employee,COUNT(ic.id) item_count
+             FROM inventory_sessions s
+             LEFT JOIN users u ON u.id=s.user_id
+             LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+             WHERE s.session_date=? AND s.session_type=?"""
+    ps=[ds,kind]
+    if cycle:
+        sql += " AND COALESCE(s.inventory_cycle,'DAILY')=?"; ps.append(cycle)
+    if before_created_at:
+        sql += " AND s.created_at<=?"; ps.append(before_created_at)
+    sql += " GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC LIMIT 1"
+    return one(sql,ps)
+
+def _inventory_session_by_id(session_id):
+    if not session_id: return None
+    return one("""SELECT s.*,u.name employee,COUNT(ic.id) item_count
+                  FROM inventory_sessions s
+                  LEFT JOIN users u ON u.id=s.user_id
+                  LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                  WHERE s.id=? GROUP BY s.id""",(session_id,))
+
+def _inventory_session_candidates(ds,kind,cycle):
+    return q("""SELECT s.*,u.name employee,COUNT(ic.id) item_count
+                FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                WHERE s.session_date=? AND s.session_type=? AND COALESCE(s.inventory_cycle,'DAILY')=?
+                GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC""",(ds,kind,cycle))
+
+def _paired_inventory_sessions(ds, preferred_cycle=None):
+    """Return one coherent opening/closing pair for a business date.
+
+    Priority: latest closing (optionally within preferred_cycle), then its stored
+    paired opening. Historical closings without a stored link are paired to the
+    latest opening of the SAME cycle saved before the closing. If no closing exists,
+    the latest opening determines the active cycle. No cross-cycle mixing occurs.
+    """
+    closing=_inventory_session(ds,'CLOSING',preferred_cycle)
+    if closing:
+        cycle=str(closing['inventory_cycle'] or 'DAILY')
+        opening=None
+        try:
+            paired_id=closing['paired_opening_session_id']
+        except Exception:
+            paired_id=None
+        if paired_id:
+            candidate=_inventory_session_by_id(paired_id)
+            if candidate and candidate['session_date']==ds and candidate['session_type']=='OPENING' and str(candidate['inventory_cycle'] or 'DAILY')==cycle:
+                opening=candidate
+        if opening is None:
+            opening=_inventory_session(ds,'OPENING',cycle,closing['created_at'])
+        return opening,closing,cycle
+    if preferred_cycle:
+        opening=_inventory_session(ds,'OPENING',preferred_cycle)
+        if opening: return opening,None,str(opening['inventory_cycle'] or preferred_cycle)
+        return None,None,preferred_cycle
+    # Before a close exists, prioritize the operational DAILY cycle when present.
+    # A later weekly count must not hide a daily opening already in progress.
+    opening=_inventory_session(ds,'OPENING','DAILY') or _inventory_session(ds,'OPENING')
+    if opening:
+        return opening,None,str(opening['inventory_cycle'] or 'DAILY')
+    return None,None,'DAILY'
+
+def _count_record_for_session(session_id,pid,lid):
+    if not session_id: return None
+    return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation
+                  FROM inventory_counts ic WHERE ic.session_id=? AND ic.product_id=? AND ic.location_id=?
+                  ORDER BY ic.id DESC LIMIT 1""",(session_id,pid,lid))
+
+def _latest_product_count(ds,pid,kind,lid,cycle,before_created_at=None):
+    """Latest count for one product within the SAME date/cycle.
+
+    This is intentionally product-level so beer and liquor counts can be submitted at
+    different hours without losing or replacing each other.
+    """
+    sql="""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
+                    s.id session_id,s.created_at,s.inventory_cycle,u.name employee
+             FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+             LEFT JOIN users u ON u.id=s.user_id
+             WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
+               AND COALESCE(s.inventory_cycle,'DAILY')=?"""
+    ps=[ds,kind,pid,lid,cycle]
+    if before_created_at:
+        sql += " AND s.created_at<=?"; ps.append(before_created_at)
+    sql += " ORDER BY s.created_at DESC,s.id DESC,ic.id DESC LIMIT 1"
+    return one(sql,ps)
+
+def _count_value_for_reconciliation(p, rec):
+    """Return physical value in the best available basis.
+
+    Beer -> units. Liquor with presentation -> oz. Liquor without ml -> bottle equivalents.
+    This prevents a valid bottle count from being displayed/calculated as 0 oz.
+    """
+    if rec is None: return None
+    if p['category']=='Cerveza': return float(rec['qty_base'] or 0), 'unit'
+    if p['bottle_ml']: return float(rec['qty_base'] or 0), 'oz'
+    if rec['qty_bottle_equiv'] is not None: return float(rec['qty_bottle_equiv']), 'bottle'
+    # Historical imports before bottle-equivalent storage may already contain oz.
+    # Preserve those non-zero values instead of discarding them.
+    if rec['qty_base'] is not None and abs(float(rec['qty_base'] or 0))>1e-9:
+        return float(rec['qty_base']), 'oz'
+    return 0.0, 'bottle'
+
+def _movement_total_in_basis(ds,p,bar_id,types,direction,basis):
+    col='qty_base' if basis in ('unit','oz') else 'qty_bottle_equiv'
+    loc_col='to_location_id' if direction=='in' else 'from_location_id'
+    marks=','.join('?' for _ in types)
+    sql=f"SELECT COALESCE(SUM(COALESCE({col},0)),0) x FROM movements WHERE movement_date=? AND product_id=? AND {loc_col}=? AND movement_type IN ({marks})"
+    r=one(sql,[ds,p['id'],bar_id,*types])
+    return float(r['x'] or 0)
+
+def transfers_in_basis(ds,p,bar_id,basis):
+    return _movement_total_in_basis(ds,p,bar_id,('TRANSFER','SUPPLIER'),'in',basis)
+
+def adjustments_basis(ds,p,bar_id,basis):
+    return _movement_total_in_basis(ds,p,bar_id,('PRUEBA','DESPERDICIO','CORTESIA','ROTURA'),'out',basis)
+
+def basis_qty_text(p,qty,basis,signed=False):
+    if qty is None: return '—'
+    v=float(qty); plus='+' if signed and v>0 else ''
+    if basis=='unit': return f"{plus}{v:.0f} unid"
+    if basis=='bottle': return f"{plus}{v:.2f} bot · oz pendiente"
+    return dual_qty_text(p,v,signed=signed)
+
+def physical_issue_text_basis(p,stock_gain,adjustment_excess,basis):
+    if stock_gain and stock_gain>0:
+        return f"⚠ Stock aumentó {basis_qty_text(p,stock_gain,basis)} sin entrada registrada"
+    if adjustment_excess and adjustment_excess>0:
+        return f"⚠ Ajustes superan la salida física por {basis_qty_text(p,adjustment_excess,basis)}"
+    return '—'
+
+def _session_trace_label(session):
+    if not session: return '—'
+    kind='Apertura' if session['session_type']=='OPENING' else 'Cierre'
+    cyc='Semanal' if str(session['inventory_cycle'] or 'DAILY')=='WEEKLY' else 'Diario'
+    return f"{kind} {cyc} · {session['employee'] or 'Usuario'} · {format_local_time(session['created_at'])} · ID {session['id']}"
+
+def day_product_reconciliation(ds,p,bar_id):
+    """Reconcile one product using latest same-cycle counts, even if saved at different hours."""
+    _,day_closing,cycle=_paired_inventory_sessions(ds)
+    if not day_closing:
+        # Without any close for the active day/cycle there is no physical sale to reconcile.
+        return None
+    cl=_latest_product_count(ds,p['id'],'CLOSING',bar_id,cycle)
+    if cl is None:
+        return None
+    op=_latest_product_count(ds,p['id'],'OPENING',bar_id,cycle,cl['created_at'])
+    if op is None:
+        return None
+    opv,op_basis=_count_value_for_reconciliation(p,op); clv,cl_basis=_count_value_for_reconciliation(p,cl)
+    if opv is None or clv is None or op_basis!=cl_basis:
+        return None
+    basis=op_basis
+    entries=transfers_in_basis(ds,p,bar_id,basis); adj=adjustments_basis(ds,p,bar_id,basis)
+    rec=reconciliation_values(opv,clv,entries,adj)
+    pos_ready=(basis!='bottle' and pos_comparison_ready(ds,p))
+    pos=expected_sales(ds,p['id'],p) if pos_ready else None
+    diff=(rec['count_sale']-pos) if pos_ready else None
+    return {'opening':opv,'closing':clv,'basis':basis,'entries':entries,'adjustments':adj,
+            'physical':rec['physical'],'count_sale':rec['count_sale'],'stock_gain':rec['stock_gain'],
+            'adjustment_excess':rec['adjustment_excess'],'pos_ready':pos_ready,'pos_sale':pos,'diff':diff,
+            'opening_session_id':op['session_id'],'opening_created_at':op['created_at'],'opening_employee':op['employee'],
+            'closing_session_id':cl['session_id'],'closing_created_at':cl['created_at'],'closing_employee':cl['employee'],'cycle':cycle}
+
 
 def transfers_in(d,pid,bar_id):
     r=one("SELECT COALESCE(SUM(qty_base),0) x FROM movements WHERE movement_date=? AND product_id=? AND to_location_id=? AND movement_type IN ('TRANSFER','SUPPLIER')",(d,pid,bar_id))
@@ -671,19 +874,20 @@ def consolidated(d1,d2):
     for p in products():
         if p['category'] not in ('Cerveza','Licor'): continue
         physical=pos_total=adj=trans=count_sales=stock_gain=adjustment_excess=0.0; days_complete=days_pos=0
-        first_open=last_close_val=None
+        first_open=last_close_val=None; basis=('unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
         for dd in date_range(d1,d2):
-            ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar); cl=session_qty(ds,p['id'],'CLOSING',bar)
-            ti=transfers_in(ds,p['id'],bar); av=adjustments(ds,p['id'],bar)
-            if op is not None and first_open is None: first_open=op
-            if cl is not None: last_close_val=cl
-            if op is not None and cl is not None:
-                rec=reconciliation_values(op,cl,ti,av); day_physical=rec['physical']; day_count_sale=rec['count_sale']
-                physical+=day_physical; adj+=rec['adjustments']; trans+=ti; count_sales+=day_count_sale; stock_gain+=rec['stock_gain']; adjustment_excess+=rec['adjustment_excess']; days_complete+=1
-                if pos_comparison_ready(ds,p): pos_total+=expected_sales(ds,p['id'],p); days_pos+=1
-        pos_ready=days_complete>0 and days_pos==days_complete
-        diff=(count_sales-pos_total) if pos_ready else None
+            ds=dd.isoformat(); dr=day_product_reconciliation(ds,p,bar)
+            if not dr: continue
+            basis=dr['basis']
+            if first_open is None: first_open=dr['opening']
+            last_close_val=dr['closing']
+            physical+=dr['physical']; adj+=dr['adjustments']; trans+=dr['entries']; count_sales+=dr['count_sale']; stock_gain+=dr['stock_gain']; adjustment_excess+=dr['adjustment_excess']; days_complete+=1
+            if dr['pos_ready']:
+                pos_total+=float(dr['pos_sale'] or 0); days_pos+=1
+        pos_ready=days_complete>0 and days_pos==days_complete; diff=(count_sales-pos_total) if pos_ready else None
         state_code,state_label,diff_text=_difference_state(p,diff,days_complete>0,pos_ready=pos_ready)
+        if basis=='bottle' and days_complete>0 and stock_gain<=0 and adjustment_excess<=0:
+            state_code,state_label,diff_text=('PENDING','⚠ Falta ml para POS','—')
         if stock_gain>0:
             state_code,state_label=('ALERT','🔴 Revisar entradas/conteo')
         elif adjustment_excess>0:
@@ -693,17 +897,42 @@ def consolidated(d1,d2):
             'Venta por conteo':count_sales,'Ventas POS':pos_total,'Consumo esperado':pos_total,
             'Diferencia no explicada':diff,'Diferencia':diff,'Estado':state_label,'Días completos':days_complete,
             'Días POS completos':days_pos,'_state':state_code,'_diff_text':diff_text,
-            '_pid':p['id'],'_unit':unit_label(p),'_p':p,'Incidencia física':physical_issue_text(p,stock_gain,adjustment_excess),'_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess})
+            '_pid':p['id'],'_unit':unit_label(p),'_p':p,'_basis':basis,
+            'Incidencia física':physical_issue_text_basis(p,stock_gain,adjustment_excess,basis),
+            '_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess})
     return rows
 
+def current_stock_basis(p, location_id):
+    """Current physical stock in units/oz/bottles, including same-day movements after the latest count."""
+    r=one("""SELECT ic.qty_base,ic.qty_bottle_equiv,s.session_date,s.created_at
+             FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+             WHERE ic.product_id=? AND ic.location_id=?
+             ORDER BY s.session_date DESC,s.created_at DESC,s.id DESC LIMIT 1""",(p['id'],location_id))
+    basis='unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle')
+    if r:
+        if basis=='unit': base=float(r['qty_base'] or 0)
+        elif basis=='oz': base=float(r['qty_base'] or 0)
+        elif r['qty_bottle_equiv'] is not None: base=float(r['qty_bottle_equiv'])
+        elif abs(float(r['qty_base'] or 0))>1e-9:
+            # Legacy imported liquor quantity already stored as oz.
+            basis='oz'; base=float(r['qty_base'])
+        else: base=0.0
+        base_date=r['session_date']; base_created=r['created_at']
+        time_clause=" AND (movement_date>? OR (movement_date=? AND created_at>?))"
+        time_params=(base_date,base_date,base_created)
+    else:
+        base=0.0; time_clause=''; time_params=()
+    col='qty_bottle_equiv' if basis=='bottle' else 'qty_base'
+    incoming=one(f"SELECT COALESCE(SUM(COALESCE({col},0)),0) x FROM movements WHERE product_id=? AND to_location_id=?{time_clause}",(p['id'],location_id,*time_params))['x']
+    outgoing=one(f"SELECT COALESCE(SUM(COALESCE({col},0)),0) x FROM movements WHERE product_id=? AND from_location_id=?{time_clause}",(p['id'],location_id,*time_params))['x']
+    return max(base + float(incoming or 0)-float(outgoing or 0),0.0),basis
+
 def current_stock(pid, location_id):
-    # Best physical count if available, otherwise movement-derived stock from 0.
-    r=one("""SELECT ic.qty_base,s.session_date,s.created_at FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
-             WHERE ic.product_id=? AND ic.location_id=? ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1""",(pid,location_id))
-    base=float(r['qty_base']) if r else 0.0; base_date=r['session_date'] if r else '1900-01-01'
-    incoming=one("SELECT COALESCE(SUM(qty_base),0) x FROM movements WHERE product_id=? AND to_location_id=? AND movement_date>?",(pid,location_id,base_date))['x']
-    outgoing=one("SELECT COALESCE(SUM(qty_base),0) x FROM movements WHERE product_id=? AND from_location_id=? AND movement_date>?",(pid,location_id,base_date))['x']
-    return base + float(incoming or 0)-float(outgoing or 0)
+    # Compatibility wrapper for legacy callers. Prefer current_stock_basis when unit context matters.
+    p=one("SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=?",(pid,))
+    if not p: return 0.0
+    val,basis=current_stock_basis(p,location_id)
+    return val
 
 def bottle_oz(p):
     return (float(p['bottle_ml'])/ML_PER_OZ) if p['category']=='Licor' and p['bottle_ml'] else None
@@ -734,31 +963,33 @@ def product_accuracy(r):
 def daily_trend(d1,d2,category):
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; out=[]
     for dd in date_range(d1,d2):
-        count_sale=pos_sale=0.0; complete=False; pos_ready=True; ds=dd.isoformat()
+        count_sale=pos_sale=0.0; complete=False; pos_ready=True; comparable_count=0; ds=dd.isoformat()
         for p in products(category):
-            op=session_qty(ds,p['id'],'OPENING',bar); cl=session_qty(ds,p['id'],'CLOSING',bar)
-            if op is not None and cl is not None:
-                rec=reconciliation_values(op,cl,transfers_in(ds,p['id'],bar),adjustments(ds,p['id'],bar))
-                count_sale += rec['count_sale']; complete=True
-                if pos_comparison_ready(ds,p): pos_sale += expected_sales(ds,p['id'],p)
-                else: pos_ready=False
-        if complete: out.append({'Fecha':ds,'Venta por conteo':count_sale,'Ventas POS':(pos_sale if pos_ready else None)})
+            dr=day_product_reconciliation(ds,p,bar)
+            if not dr: continue
+            # Liquor without ml is kept in bottles and cannot be mixed into an oz chart.
+            if category=='Licor' and dr['basis']!='oz':
+                continue
+            count_sale += dr['count_sale']; complete=True; comparable_count+=1
+            if dr['pos_ready']: pos_sale += float(dr['pos_sale'] or 0)
+            else: pos_ready=False
+        if complete and comparable_count:
+            out.append({'Fecha':ds,'Venta por conteo':count_sale,'Ventas POS':(pos_sale if pos_ready else None)})
     return pd.DataFrame(out)
 
-# --------------------------- Dashboard operacional V0.4.7 ---------------------------
+# --------------------------- Dashboard operacional V0.4.8 ---------------------------
 def _latest_count_record(ds, pid, kind, bar_id):
-    return one("""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,COALESCE(ic.observation,'') observation,
-                        s.created_at,s.inventory_cycle,u.name employee
-                 FROM inventory_counts ic
-                 JOIN inventory_sessions s ON s.id=ic.session_id
-                 LEFT JOIN users u ON u.id=s.user_id
-                 WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
-                 ORDER BY s.created_at DESC LIMIT 1""",(ds,kind,pid,bar_id))
+    # Backward-compatible helper. Dashboard/reports use coherent session pairs in V0.4.8.
+    sess=_inventory_session(ds,kind)
+    if not sess: return None
+    rec=_count_record_for_session(sess['id'],pid,bar_id)
+    if not rec: return None
+    out=dict(rec); out.update({'created_at':sess['created_at'],'inventory_cycle':sess['inventory_cycle'],'employee':sess['employee'],'session_id':sess['id']})
+    return out
 
 def _latest_cycle_for_date(ds):
-    r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle FROM inventory_sessions
-             WHERE session_date=? ORDER BY created_at DESC LIMIT 1""",(ds,))
-    return str(r['cycle']) if r else 'DAILY'
+    op,cl,cycle=_paired_inventory_sessions(ds)
+    return cycle
 
 def _count_text(p, base, bottle_equiv=None):
     if base is None and bottle_equiv is None:
@@ -772,8 +1003,10 @@ def _count_text(p, base, bottle_equiv=None):
     if beq is not None and base is not None and p['bottle_ml']:
         return f"{float(beq):.2f} bot · {float(base):.2f} oz"
     if beq is not None:
-        return f"{float(beq):.2f} bot · ⚠ ml pendiente"
-    return f"{float(base or 0):.2f} oz"
+        return f"{float(beq):.2f} bot · oz pendiente"
+    if base is not None and abs(float(base or 0))>1e-9:
+        return f"{float(base):.2f} oz · presentación pendiente"
+    return "0.00 bot · oz pendiente"
 
 def _base_expected_text(p, base):
     if base is None:
@@ -795,40 +1028,76 @@ def _difference_state(p, diff, registered=True, pos_ready=True):
     if ad<=tol*3: return ('REVIEW','🟡 Revisar',diff_text)
     return ('ALERT','🔴 Alerta',diff_text)
 
-def today_inventory_snapshot(target_date=None):
+def _snapshot_products_for_date_cycle(ds,cycle):
+    """Historical view = products actually counted; current day = configured requirements + actual counts."""
+    historical=ds < local_today().isoformat()
+    base={} if historical else {p['id']:p for p in inventory_products(cycle)}
+    rows=q("""SELECT DISTINCT p.*,c.name category,c.count_unit
+              FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+              JOIN products p ON p.id=ic.product_id JOIN categories c ON c.id=p.category_id
+              WHERE s.session_date=? AND COALESCE(s.inventory_cycle,'DAILY')=? AND c.name IN ('Cerveza','Licor')""",(ds,cycle))
+    for p in rows: base[p['id']]=p
+    return sorted(base.values(),key=lambda p:(p['category'],p['name']))
+
+def today_inventory_snapshot(target_date=None, preferred_cycle=None):
     target_date=target_date or local_today(); ds=target_date.isoformat()
-    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']; cycle=_latest_cycle_for_date(ds)
+    bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    _,day_closing,cycle=_paired_inventory_sessions(ds,preferred_cycle)
+    if day_closing is None:
+        day_opening=_inventory_session(ds,'OPENING',preferred_cycle)
+        if day_opening: cycle=str(day_opening['inventory_cycle'] or 'DAILY')
+        elif preferred_cycle: cycle=preferred_cycle
     rows=[]
-    for p in inventory_products(cycle):
-        op=_latest_count_record(ds,p['id'],'OPENING',bar_id); cl=_latest_count_record(ds,p['id'],'CLOSING',bar_id); rec=cl or op
-        registered=rec is not None; physical=adj=count_sale=pos_sale=diff=None; stock_gain=adjustment_excess=0.0; ready=False
+    for p in _snapshot_products_for_date_cycle(ds,cycle):
+        cl=_latest_product_count(ds,p['id'],'CLOSING',bar_id,cycle)
+        op=_latest_product_count(ds,p['id'],'OPENING',bar_id,cycle,cl['created_at'] if cl else None)
+        rec=cl or op
+        registered=rec is not None; physical=adj=count_sale=pos_sale=diff=None; stock_gain=adjustment_excess=0.0; ready=False; basis=None
+        opv,op_basis=_count_value_for_reconciliation(p,op) if op is not None else (None,None)
+        clv,cl_basis=_count_value_for_reconciliation(p,cl) if cl is not None else (None,None)
         if op is None:
-            state_code,state_label,diff_text=('PENDING','⏳ Pendiente apertura','—'); basis='Sin apertura'
+            state_code,state_label,diff_text=('PENDING','⏳ Pendiente apertura','—'); basis_text='Sin apertura comparable'
         elif cl is None:
-            state_code,state_label,diff_text=('PENDING','⏳ Pendiente cierre','—'); basis='Apertura registrada · cierre pendiente'
-        elif p['category']=='Licor' and not p['bottle_ml']:
-            state_code,state_label,diff_text=('PENDING','⚠ Falta ml','—'); basis='Cierre registrado · falta ml'
+            state_code,state_label,diff_text=('PENDING','⏳ Pendiente cierre','—'); basis_text='Apertura registrada · cierre pendiente'
+        elif op_basis!=cl_basis:
+            state_code,state_label,diff_text=('PENDING','⚠ Base de medida incompatible','—'); basis_text='Revisar presentación histórica'
         else:
-            entries=transfers_in(ds,p['id'],bar_id); adj=adjustments(ds,p['id'],bar_id)
-            recon=reconciliation_values(op['qty_base'],cl['qty_base'],entries,adj); physical=recon['physical']; count_sale=recon['count_sale']; stock_gain=recon['stock_gain']; adjustment_excess=recon['adjustment_excess']; ready=pos_comparison_ready(ds,p)
-            if ready: pos_sale=expected_sales(ds,p['id'],p); diff=count_sale-pos_sale; basis='Venta por conteo vs POS'
-            else: basis='Cierre completo · POS pendiente'
-            state_code,state_label,diff_text=_difference_state(p,diff,True,pos_ready=ready)
+            basis=op_basis
+            entries=transfers_in_basis(ds,p,bar_id,basis); adj=adjustments_basis(ds,p,bar_id,basis)
+            recon=reconciliation_values(opv,clv,entries,adj); physical=recon['physical']; count_sale=recon['count_sale']; stock_gain=recon['stock_gain']; adjustment_excess=recon['adjustment_excess']
+            if basis=='bottle':
+                ready=False; basis_text='Conteo en botellas · falta ml para comparar con POS/recetas'
+                state_code,state_label,diff_text=('PENDING','⚠ Falta ml para POS','—')
+            else:
+                ready=pos_comparison_ready(ds,p)
+                if ready:
+                    pos_sale=expected_sales(ds,p['id'],p); diff=count_sale-pos_sale; basis_text='Venta por conteo vs POS'
+                else:
+                    basis_text='Cierre completo · POS pendiente'
+                state_code,state_label,diff_text=_difference_state(p,diff,True,pos_ready=ready)
             if stock_gain>0:
                 state_code,state_label=('ALERT','🔴 Revisar entradas/conteo')
             elif adjustment_excess>0:
                 state_code,state_label=('REVIEW','🟡 Revisar ajustes')
-        entries=transfers_in(ds,p['id'],bar_id) if op is not None else None
+        entries=(transfers_in_basis(ds,p,bar_id,basis) if basis else None) if op is not None and cl is not None else None
+        basis_for_text=basis or ('unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
+        op_base=float(op['qty_base']) if op else None; op_beq=float(op['qty_bottle_equiv']) if op and op['qty_bottle_equiv'] is not None else None
+        cl_base=float(cl['qty_base']) if cl else None; cl_beq=float(cl['qty_bottle_equiv']) if cl and cl['qty_bottle_equiv'] is not None else None
         rows.append({'Producto':p['name'],'Tipo':p['category'],
-            'Apertura':_count_text(p,float(op['qty_base']) if op else None,float(op['qty_bottle_equiv']) if op and op['qty_bottle_equiv'] is not None else None),
-            'Cierre':_count_text(p,float(cl['qty_base']) if cl else None,float(cl['qty_bottle_equiv']) if cl and cl['qty_bottle_equiv'] is not None else None),
-            'Entradas':dual_qty_text(p,entries) if entries is not None else '—','Consumo físico':dual_qty_text(p,physical),
-            'Ajustes':dual_qty_text(p,adj),'Venta por conteo':dual_qty_text(p,count_sale),'Incidencia física':physical_issue_text(p,stock_gain,adjustment_excess),
-            'Ventas POS / recetas':dual_qty_text(p,pos_sale) if ready else ('Pendiente POS' if cl is not None else '—'),
-            'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente','Base comparación':basis,
-            'Empleado':rec['employee'] if rec else '—','Hora':format_local_time(rec['created_at']) if rec and rec['created_at'] else '—',
+            'Apertura':_count_text(p,op_base,op_beq),
+            'Cierre':_count_text(p,cl_base,cl_beq),
+            'Entradas':basis_qty_text(p,entries,basis_for_text) if entries is not None else '—',
+            'Consumo físico':basis_qty_text(p,physical,basis_for_text),
+            'Ajustes':basis_qty_text(p,adj,basis_for_text),
+            'Venta por conteo':basis_qty_text(p,count_sale,basis_for_text),
+            'Incidencia física':physical_issue_text_basis(p,stock_gain,adjustment_excess,basis_for_text),
+            'Ventas POS / recetas':(basis_qty_text(p,pos_sale,basis_for_text) if ready else ('⚠ Falta ml para comparar' if basis=='bottle' and cl is not None else ('Pendiente POS' if cl is not None else '—'))),
+            'Diferencia':diff_text,'Alerta':state_label,'Estado':'Registrado' if registered else 'Pendiente','Base comparación':basis_text,
+            'Empleado':(cl['employee'] if cl else (op['employee'] if op else '—')),
+            'Hora':(format_local_time(cl['created_at']) if cl else (format_local_time(op['created_at']) if op else '—')),
             '_state':state_code,'_diff':diff,'_p':p,'_pid':p['id'],'_registered':registered,'_has_opening':op is not None,
-            '_has_closing':cl is not None,'_pos_ready':ready,'_physical':physical,'_adjustments':adj,'_count_sale':count_sale,'_pos_sale':pos_sale,'_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess})
+            '_has_closing':cl is not None,'_pos_ready':ready,'_physical':physical,'_adjustments':adj,'_count_sale':count_sale,'_pos_sale':pos_sale,'_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess,'_basis':basis_for_text,
+            '_opening_session_id':op['session_id'] if op else None,'_closing_session_id':cl['session_id'] if cl else None})
     return rows,cycle
 
 def _inventory_progress_today(snapshot):
@@ -904,30 +1173,31 @@ def recent_activity(limit=8):
     return out
 
 def period_inventory_performance(d1,d2):
-    """Salida física y venta por conteo siempre no negativas. Diferencia = venta por conteo - POS y sí puede ser positiva o negativa."""
+    """Period reconciliation using coherent session pairs and the best physical basis available."""
     bar_id=one("SELECT id FROM locations WHERE name='Bar'")['id']; rows=[]
     for p in products():
         if p['category'] not in ('Cerveza','Licor'): continue
-        if p['category']=='Licor' and not p['bottle_ml']:
-            rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':0.0,'Consumo físico':0.0,'Ajustes':0.0,
-                         'Venta por conteo':0.0,'Ventas POS':0.0,'Consumo esperado':0.0,'Diferencia':None,'Días completos':0,
-                         'Días POS completos':0,'Estado':'⚠ Falta ml','_state':'PENDING','_p':p,'_diff_text':'—'}); continue
         physical=adj=count_sale=pos_sale=stock_gain=adjustment_excess=0.0; complete=pos_complete=0
+        basis=('unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
         for dd in date_range(d1,d2):
-            ds=dd.isoformat(); op=session_qty(ds,p['id'],'OPENING',bar_id); cl=session_qty(ds,p['id'],'CLOSING',bar_id)
-            if op is None or cl is None: continue
-            day_adj=adjustments(ds,p['id'],bar_id); rec=reconciliation_values(op,cl,transfers_in(ds,p['id'],bar_id),day_adj)
-            physical+=rec['physical']; adj+=rec['adjustments']; count_sale+=rec['count_sale']; stock_gain+=rec['stock_gain']; adjustment_excess+=rec['adjustment_excess']; complete+=1
-            if pos_comparison_ready(ds,p): pos_sale+=expected_sales(ds,p['id'],p); pos_complete+=1
+            dr=day_product_reconciliation(dd.isoformat(),p,bar_id)
+            if not dr: continue
+            basis=dr['basis']; physical+=dr['physical']; adj+=dr['adjustments']; count_sale+=dr['count_sale']; stock_gain+=dr['stock_gain']; adjustment_excess+=dr['adjustment_excess']; complete+=1
+            if dr['pos_ready']:
+                pos_sale+=float(dr['pos_sale'] or 0); pos_complete+=1
         ready=complete>0 and pos_complete==complete; diff=(count_sale-pos_sale) if ready else None
         state_code,state_label,diff_text=_difference_state(p,diff,complete>0,pos_ready=ready)
+        if basis=='bottle' and complete>0 and stock_gain<=0 and adjustment_excess<=0:
+            state_code,state_label,diff_text=('PENDING','⚠ Falta ml para POS','—')
         if stock_gain>0:
             state_code,state_label=('ALERT','🔴 Revisar entradas/conteo')
         elif adjustment_excess>0:
             state_code,state_label=('REVIEW','🟡 Revisar ajustes')
         rows.append({'Producto':p['name'],'Categoría':p['category'],'Consumo real':physical,'Consumo físico':physical,'Ajustes':adj,
                      'Venta por conteo':count_sale,'Ventas POS':pos_sale,'Consumo esperado':pos_sale,'Diferencia':diff,'Días completos':complete,
-                     'Días POS completos':pos_complete,'Estado':state_label,'Incidencia física':physical_issue_text(p,stock_gain,adjustment_excess),'_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess,'_state':state_code,'_p':p,'_diff_text':diff_text})
+                     'Días POS completos':pos_complete,'Estado':state_label,
+                     'Incidencia física':physical_issue_text_basis(p,stock_gain,adjustment_excess,basis),
+                     '_stock_gain':stock_gain,'_adjustment_excess':adjustment_excess,'_state':state_code,'_p':p,'_basis':basis,'_diff_text':diff_text})
     return rows
 
 def cocktail_sales_summary(d1,d2):
@@ -991,20 +1261,17 @@ def _pdf_state_label(code):
 
 
 def _report_inventory_status(d1,d2):
-    rows=q("""SELECT session_date,
-                     MAX(CASE WHEN session_type='OPENING' THEN 1 ELSE 0 END) has_opening,
-                     MAX(CASE WHEN session_type='CLOSING' THEN 1 ELSE 0 END) has_closing
-              FROM inventory_sessions
-              WHERE session_date BETWEEN ? AND ?
-              GROUP BY session_date ORDER BY session_date""",(d1.isoformat(),d2.isoformat()))
-    active=len(rows)
-    complete=sum(1 for r in rows if int(r['has_opening'] or 0)==1 and int(r['has_closing'] or 0)==1)
+    dates=[r['session_date'] for r in q("SELECT DISTINCT session_date FROM inventory_sessions WHERE session_date BETWEEN ? AND ? ORDER BY session_date",(d1.isoformat(),d2.isoformat()))]
+    active=len(dates); complete=0
+    for ds in dates:
+        op,cl,_=_paired_inventory_sessions(ds)
+        if op and cl: complete+=1
     if active==0:
         state='SIN INVENTARIO FISICO'
     elif complete==active:
         state='COMPLETO' if active==1 else f'COMPLETO - {complete} DIAS CON ACTIVIDAD'
     else:
-        state=f'PARCIAL - {complete}/{active} DIAS CON APERTURA + CIERRE'
+        state=f'PARCIAL - {complete}/{active} DIAS CON APERTURA + CIERRE COMPARABLE'
     counted=one("""SELECT COUNT(DISTINCT ic.product_id) n
                    FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
                    WHERE s.session_date BETWEEN ? AND ?""",(d1.isoformat(),d2.isoformat()))['n']
@@ -1013,7 +1280,7 @@ def _report_inventory_status(d1,d2):
                   LEFT JOIN users u ON u.id=s.user_id
                   LEFT JOIN inventory_counts ic ON ic.session_id=s.id
                   WHERE s.session_date BETWEEN ? AND ?
-                  GROUP BY s.id ORDER BY s.created_at DESC LIMIT 1""",(d1.isoformat(),d2.isoformat()))
+                  GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC LIMIT 1""",(d1.isoformat(),d2.isoformat()))
     return {'state':state,'active_days':active,'complete_days':complete,'products_counted':int(counted or 0),'latest':latest}
 
 
@@ -1044,21 +1311,22 @@ def _report_replenishment(perf_rows):
     rows=[]
     for r in perf_rows:
         if r['Días completos']<=0: continue
-        p=r['_p']
+        p=r['_p']; basis=r.get('_basis','unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
         weekly=max(float(r['Consumo real'] or 0),0)/max(r['Días completos'],1)*7
         target=weekly*(1+safety)
-        stock=max(current_stock(p['id'],bar_id)+current_stock(p['id'],wh_id),0)
-        need=max(target-stock,0)
+        sb,sbb=current_stock_basis(p,bar_id); sw,swb=current_stock_basis(p,wh_id)
+        if sbb!=basis or swb!=basis:
+            continue
+        stock=max(sb+sw,0); need=max(target-stock,0)
         if need<=0: continue
-        if p['category']=='Licor':
-            boz=bottle_oz(p)
-            buy=(math.ceil(need/boz) if boz else None)
-            action=(f'{buy} botellas' if buy is not None else 'Falta presentación ml')
+        if p['category']=='Cerveza':
+            buy=math.ceil(need); action=f'{buy} unidades'
+        elif basis=='bottle':
+            buy=math.ceil(need); action=f'{buy} botellas'
         else:
-            buy=math.ceil(need)
-            action=f'{buy} unidades'
+            boz=bottle_oz(p); buy=(math.ceil(need/boz) if boz else None); action=(f'{buy} botellas' if buy is not None else 'Falta presentación ml')
         rows.append({'Producto':p['name'],'Categoría':p['category'],'Necesidad':need,'Stock':stock,
-                     'Comprar':action,'_p':p,'_buy':buy})
+                     'Comprar':action,'_p':p,'_buy':buy,'_basis':basis})
     rows.sort(key=lambda x:(0 if x['_buy'] is None else -x['_buy'],x['Producto']))
     return rows
 
@@ -1076,7 +1344,10 @@ def _report_observations(perf, inv_status, cocktails, shots, beers, replenishmen
         notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) completo(s) de {inv_status['active_days']} día(s) con actividad. Las métricas físicas usan solo días comparables.")
     else:
         notes.append(f"El periodo contiene {inv_status['complete_days']} día(s) con apertura y cierre comparables.")
-    pending_pos=[r for r in perf if r.get('Días completos',0)>r.get('Días POS completos',0)]
+    pending_ml=[r for r in perf if r.get('Días completos',0)>0 and r.get('_basis')=='bottle']
+    if pending_ml:
+        notes.append(f"Hay {len(pending_ml)} licor(es) con conteo físico conservado en botellas equivalentes y presentación ml pendiente. Sus cantidades no se pierden; la comparación con POS/recetas en oz se activará al completar los ml.")
+    pending_pos=[r for r in perf if r.get('Días completos',0)>r.get('Días POS completos',0) and r.get('_basis')!='bottle']
     if pending_pos:
         notes.append(f"Hay {len(pending_pos)} producto(s) con inventario físico comparable pero POS aún pendiente de confirmar; no generan alerta hasta completar el POS.")
     if alerts or reviews:
@@ -1109,10 +1380,15 @@ def build_executive_report_pdf(d1,d2):
     inv_status=_report_inventory_status(d1,d2)
     replenishment=_report_replenishment(perf)
 
+    physical_rows=[r for r in perf if r['Días completos']>0]
+    liquor_oz_rows=[r for r in physical_rows if r['Categoría']=='Licor' and r.get('_basis')=='oz']
+    liquor_bottle_rows=[r for r in physical_rows if r['Categoría']=='Licor' and r.get('_basis')=='bottle']
     liquor_rows=[r for r in comparable if r['Categoría']=='Licor']
     beer_rows=[r for r in comparable if r['Categoría']=='Cerveza']
-    liquor_real=sum(float(r['Consumo físico'] or 0) for r in liquor_rows)
-    liquor_count_sale=sum(float(r['Venta por conteo'] or 0) for r in liquor_rows)
+    liquor_real=sum(float(r['Consumo físico'] or 0) for r in liquor_oz_rows)
+    liquor_real_bottles=sum(float(r['Consumo físico'] or 0) for r in liquor_bottle_rows)
+    liquor_count_sale=sum(float(r['Venta por conteo'] or 0) for r in liquor_oz_rows)
+    liquor_count_sale_bottles=sum(float(r['Venta por conteo'] or 0) for r in liquor_bottle_rows)
     liquor_pos=sum(float(r['Ventas POS'] or 0) for r in liquor_rows)
     beer_real=sum(float(r['Consumo físico'] or 0) for r in beer_rows)
     beer_count_sale=sum(float(r['Venta por conteo'] or 0) for r in beer_rows)
@@ -1216,11 +1492,16 @@ def build_executive_report_pdf(d1,d2):
     story += [status_tbl,Spacer(1,7),Paragraph('Indicadores clave',section_style)]
 
     physical_available=inv_status['complete_days']>0
+    def liquor_mix_text(oz_value,bottle_value,empty='Pendiente'):
+        parts=[]
+        if abs(float(oz_value or 0))>1e-9: parts.append(f'{float(oz_value):.2f} oz')
+        if abs(float(bottle_value or 0))>1e-9: parts.append(f'{float(bottle_value):.2f} bot (ml pend.)')
+        return ' + '.join(parts) if parts else empty
     largest_txt='Sin diferencias'
     if largest:
         largest_txt=f"{largest['Producto']} ({diff_text(largest)})"
     kpis=[
-        ('Venta por conteo licor',f'{liquor_count_sale:.1f} oz' if physical_available and liquor_rows else 'Pendiente'),
+        ('Venta por conteo licor',liquor_mix_text(liquor_count_sale,liquor_count_sale_bottles) if physical_available else 'Pendiente'),
         ('Venta por conteo cerveza',f'{beer_count_sale:.0f} unid' if physical_available and beer_rows else 'Pendiente'),
         ('Cócteles vendidos',f'{cocktail_sold:.0f}'),
         ('Shots vendidos',f'{shot_sold:.0f}'),
@@ -1245,7 +1526,7 @@ def build_executive_report_pdf(d1,d2):
     story.append(Paragraph('Resumen comercial y de consumo',section_style))
     summary_data=[
         [P('Indicador',small_style),P('Resultado',small_style),P('Indicador',small_style),P('Resultado',small_style)],
-        [P('Salida física de licor'),P(f'{liquor_real:.2f} oz' if physical_available and liquor_rows else 'Pendiente de cierre'),P('Venta conteo / POS-recetas licor'),P(f'{liquor_count_sale:.2f} / {liquor_pos:.2f} oz' if physical_available and liquor_rows else 'Pendiente')],
+        [P('Salida física de licor'),P(liquor_mix_text(liquor_real,liquor_real_bottles,'Pendiente de cierre') if physical_available else 'Pendiente de cierre'),P('Venta conteo / POS-recetas licor'),P((liquor_mix_text(liquor_count_sale,liquor_count_sale_bottles)+' / '+(f'{liquor_pos:.2f} oz' if liquor_rows else 'POS pendiente / ml pendiente')) if physical_available else 'Pendiente')],
         [P('Salida física de cerveza'),P(f'{beer_real:.0f} unidades' if physical_available and beer_rows else 'Pendiente de cierre'),P('Venta por conteo / POS cerveza'),P(f'{beer_count_sale:.0f} / {beer_pos:.0f}' if physical_available and beer_rows else 'Pendiente')],
         [P('Cócteles vendidos'),P(f'{cocktail_sold:.0f}'),P('Licor teórico en cócteles'),P(f'{cocktail_oz:.2f} oz')],
         [P('Shots vendidos'),P(f'{shot_sold:.0f}'),P('Licor teórico en shots'),P(f'{shot_oz:.2f} oz')],
@@ -1267,7 +1548,7 @@ def build_executive_report_pdf(d1,d2):
         att=[['Producto','Tipo','Físico','Ajustes','Venta conteo','POS/recetas','Diferencia','Incidencia','Estado']]
         for r in attention[:10]:
             p=r['_p']
-            att.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(dual_qty_text(p,r['Consumo físico'])),_pdf_clean(dual_qty_text(p,r['Ajustes'])),_pdf_clean(dual_qty_text(p,r['Venta por conteo'])),_pdf_clean(dual_qty_text(p,r['Ventas POS'])),diff_text(r),_pdf_clean(r.get('Incidencia física','—')),state_text(r)])
+            att.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(basis_qty_text(p,r['Consumo físico'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Ajustes'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Venta por conteo'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Ventas POS'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),diff_text(r),_pdf_clean(r.get('Incidencia física','—')),state_text(r)])
         t=Table(att,colWidths=[1.15*inch,.50*inch,1.05*inch,.95*inch,1.15*inch,1.15*inch,.95*inch,1.55*inch,.90*inch],repeatRows=1)
         t.setStyle(table_style('#9f3f32',6.8)); story.append(t)
     else:
@@ -1279,11 +1560,20 @@ def build_executive_report_pdf(d1,d2):
         detail=[['Producto','Tipo','Físico','Ajustes','Venta conteo','POS/recetas','Diferencia','Incidencia','Exact.','Estado','Días']]
         for r in sorted(comparable,key=lambda x:(x['Categoría'],x['Producto'])):
             p=r['_p']
-            detail.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(dual_qty_text(p,r['Consumo físico'])),_pdf_clean(dual_qty_text(p,r['Ajustes'])),_pdf_clean(dual_qty_text(p,r['Venta por conteo'])),_pdf_clean(dual_qty_text(p,r['Ventas POS'])),diff_text(r),_pdf_clean(r.get('Incidencia física','—')),accuracy_text(r),state_text(r),str(r['Días completos'])])
+            detail.append([_pdf_clean(r['Producto']),r['Categoría'],_pdf_clean(basis_qty_text(p,r['Consumo físico'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Ajustes'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Venta por conteo'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),_pdf_clean(basis_qty_text(p,r['Ventas POS'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))),diff_text(r),_pdf_clean(r.get('Incidencia física','—')),accuracy_text(r),state_text(r),str(r['Días completos'])])
         dt=Table(detail,colWidths=[.95*inch,.45*inch,.95*inch,.85*inch,1.05*inch,1.05*inch,.85*inch,1.35*inch,.50*inch,.70*inch,.30*inch],repeatRows=1)
         dt.setStyle(table_style('#252a31',6.6)); story.append(dt)
     else:
         story.append(P('No hay productos con apertura + cierre + POS completo para comparar en el periodo seleccionado.'))
+
+    pending_ml_rows=[r for r in physical_rows if r['Categoría']=='Licor' and r.get('_basis')=='bottle']
+    if pending_ml_rows:
+        story += [Spacer(1,8),Paragraph('Licores contados con presentación ml pendiente',section_style),
+                  Paragraph('Estos conteos físicos se conservan en botellas equivalentes. No se comparan contra recetas/POS en oz hasta registrar la presentación en ml.',subtitle_style),Spacer(1,4)]
+        pml=[['Producto','Salida física','Ajustes','Venta por conteo','Estado']]
+        for r in pending_ml_rows:
+            pml.append([r['Producto'],basis_qty_text(r['_p'],r['Consumo físico'],'bottle'),basis_qty_text(r['_p'],r['Ajustes'],'bottle'),basis_qty_text(r['_p'],r['Venta por conteo'],'bottle'),_pdf_clean(r['Estado'])])
+        pmt=Table(pml,colWidths=[3.0*inch,1.7*inch,1.5*inch,1.8*inch,2.0*inch],repeatRows=1); pmt.setStyle(table_style('#7c4a3b',7)); story.append(pmt)
 
     story += [Spacer(1,9),Paragraph('Ventas POS y consumo teórico',section_style)]
     sales_summary=[['Categoría','Ventas','Consumo teórico / referencia','Producto más vendido']]
@@ -1322,8 +1612,8 @@ def build_executive_report_pdf(d1,d2):
         rt=[['Producto','Tipo','Stock actual','Necesidad estimada','Compra sugerida']]
         for r in replenishment[:30]:
             p=r['_p']
-            stock=oz_and_bottles_text(p,r['Stock']).replace('\n',' / ')
-            need=oz_and_bottles_text(p,r['Necesidad']).replace('\n',' / ')
+            stock=basis_qty_text(p,r['Stock'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))
+            need=basis_qty_text(p,r['Necesidad'],r.get('_basis','unit' if p['category']=='Cerveza' else 'oz'))
             rt.append([r['Producto'],r['Categoría'],stock,need,r['Comprar']])
         rtb=Table(rt,colWidths=[2.4*inch,.8*inch,1.9*inch,1.9*inch,2.6*inch],repeatRows=1); rtb.setStyle(table_style('#355c4d',7)); story.append(rtb)
     else:
@@ -1468,7 +1758,11 @@ if page=='Apertura':
     else:
         st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
     st.caption("Si no existe un cierre anterior comparable, el conteo se guarda como referencia sin generar una alerta falsa.")
+    scope=st.radio("Registrar en esta captura",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key=f'opening_scope_{cycle}_{d}')
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; ps=inventory_products(cycle)
+    if scope=='Solo cervezas': ps=[p for p in ps if p['category']=='Cerveza']
+    elif scope=='Solo licores': ps=[p for p in ps if p['category']=='Licor']
+    st.caption("Puedes guardar cervezas y licores en momentos distintos. Cada captura se conserva con usuario y hora; no sobrescribe las anteriores.")
     counts=[]; missing_obs=False
     for cat in ['Cerveza','Licor']:
         g=[p for p in ps if p['category']==cat]
@@ -1501,13 +1795,19 @@ if page=='Apertura':
                             obs=st.text_input("Observación obligatoria",key=f"opobs_{cycle}_{d}_{p['id']}")
                             missing_obs |= not bool(obs.strip())
                         elif var is not None: st.caption(f"Diferencia: {var:+.2f} {var_unit} · dentro de tolerancia")
-                counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv})
-    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label}")
+                counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv,'name':p['name'],'category':p['category']})
+    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label} · Captura: {scope}")
+    zero_items=[x['name'] for x in counts if ((x['category']=='Cerveza' and float(x['qty'] or 0)<=0) or (x['category']=='Licor' and float(x.get('bottle_equiv') or 0)<=0))]
+    zero_confirm=True
+    if zero_items:
+        st.warning("Productos con conteo 0: " + ", ".join(zero_items))
+        zero_confirm=st.checkbox("Confirmo que los productos mostrados en 0 fueron contados físicamente y realmente están en cero.",key=f'opening_zero_confirm_{cycle}_{d}_{scope}')
     if st.button("Guardar apertura",type="primary",width="stretch"):
         if missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
+        elif not zero_confirm: st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
         else:
             save_session('OPENING',counts,d,inventory_cycle=cycle)
-            st.success(f"Apertura {cycle_label.lower()} guardada correctamente.")
+            st.success(f"Apertura {cycle_label.lower()} guardada correctamente. Esta captura quedó registrada sin borrar capturas anteriores.")
 
 elif page=='Cierre':
     page_header("Cierre", "Conteo final del turno. Cada producto muestra como base la apertura del mismo día.")
@@ -1522,31 +1822,50 @@ elif page=='Cierre':
         st.caption("Inventario diario: todas las cervezas + licores principales.")
     else:
         st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
+    scope=st.radio("Registrar en esta captura",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key=f'closing_scope_{cycle}_{d}')
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     ps=inventory_products(cycle); all_ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
+    if scope=='Solo cervezas': ps=[p for p in ps if p['category']=='Cerveza']
+    elif scope=='Solo licores': ps=[p for p in ps if p['category']=='Licor']
+    opening_meta=_inventory_session(d.isoformat(),'OPENING',cycle)
+    if opening_meta:
+        st.success(f"Aperturas disponibles para este ciclo. Última captura: {_session_trace_label(opening_meta)}")
+    else:
+        st.warning("⚠ No existe apertura del mismo ciclo para esta fecha. Los productos sin apertura comparable quedarán pendientes y no generarán una diferencia falsa.")
+    st.caption("Puedes guardar cervezas y licores en momentos distintos. Para cada producto se usa la apertura más reciente del mismo ciclo registrada antes de su cierre.")
     counts=[]
     for cat in ['Cerveza','Licor']:
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
         for p in g:
-            op,op_bottles=session_qty_detail(d.isoformat(),p['id'],'OPENING',bar)
-            if op is not None: default,default_bottles=op,op_bottles
+            op_rec=_latest_product_count(d.isoformat(),p['id'],'OPENING',bar,cycle)
+            op=float(op_rec['qty_base']) if op_rec is not None else None
+            op_bottles=float(op_rec['qty_bottle_equiv']) if op_rec is not None and op_rec['qty_bottle_equiv'] is not None else None
+            if op_rec is not None: default,default_bottles=op,op_bottles
             else:
                 lc,lc_bottles,_=last_close_detail(p['id'],bar,d.isoformat()); default,default_bottles=(lc or 0),lc_bottles
             with st.expander(product_label(p),expanded=True):
                 if op is not None:
-                    if cat=='Licor' and not p['bottle_ml'] and op_bottles is not None: st.info(f"📌 BASE PARA CIERRE · Apertura de hoy: {op_bottles:.2f} botellas · ml pendiente")
-                    else: st.info(f"📌 BASE PARA CIERRE · Apertura de hoy: {qty_fmt(p,op)}")
+                    source=f" · {op_rec['employee'] or 'Usuario'} · {format_local_time(op_rec['created_at'])} · sesión {op_rec['session_id']}"
+                    if cat=='Licor' and not p['bottle_ml'] and op_bottles is not None: st.info(f"📌 BASE PARA CIERRE · Apertura: {op_bottles:.2f} botellas · oz pendiente{source}")
+                    else: st.info(f"📌 BASE PARA CIERRE · Apertura: {qty_fmt(p,op)}{source}")
                 else:
                     st.warning("⚠ No se encontró apertura de hoy. La base sugerida será el último cierre disponible; verifica el conteo antes de guardar.")
                 res=bottle_count_input(p,f"cl_{cycle}_{d}_{p['id']}",default,default_bottles); val=res['base']
-                if op is not None and not (cat=='Licor' and not p['bottle_ml']):
-                    ent=transfers_in(d.isoformat(),p['id'],bar); aj=adjustments(d.isoformat(),p['id'],bar)
-                    rc=reconciliation_values(op,val,ent,aj)
-                    st.caption(f"Salida física estimada: **{dual_qty_text(p,rc['physical'])}** · Ajustes registrados: **{dual_qty_text(p,rc['adjustments'])}** · Venta por conteo estimada: **{dual_qty_text(p,rc['count_sale'])}**")
-                    if rc['stock_gain']>0: st.warning(f"El cierre supera apertura + entradas en {dual_qty_text(p,rc['stock_gain'])}. Revisa el conteo o registra la entrada faltante.")
-                counts.append({'pid':p['id'],'lid':bar,'qty':val,'bottle_equiv':res['bottles']})
-    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label}")
+                if op_rec is not None:
+                    op_value,op_basis=_count_value_for_reconciliation(p,op_rec)
+                    close_value=(float(res['bottles'] or 0) if op_basis=='bottle' else float(val or 0))
+                    ent=transfers_in_basis(d.isoformat(),p,bar,op_basis); aj=adjustments_basis(d.isoformat(),p,bar,op_basis)
+                    rc=reconciliation_values(op_value,close_value,ent,aj)
+                    st.caption(f"Salida física estimada: **{basis_qty_text(p,rc['physical'],op_basis)}** · Ajustes registrados: **{basis_qty_text(p,rc['adjustments'],op_basis)}** · Venta por conteo estimada: **{basis_qty_text(p,rc['count_sale'],op_basis)}**")
+                    if rc['stock_gain']>0: st.warning(f"El cierre supera apertura + entradas en {basis_qty_text(p,rc['stock_gain'],op_basis)}. Revisa el conteo o registra la entrada faltante.")
+                counts.append({'pid':p['id'],'lid':bar,'qty':val,'bottle_equiv':res['bottles'],'name':p['name'],'category':p['category']})
+    st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label} · Captura: {scope}")
+    zero_items=[x['name'] for x in counts if ((x['category']=='Cerveza' and float(x['qty'] or 0)<=0) or (x['category']=='Licor' and float(x.get('bottle_equiv') or 0)<=0))]
+    zero_confirm=True
+    if zero_items:
+        st.warning("Productos con conteo 0: " + ", ".join(zero_items))
+        zero_confirm=st.checkbox("Confirmo que los productos mostrados en 0 fueron contados físicamente y realmente están en cero.",key=f'closing_zero_confirm_{cycle}_{d}_{scope}')
     st.divider(); pending=[]
     st.subheader("Movimientos pendientes del día")
     st.caption("Solo registra aquí lo que todavía NO haya sido ingresado desde las opciones independientes. Puedes seleccionar cualquier cerveza o licor, aunque no forme parte del conteo diario.")
@@ -1570,10 +1889,13 @@ elif page=='Cierre':
             if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append((typdb,p['id'],mv['base'],mv['bottles'],bar,None,None,None,obs))
     notes=st.text_area("Observaciones generales (opcional)")
     if st.button("Guardar cierre",type="primary",width="stretch"):
-        save_session('CLOSING',counts,d,notes,inventory_cycle=cycle)
-        for typ,pid,qty,beq,fr,to,sup,ref,obs in pending:
-            create_movement(typ,pid,qty,fr,to,sup,ref,obs,d,bottle_equiv=beq)
-        st.success(f"Cierre {cycle_label.lower()} y movimientos pendientes guardados correctamente.")
+        if not zero_confirm:
+            st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
+        else:
+            save_session('CLOSING',counts,d,notes,inventory_cycle=cycle,paired_opening_session_id=(opening_meta['id'] if opening_meta else None))
+            for typ,pid,qty,beq,fr,to,sup,ref,obs in pending:
+                create_movement(typ,pid,qty,fr,to,sup,ref,obs,d,bottle_equiv=beq)
+            st.success(f"Cierre {cycle_label.lower()} y movimientos pendientes guardados correctamente. Esta captura quedó registrada sin borrar capturas anteriores.")
 
 elif page=='Recibir pedido':
     page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
@@ -1747,6 +2069,8 @@ elif page=='Dashboard':
     # un inventario registrado, en vez de forzar siempre la fecha de hoy.
     latest_inventory_date=_latest_inventory_date_in_period(d1,d2)
     snapshot_date=latest_inventory_date or d2
+    # V0.4.8 resolves each product independently within the same inventory cycle.
+    # This preserves partial submissions made at different hours by different users.
     period_snapshot,cycle=today_inventory_snapshot(snapshot_date)
     total_required,registered_period,open_done,close_done,inventory_state=_inventory_progress_today(period_snapshot)
     current_alerts=[r for r in period_snapshot if r['_state']=='ALERT']
@@ -1846,11 +2170,13 @@ elif page=='Dashboard':
             perf_show=[]
             for r in perf_view:
                 p=r['_p']
+                basis=r.get('_basis','unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
+                pos_txt=basis_qty_text(p,r['Ventas POS'],basis) if r['Días POS completos']==r['Días completos'] and basis!='bottle' else ('⚠ Falta ml para comparar' if basis=='bottle' else 'Pendiente POS')
                 perf_show.append({'Producto':r['Producto'],'Tipo':r['Categoría'],
-                                  'Salida física':dual_qty_text(p,r['Consumo físico']),
-                                  'Ajustes':dual_qty_text(p,r['Ajustes']),
-                                  'Venta por conteo':dual_qty_text(p,r['Venta por conteo']),
-                                  'Ventas POS / recetas':dual_qty_text(p,r['Ventas POS']) if r['Días POS completos']==r['Días completos'] else 'Pendiente POS',
+                                  'Salida física':basis_qty_text(p,r['Consumo físico'],basis),
+                                  'Ajustes':basis_qty_text(p,r['Ajustes'],basis),
+                                  'Venta por conteo':basis_qty_text(p,r['Venta por conteo'],basis),
+                                  'Ventas POS / recetas':pos_txt,
                                   'Diferencia':r['_diff_text'],'Incidencia física':r.get('Incidencia física','—'),'Estado':r['Estado'],'Días físicos':r['Días completos'],'Días POS':r['Días POS completos']})
             st.dataframe(pd.DataFrame(perf_show),width='stretch',hide_index=True)
             st.caption('Interpretación de la diferencia: positiva = el conteo físico indica más ventas/salidas que el POS; negativa = el POS registra más ventas que las explicadas por el conteo. En ambos casos se revisa si supera la tolerancia. Pruebas, desperdicios, cortesías y roturas se descuentan antes de comparar con POS.')
@@ -1883,13 +2209,17 @@ elif page=='Dashboard':
             buy_rows=[]
             for r in perf:
                 if r['Días completos']<=0: continue
-                p=r['_p']; daily=max(float(r['Consumo real'] or 0),0)/r['Días completos']; target=daily*7*(1+safety)
-                stock=max(current_stock(p['id'],bar_id)+current_stock(p['id'],wh_id),0); need=max(target-stock,0)
+                p=r['_p']; basis=r.get('_basis','unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
+                daily=max(float(r['Consumo real'] or 0),0)/r['Días completos']; target=daily*7*(1+safety)
+                sb,sbb=current_stock_basis(p,bar_id); sw,swb=current_stock_basis(p,wh_id)
+                if sbb!=basis or swb!=basis: continue
+                stock=max(sb+sw,0); need=max(target-stock,0)
                 if need<=0: continue
-                if p['category']=='Licor':
+                if p['category']=='Cerveza': action=f"Comprar {math.ceil(need)} unid"
+                elif basis=='bottle': action=f"Comprar {math.ceil(need)} bot"
+                else:
                     boz=bottle_oz(p); action=(f"Comprar {math.ceil(need/boz)} bot" if boz else '⚠ Falta ml')
-                else: action=f"Comprar {math.ceil(need)} unid"
-                buy_rows.append({'Producto':p['name'],'Necesidad':oz_and_bottles_text(p,need).replace('\n',' · '),'Acción sugerida':action})
+                buy_rows.append({'Producto':p['name'],'Necesidad':basis_qty_text(p,need,basis),'Acción sugerida':action})
             if buy_rows:
                 st.dataframe(pd.DataFrame(buy_rows[:8]),width='stretch',hide_index=True)
             else:
@@ -1930,27 +2260,60 @@ elif page=='Dashboard':
 
     st.divider()
     st.markdown('<div class="ramona-section">🔎 Detalle para auditoría</div>',unsafe_allow_html=True)
+    st.caption("Los registros son acumulativos: una nueva apertura o cierre no elimina los anteriores. El ID de sesión, usuario y hora permiten reconstruir exactamente qué se ingresó y cuándo.")
     audit_mode=st.selectbox("Mostrar",['Actividad de inventario','Aperturas','Cierres','Ambos'],key='dash_audit_v4')
-    if audit_mode=='Actividad de inventario':
-        df=pd.read_sql_query("""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
-                                      ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) [Var. apertura],
-                                      COALESCE(ic.observation,'') Observación,u.name Empleado
-                               FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
-                               JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
-                               WHERE s.session_date BETWEEN ? AND ? ORDER BY s.created_at DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat()))
+    types=None if audit_mode=='Actividad de inventario' else {'Aperturas':['OPENING'],'Cierres':['CLOSING'],'Ambos':['OPENING','CLOSING']}[audit_mode]
+    params=[d1.isoformat(),d2.isoformat()]
+    type_sql=''
+    if types:
+        placeholders=','.join('?' for _ in types); type_sql=f" AND s.session_type IN ({placeholders})"; params.extend(types)
+    raw=q(f"""SELECT s.id session_id,s.session_date,s.created_at,s.session_type,COALESCE(s.inventory_cycle,'DAILY') inventory_cycle,
+                    s.paired_opening_session_id,p.id product_id,p.name product,c.name category,p.bottle_ml,
+                    ic.qty_base,ic.qty_bottle_equiv,ic.variance,COALESCE(ic.observation,'') observation,u.name employee
+             FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+             JOIN products p ON p.id=ic.product_id JOIN categories c ON c.id=p.category_id
+             LEFT JOIN users u ON u.id=s.user_id
+             WHERE s.session_date BETWEEN ? AND ? {type_sql}
+             ORDER BY s.created_at DESC,s.id DESC,p.name""",params)
+    audit_rows=[]
+    for r in raw:
+        if r['category']=='Cerveza':
+            count_text=f"{float(r['qty_base'] or 0):.0f} botellas"
+        elif r['qty_bottle_equiv'] is not None:
+            if r['bottle_ml']:
+                count_text=f"{float(r['qty_bottle_equiv']):.2f} bot · {float(r['qty_base'] or 0):.2f} oz"
+            else:
+                count_text=f"{float(r['qty_bottle_equiv']):.2f} bot · oz pendiente"
+        elif abs(float(r['qty_base'] or 0))>1e-9:
+            count_text=f"{float(r['qty_base']):.2f} oz · registro histórico"
+        else:
+            count_text='0.00 bot · oz pendiente'
+        audit_rows.append({'Sesión':int(r['session_id']),'Fecha':r['session_date'],'Hora local':format_local_time(r['created_at']),
+                           'Tipo':'Apertura' if r['session_type']=='OPENING' else 'Cierre',
+                           'Ciclo':'Semanal' if r['inventory_cycle']=='WEEKLY' else 'Diario','Producto':r['product'],
+                           'Conteo registrado':count_text,'Empleado':r['employee'] or 'Usuario','Observación':r['observation']})
+    if audit_rows:
+        st.dataframe(pd.DataFrame(audit_rows),width='stretch',hide_index=True)
     else:
-        types={'Aperturas':['OPENING'],'Cierres':['CLOSING'],'Ambos':['OPENING','CLOSING']}[audit_mode]
-        placeholders=','.join('?'*len(types))
-        df=pd.read_sql_query(f"""SELECT s.session_date Fecha,s.created_at Hora,s.session_type Tipo,p.name Producto,
-                                       ROUND(ic.qty_base,2) Conteo,ROUND(ic.variance,2) [Var. apertura],
-                                       COALESCE(ic.observation,'') Observación,u.name Empleado
-                                FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
-                                JOIN products p ON p.id=ic.product_id LEFT JOIN users u ON u.id=s.user_id
-                                WHERE s.session_date BETWEEN ? AND ? AND s.session_type IN ({placeholders})
-                                ORDER BY s.created_at DESC,p.name""",con,params=(d1.isoformat(),d2.isoformat(),*types))
-    if not df.empty and 'Hora' in df.columns:
-        df['Hora']=df['Hora'].apply(lambda x: format_local_datetime(x, '%Y-%m-%d %I:%M %p'))
-    st.dataframe(df,width='stretch',hide_index=True)
+        st.info("No hay registros de inventario dentro del periodo seleccionado.")
+
+    with st.expander("🧾 Historial íntegro de sesiones del periodo",expanded=False):
+        sessions=q("""SELECT s.id,s.session_date,s.session_type,COALESCE(s.inventory_cycle,'DAILY') inventory_cycle,s.created_at,
+                            s.paired_opening_session_id,u.name employee,COUNT(ic.id) item_count
+                     FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                     LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                     WHERE s.session_date BETWEEN ? AND ?
+                     GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC""",(d1.isoformat(),d2.isoformat()))
+        if sessions:
+            hist=[]
+            for r in sessions:
+                hist.append({'ID sesión':int(r['id']),'Fecha':r['session_date'],'Hora local':format_local_time(r['created_at']),
+                             'Tipo':'Apertura' if r['session_type']=='OPENING' else 'Cierre',
+                             'Ciclo':'Semanal' if r['inventory_cycle']=='WEEKLY' else 'Diario','Usuario':r['employee'] or 'Usuario',
+                             'Productos':int(r['item_count'] or 0),'Apertura vinculada':(int(r['paired_opening_session_id']) if r['paired_opening_session_id'] else '—')})
+            st.dataframe(pd.DataFrame(hist),width='stretch',hide_index=True)
+        else:
+            st.info("Sin sesiones en el periodo.")
 
 elif page=='Abastecimiento':
     page_header("Abastecimiento", "Consumo en oz y botellas equivalentes para convertir inventario operativo en compras.")
@@ -1960,26 +2323,25 @@ elif page=='Abastecimiento':
     d2=local_today(); d1=d2-timedelta(days=lookback-1); data=consolidated(d1,d2); bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     rows=[]; products_to_buy=0; total_buy_units=0
     for r in data:
-        p=r['_p']; complete=max(r['Días completos'],0)
+        p=r['_p']; complete=max(r['Días completos'],0); basis=r.get('_basis','unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle'))
         weekly=max((r['Consumo real']/complete*7) if complete else 0,0)
-        target=weekly*(1+safety); sb=max(current_stock(p['id'],bar),0); sw=max(current_stock(p['id'],wh),0); stock=max(sb+sw,0); need=max(target-stock,0)
-        if p['category']=='Licor':
-            boz=bottle_oz(p)
-            if boz:
-                buy=math.ceil(need/boz) if need>0 else 0
-                buy_text=f"{buy} botellas" if buy!=1 else "1 botella"
-            else:
-                buy=None; buy_text="⚠ Falta ml"
+        sb,sbb=current_stock_basis(p,bar); sw,swb=current_stock_basis(p,wh)
+        if sbb!=basis or swb!=basis:
+            continue
+        target=weekly*(1+safety); stock=max(sb+sw,0); need=max(target-stock,0)
+        if p['category']=='Cerveza':
+            buy=math.ceil(need) if need>0 else 0; buy_text=f"{buy} unidades"
+        elif basis=='bottle':
+            buy=math.ceil(need) if need>0 else 0; buy_text=f"{buy} botellas" if buy!=1 else "1 botella"
         else:
-            buy=math.ceil(need) if need>0 else 0
-            buy_text=f"{buy} unidades"
+            boz=bottle_oz(p); buy=(math.ceil(need/boz) if need>0 and boz else 0); buy_text=(f"{buy} botellas" if buy!=1 else "1 botella")
         if buy and buy>0: products_to_buy+=1; total_buy_units+=buy
         rows.append({
             'Producto':product_label(p),
-            'Consumo semanal · oz / bot':oz_and_bottles_text(p,weekly),
-            'Stock Bar · oz / bot':oz_and_bottles_text(p,sb),
-            'Stock Bodega · oz / bot':oz_and_bottles_text(p,sw),
-            'Stock total · oz / bot':oz_and_bottles_text(p,stock),
+            'Consumo semanal':basis_qty_text(p,weekly,basis),
+            'Stock Bar':basis_qty_text(p,sb,basis),
+            'Stock Bodega':basis_qty_text(p,sw,basis),
+            'Stock total':basis_qty_text(p,stock,basis),
             'Seguridad':f"{int(safety*100)}%",'Comprar':buy_text,'Días usados':complete,'_buy':buy or 0,'_stock':stock})
     if rows:
         k1,k2,k3=st.columns(3)
