@@ -1,4 +1,18 @@
-# Inventario La Ramona — V0.4.6
+# Inventario La Ramona — V0.4.7
+
+
+## Corrección de periodos históricos en Dashboard
+
+V0.4.7 corrige el Dashboard para que **Periodo**, incluyendo **Personalizado**, controle también el bloque operacional. Cuando el rango incluye varios días, la aplicación localiza el **último día con inventario realmente registrado dentro del rango** y lo usa como fecha de referencia para Estado de inventario, Productos registrados, alertas prioritarias y Detalle de inventario. Esto evita que un rango como 31/08/2026–01/09/2026 aparezca vacío solo porque el día actual todavía no tiene apertura.
+
+- El KPI cambia a **Último inventario** cuando se consulta un periodo histórico o de varios días.
+- El Dashboard muestra la fecha exacta usada como referencia.
+- El detalle físico presenta Apertura, Cierre, Entradas, Salida física, Ajustes, Venta por conteo, POS y Diferencia del último inventario dentro del periodo.
+- **Venta por conteo vs POS**, ventas y tendencias continúan agregándose para todo el rango seleccionado.
+
+## Abastecimiento cada 7 días
+
+La pantalla **Abastecimiento** incorpora **Últimos 7 días** como opción y queda seleccionada por defecto. La recomendación continúa proyectando la necesidad para los **próximos 7 días**, con el margen de seguridad configurado. Se mantienen también 14, 21, 28, 42 y 56 días como históricos alternativos.
 
 ## Corrección de reconciliación de inventario
 
