@@ -73,7 +73,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.4.8"):
+def page_header(title, subtitle="", badge="V0.5.0"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -117,6 +117,24 @@ def format_local_time(value, fmt="%I:%M %p"):
 
 def format_local_datetime(value, fmt="%m-%d %I:%M %p"):
     return format_local_time(value, fmt)
+
+def operation_confirmation(action, business_date=None, detail="", event_ts=None):
+    """Build a clear, user-specific confirmation message for successful writes."""
+    actor=(str(user.get('name') or '').strip() if 'user' in globals() else '') or (str(user.get('email') or '').strip() if 'user' in globals() else '') or 'Usuario'
+    ts=event_ts or now_iso()
+    local_dt=to_local_datetime(ts) or local_now()
+    registered=f"{local_dt.strftime('%d/%m/%Y')} · {local_dt.strftime('%I:%M:%S %p')}"
+    parts=[f"✅ **{actor}** · {action}.", f"Registrado: **{registered}**"]
+    if business_date is not None:
+        bd=business_date.isoformat() if hasattr(business_date,'isoformat') else str(business_date)
+        try:
+            bd_txt=datetime.fromisoformat(bd).strftime('%d/%m/%Y')
+        except Exception:
+            bd_txt=bd
+        parts.append(f"Fecha operativa: **{bd_txt}**")
+    if detail:
+        parts.append(str(detail))
+    return "  \n".join(parts)
 
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
@@ -507,21 +525,98 @@ def last_close(pid, lid, before_or_on=None):
     sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
     r=one(sql,ps); return (float(r['qty_base']),r['session_date']) if r else (None,None)
 
-def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY", paired_opening_session_id=None):
-    """Append-only inventory session. V0.4.8 never overwrites earlier counts.
-
-    Closing sessions can store the exact opening session used as their baseline.
-    This keeps reconciliation stable even when daily/weekly counts or corrections are
-    entered at different hours on the same date.
-    """
-    d=(session_date or local_today()).isoformat() if hasattr((session_date or local_today()),'isoformat') else str(session_date)
-    cur=con.execute("""INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle,paired_opening_session_id)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (d,kind,user['id'],now_iso(),notes,inventory_cycle,paired_opening_session_id)); sid=cur.lastrowid
+def _normalized_count_signature(counts):
+    """Stable signature used only to suppress accidental immediate re-submits."""
+    rows=[]
     for x in counts:
-        con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
-                       VALUES(?,?,?,?,?,?,?,?)""",(sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
-    con.commit(); backup_db_to_drive(); return sid
+        beq=x.get('bottle_equiv')
+        rows.append((int(x['pid']),int(x['lid']),round(float(x.get('qty') or 0),6),None if beq is None else round(float(beq),6)))
+    return tuple(sorted(rows))
+
+
+def _recent_identical_inventory_session(kind, counts, session_date, inventory_cycle, paired_opening_session_id=None, max_age_seconds=120):
+    """Find an identical session recently saved by the same user.
+
+    This is a defensive idempotency guard for double taps, browser retries and
+    Streamlit reruns. The short window avoids blocking a legitimate later recount.
+    """
+    d=session_date.isoformat() if hasattr(session_date,'isoformat') else str(session_date)
+    now_utc=datetime.now(timezone.utc).replace(tzinfo=None)
+    candidates=q("""SELECT id,created_at,paired_opening_session_id FROM inventory_sessions
+                    WHERE session_date=? AND session_type=? AND user_id=?
+                      AND COALESCE(inventory_cycle,'DAILY')=?
+                    ORDER BY created_at DESC,id DESC LIMIT 6""",
+                 (d,kind,user['id'],inventory_cycle))
+    target=_normalized_count_signature(counts)
+    for r in candidates:
+        try:
+            created=datetime.fromisoformat(str(r['created_at']))
+            if created.tzinfo is not None:
+                created=created.astimezone(timezone.utc).replace(tzinfo=None)
+            if (now_utc-created).total_seconds()>max_age_seconds:
+                continue
+        except Exception:
+            continue
+        paired=r['paired_opening_session_id'] if 'paired_opening_session_id' in r.keys() else None
+        if (paired or None)!=(paired_opening_session_id or None):
+            continue
+        saved=q("""SELECT product_id,location_id,qty_base,qty_bottle_equiv
+                   FROM inventory_counts WHERE session_id=? ORDER BY product_id,location_id,id""",(r['id'],))
+        saved_sig=tuple(sorted((int(x['product_id']),int(x['location_id']),round(float(x['qty_base'] or 0),6),None if x['qty_bottle_equiv'] is None else round(float(x['qty_bottle_equiv']),6)) for x in saved))
+        if saved_sig==target:
+            return r
+    return None
+
+
+def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY", paired_opening_session_id=None, pending_movements=None):
+    """Save one immutable inventory capture with transaction + duplicate protection.
+
+    Inventory session, all product counts and any movements entered as part of a
+    closing are committed atomically. An identical submission by the same user
+    within two minutes is treated as a retry and is not inserted again.
+    """
+    business_date=(session_date or local_today())
+    d=business_date.isoformat() if hasattr(business_date,'isoformat') else str(business_date)
+    pending_movements=pending_movements or []
+
+    duplicate=_recent_identical_inventory_session(kind,counts,business_date,inventory_cycle,paired_opening_session_id)
+    if duplicate:
+        return {'ok':True,'saved':False,'duplicate':True,'id':int(duplicate['id']),'created_at':duplicate['created_at']}
+
+    created_at=now_iso()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        # Recheck after the write lock so concurrent users cannot slip a second
+        # session between validation and insert.
+        duplicate=_recent_identical_inventory_session(kind,counts,business_date,inventory_cycle,paired_opening_session_id)
+        if duplicate:
+            con.rollback()
+            return {'ok':True,'saved':False,'duplicate':True,'id':int(duplicate['id']),'created_at':duplicate['created_at']}
+
+        valid,msg=_validate_inventory_save(kind,business_date,inventory_cycle)
+        if not valid:
+            con.rollback()
+            return {'ok':False,'saved':False,'duplicate':False,'error':msg}
+
+        cur=con.execute("""INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle,paired_opening_session_id)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (d,kind,user['id'],created_at,notes,inventory_cycle,paired_opening_session_id))
+        sid=cur.lastrowid
+        for x in counts:
+            con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
+
+        for typ,pid,qty,beq,fr,to,sup,ref,obs in pending_movements:
+            con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (d,typ,pid,qty,fr,to,user['id'],sup,ref,obs,created_at,beq))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    backup_db_to_drive()
+    return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at}
 
 def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
     if p['category']=='Cerveza':
@@ -738,6 +833,115 @@ def _session_trace_label(session):
     kind='Apertura' if session['session_type']=='OPENING' else 'Cierre'
     cyc='Semanal' if str(session['inventory_cycle'] or 'DAILY')=='WEEKLY' else 'Diario'
     return f"{kind} {cyc} · {session['employee'] or 'Usuario'} · {format_local_time(session['created_at'])} · ID {session['id']}"
+
+
+# ---------------------- V0.5.0 reliable opening/closing workflow ----------------------
+def _cycle_for_date(ds):
+    """Latest inventory cycle started for a business date."""
+    r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle
+             FROM inventory_sessions
+             WHERE session_date=? AND session_type='OPENING'
+             ORDER BY created_at DESC,id DESC LIMIT 1""",(ds,))
+    return str(r['cycle']) if r else None
+
+
+def _captured_product_ids(ds,kind,cycle):
+    rows=q("""SELECT DISTINCT ic.product_id
+              FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+              WHERE s.session_date=? AND s.session_type=?
+                AND COALESCE(s.inventory_cycle,'DAILY')=?""",(ds,kind,cycle))
+    return {int(r['product_id']) for r in rows}
+
+
+def inventory_cycle_progress(ds,cycle):
+    """Progress for one business date/cycle using append-only partial captures."""
+    required={int(p['id']) for p in inventory_products(cycle)}
+    opening=_captured_product_ids(ds,'OPENING',cycle)
+    closing=_captured_product_ids(ds,'CLOSING',cycle)
+    return {
+        'required_ids':required,
+        'opening_ids':opening,
+        'closing_ids':closing,
+        'required_count':len(required),
+        'opening_count':len(required & opening),
+        'closing_count':len(required & closing),
+        'opening_complete':bool(required) and required.issubset(opening),
+        'closing_complete':bool(required) and required.issubset(closing),
+    }
+
+
+def inventory_workflow_state():
+    """Return the only valid next inventory action.
+
+    A shift is identified by its business date, not by the wall-clock date of the
+    closing timestamp. This allows an opening on Sep 3 to be closed after midnight
+    on Sep 4 while the closing remains attached to Sep 3 for reconciliation.
+
+    Only yesterday and today can block the current workflow, preventing old test or
+    incomplete historical records from locking the live operation indefinitely.
+    """
+    today=local_today()
+    candidates=[today-timedelta(days=1),today]
+    # Oldest unresolved recent shift wins. This also surfaces a previous-day shift
+    # if an accidental next-day opening was created before the prior close.
+    for d in candidates:
+        ds=d.isoformat(); cycle=_cycle_for_date(ds)
+        if not cycle: continue
+        prog=inventory_cycle_progress(ds,cycle)
+        if prog['closing_complete']:
+            continue
+        if prog['closing_ids']:
+            stage='CLOSING'
+        elif prog['opening_complete']:
+            stage='CLOSING'
+        else:
+            stage='OPENING'
+        return {'stage':stage,'business_date':d,'cycle':cycle,'progress':prog,'active':True}
+
+    # No unresolved shift. If today was already fully closed, the next valid opening
+    # is tomorrow and is not writable until that calendar date arrives.
+    cycle_today=_cycle_for_date(today.isoformat())
+    if cycle_today:
+        prog_today=inventory_cycle_progress(today.isoformat(),cycle_today)
+        if prog_today['closing_complete']:
+            next_date=today+timedelta(days=1)
+            return {'stage':'WAIT_NEXT_OPENING','business_date':next_date,'cycle':None,'progress':prog_today,'active':False}
+    return {'stage':'OPENING','business_date':today,'cycle':cycle_today,'progress':(inventory_cycle_progress(today.isoformat(),cycle_today) if cycle_today else None),'active':False}
+
+
+def _workflow_status_text(wf):
+    d=wf['business_date'].strftime('%d/%m/%Y')
+    if wf['stage']=='CLOSING':
+        p=wf['progress']; cyc='Semanal' if wf['cycle']=='WEEKLY' else 'Diario'
+        return f"Turno {d} · {cyc} · apertura {p['opening_count']}/{p['required_count']} · cierre {p['closing_count']}/{p['required_count']}"
+    if wf['stage']=='WAIT_NEXT_OPENING':
+        return f"Turno cerrado · próxima apertura {d}"
+    if wf.get('progress'):
+        p=wf['progress']; cyc='Semanal' if wf['cycle']=='WEEKLY' else 'Diario'
+        return f"Apertura {d} · {cyc} · {p['opening_count']}/{p['required_count']} productos"
+    return f"Próxima acción: apertura {d}"
+
+
+def _validate_inventory_save(kind,business_date,cycle):
+    """Server-side guard against duplicate or out-of-order captures."""
+    wf=inventory_workflow_state()
+    ds=business_date.isoformat() if hasattr(business_date,'isoformat') else str(business_date)
+    wf_ds=wf['business_date'].isoformat()
+    if kind=='OPENING':
+        if wf['stage']!='OPENING' or ds!=wf_ds:
+            return False,f"No se puede guardar una apertura. La acción válida en este momento es {'Cierre' if wf['stage']=='CLOSING' else 'esperar a la próxima fecha operativa'} ({_workflow_status_text(wf)})."
+        if wf.get('cycle') and cycle!=wf['cycle']:
+            return False,"Ya existe una apertura parcial para esta fecha. Debes continuar con el mismo tipo de inventario."
+        return True,''
+    if wf['stage']!='CLOSING' or ds!=wf_ds:
+        return False,f"No se puede guardar un cierre sin una apertura activa y completa. Estado actual: {_workflow_status_text(wf)}."
+    if cycle!=wf['cycle']:
+        return False,"El cierre debe usar el mismo tipo de inventario que la apertura activa."
+    if not wf['progress']['opening_complete']:
+        return False,"La apertura todavía está incompleta. Completa primero todos los productos requeridos antes de iniciar el cierre."
+    if wf['progress']['closing_complete']:
+        return False,"Este turno ya tiene un cierre completo. No se permiten cierres duplicados."
+    return True,''
 
 def day_product_reconciliation(ds,p,bar_id):
     """Reconcile one product using latest same-cycle counts, even if saved at different hours."""
@@ -1704,7 +1908,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.4.4 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.5.0 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -1727,17 +1931,21 @@ if not user_row or not user_row['active']:
 user=dict(user_row)
 ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']))
 
+workflow=inventory_workflow_state()
+allowed_inventory_page='Cierre' if workflow['stage']=='CLOSING' else 'Apertura'
+
 with st.sidebar:
     st.image(LOGO_PATH, width=185)
     st.markdown("---")
     st.markdown(f"**{user['name']}**")
     st.caption(f"{ROLE_LABELS.get(user['role'],user['role'])} · {user['email']}")
+    st.caption("**Flujo de inventario:** " + _workflow_status_text(workflow))
     if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
-        pages=['Dashboard','Apertura','Cierre','Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
+        pages=['Dashboard',allowed_inventory_page,'Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
     else:
-        pages=['Apertura','Cierre','Recibir pedido','Trasladar productos']
-    # V0.3.8: MANAGER y MANAGER GENERAL pueden entrar a Administración.
-    # Las acciones críticas, como reiniciar la operación, continúan protegidas dentro de la página para ADMIN.
+        pages=[allowed_inventory_page,'Recibir pedido','Trasladar productos']
+    # MANAGER y MANAGER GENERAL pueden entrar a Administración; las acciones críticas
+    # continúan protegidas dentro de la página para ADMIN/Developer Owner.
     if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages += ['Administración']
     icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
@@ -1747,12 +1955,27 @@ with st.sidebar:
     st.markdown("---")
     if st.button("Cerrar sesión",width="stretch"): st.logout()
 
+inventory_flash=st.session_state.pop('_inventory_flash',None)
+if inventory_flash:
+    st.success(inventory_flash)
+
 # --------------------------- pages ---------------------------
 if page=='Apertura':
-    page_header("Apertura", "Conteo inicial del turno. Cada producto muestra como base el último cierre disponible.")
-    d=st.date_input("Fecha de apertura",value=local_today())
-    cycle_label=st.radio("Tipo de inventario",['Diario','Semanal'],horizontal=True,key='opening_cycle')
-    cycle='DAILY' if cycle_label=='Diario' else 'WEEKLY'
+    page_header("Apertura", "Conteo inicial del turno. El sistema bloquea cierres duplicados y no permite una nueva apertura mientras exista un turno pendiente de cierre.")
+    wf=inventory_workflow_state()
+    d=wf['business_date']
+    st.date_input("Fecha operativa de apertura",value=d,disabled=True,key='opening_business_date')
+    if wf['stage']=='WAIT_NEXT_OPENING':
+        st.info(f"El último turno ya está cerrado. La próxima apertura corresponde al {d.strftime('%d/%m/%Y')} y quedará habilitada cuando llegue esa fecha.")
+        st.stop()
+    locked_cycle=wf.get('cycle') if wf.get('progress') and wf['progress']['opening_count']>0 else None
+    options=['Diario','Semanal']; locked_label='Semanal' if locked_cycle=='WEEKLY' else 'Diario'
+    cycle_label=st.radio("Tipo de inventario",options,index=(1 if locked_cycle=='WEEKLY' else 0),horizontal=True,key='opening_cycle',disabled=bool(locked_cycle))
+    cycle=locked_cycle or ('DAILY' if cycle_label=='Diario' else 'WEEKLY')
+    cycle_label='Semanal' if cycle=='WEEKLY' else 'Diario'
+    if locked_cycle:
+        p=inventory_cycle_progress(d.isoformat(),cycle)
+        st.info(f"Apertura en progreso: {p['opening_count']} de {p['required_count']} productos registrados. Debes completar esta apertura antes de que el Cierre se habilite.")
     if cycle=='DAILY':
         st.caption("Inventario diario: todas las cervezas + licores principales. Los demás licores quedan fuera para agilizar el conteo.")
     else:
@@ -1803,21 +2026,36 @@ if page=='Apertura':
         st.warning("Productos con conteo 0: " + ", ".join(zero_items))
         zero_confirm=st.checkbox("Confirmo que los productos mostrados en 0 fueron contados físicamente y realmente están en cero.",key=f'opening_zero_confirm_{cycle}_{d}_{scope}')
     if st.button("Guardar apertura",type="primary",width="stretch"):
-        if missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
+        valid,msg=_validate_inventory_save('OPENING',d,cycle)
+        if not valid: st.error(msg)
+        elif missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
         elif not zero_confirm: st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
         else:
-            save_session('OPENING',counts,d,inventory_cycle=cycle)
-            st.success(f"Apertura {cycle_label.lower()} guardada correctamente. Esta captura quedó registrada sin borrar capturas anteriores.")
+            result=save_session('OPENING',counts,d,inventory_cycle=cycle)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible guardar la apertura.'))
+            else:
+                new_prog=inventory_cycle_progress(d.isoformat(),cycle)
+                if result.get('duplicate'):
+                    detail=f"La captura ya había sido recibida y **no se creó un duplicado**. Progreso: {new_prog['opening_count']}/{new_prog['required_count']} productos."
+                elif new_prog['opening_complete']:
+                    detail=f"Apertura {cycle_label.lower()} **completa** · {new_prog['opening_count']}/{new_prog['required_count']} productos. Ahora Cierre es la única acción de inventario habilitada para este turno."
+                else:
+                    detail=f"Apertura {cycle_label.lower()} **parcial** · {new_prog['opening_count']}/{new_prog['required_count']} productos. Puedes continuar la apertura sin perder las capturas anteriores."
+                st.session_state['_inventory_flash']=operation_confirmation('Su apertura fue exitosa',d,detail,result.get('created_at'))
+                st.rerun()
 
 elif page=='Cierre':
-    page_header("Cierre", "Conteo final del turno. Cada producto muestra como base la apertura del mismo día.")
-    d=st.date_input("Fecha de cierre",value=local_today())
-    detected=latest_opening_cycle(d.isoformat())
-    options=['Diario','Semanal']; default_idx=1 if detected=='WEEKLY' else 0
-    cycle_label=st.radio("Tipo de inventario",options,index=default_idx,horizontal=True,key='closing_cycle')
-    cycle='DAILY' if cycle_label=='Diario' else 'WEEKLY'
-    if detected and cycle!=detected:
-        st.warning(f"La apertura más reciente de esta fecha fue {'semanal' if detected=='WEEKLY' else 'diaria'}. Revisa el tipo de inventario antes de guardar el cierre.")
+    page_header("Cierre", "Conteo final del turno. Si la operación pasa de medianoche, el cierre conserva la fecha operativa de la apertura y la hora real queda en la auditoría.")
+    wf=inventory_workflow_state()
+    if wf['stage']!='CLOSING':
+        st.warning("No existe una apertura completa pendiente de cierre. El sistema no permite crear un cierre sin apertura.")
+        st.stop()
+    d=wf['business_date']; cycle=wf['cycle']; detected=cycle
+    st.date_input("Fecha operativa del cierre",value=d,disabled=True,key='closing_business_date')
+    cycle_label='Semanal' if cycle=='WEEKLY' else 'Diario'
+    st.radio("Tipo de inventario",['Diario','Semanal'],index=(1 if cycle=='WEEKLY' else 0),horizontal=True,key='closing_cycle',disabled=True)
+    st.success(f"Cierre habilitado para la apertura del {d.strftime('%d/%m/%Y')}. Aunque el reloj marque {local_today().strftime('%d/%m/%Y')}, este cierre quedará vinculado al turno que sigue abierto.")
     if cycle=='DAILY':
         st.caption("Inventario diario: todas las cervezas + licores principales.")
     else:
@@ -1889,13 +2127,25 @@ elif page=='Cierre':
             if mv['base']>0 or (mv['bottles'] or 0)>0: pending.append((typdb,p['id'],mv['base'],mv['bottles'],bar,None,None,None,obs))
     notes=st.text_area("Observaciones generales (opcional)")
     if st.button("Guardar cierre",type="primary",width="stretch"):
-        if not zero_confirm:
+        valid,msg=_validate_inventory_save('CLOSING',d,cycle)
+        if not valid:
+            st.error(msg)
+        elif not zero_confirm:
             st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
         else:
-            save_session('CLOSING',counts,d,notes,inventory_cycle=cycle,paired_opening_session_id=(opening_meta['id'] if opening_meta else None))
-            for typ,pid,qty,beq,fr,to,sup,ref,obs in pending:
-                create_movement(typ,pid,qty,fr,to,sup,ref,obs,d,bottle_equiv=beq)
-            st.success(f"Cierre {cycle_label.lower()} y movimientos pendientes guardados correctamente. Esta captura quedó registrada sin borrar capturas anteriores.")
+            result=save_session('CLOSING',counts,d,notes,inventory_cycle=cycle,paired_opening_session_id=(opening_meta['id'] if opening_meta else None),pending_movements=pending)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible guardar el cierre.'))
+            else:
+                new_prog=inventory_cycle_progress(d.isoformat(),cycle)
+                if result.get('duplicate'):
+                    detail=f"La captura ya había sido recibida y **no se creó un duplicado**. Progreso: {new_prog['closing_count']}/{new_prog['required_count']} productos."
+                elif new_prog['closing_complete']:
+                    detail=f"Cierre {cycle_label.lower()} **completo** · {new_prog['closing_count']}/{new_prog['required_count']} productos. El turno quedó cerrado y la próxima acción válida será una nueva Apertura."
+                else:
+                    detail=f"Cierre {cycle_label.lower()} **parcial** · {new_prog['closing_count']}/{new_prog['required_count']} productos. Cierre seguirá siendo la única acción habilitada hasta completarlo."
+                st.session_state['_inventory_flash']=operation_confirmation('Su cierre fue exitoso',d,detail,result.get('created_at'))
+                st.rerun()
 
 elif page=='Recibir pedido':
     page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
@@ -1913,7 +2163,7 @@ elif page=='Recibir pedido':
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
             for pid,qty,beq,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d,bottle_equiv=beq)
-            st.success(f"Recepción registrada en {dest_name}.")
+            st.success(operation_confirmation('Su recepción de productos fue registrada correctamente',d,f"{len(rows)} producto(s) · Destino: **{dest_name}**"))
 
 elif page=='Trasladar productos':
     page_header("Trasladar productos", "Registra movimientos de inventario entre bodega y bar.")
@@ -1927,7 +2177,7 @@ elif page=='Trasladar productos':
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
             for pid,qty,beq in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d,bottle_equiv=beq)
-            st.success("Traslado registrado.")
+            st.success(operation_confirmation('Su traslado Bodega → Bar fue registrado correctamente',d,f"{len(rows)} producto(s) trasladado(s)"))
 
 elif page=='POS / Ventas':
     page_header("POS / Ventas", "Registra ventas de cócteles, shots, cervezas y botellas para calcular el consumo teórico.")
@@ -1955,10 +2205,10 @@ elif page=='POS / Ventas':
                     for cid,qty in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),cid,None,'Cóctel',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'COCKTAIL',obs); st.success(f"Ventas de cócteles guardadas: {len(rows)} registro(s). POS de cócteles confirmado.")
+                    con.commit(); record_pos_batch(d,'COCKTAIL',obs); st.success(operation_confirmation('Sus ventas POS de cócteles fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de cócteles confirmado"))
 
         if st.button('Confirmar 0 ventas de cócteles',key='pos_c_zero',width='stretch'):
-            record_pos_batch(d,'COCKTAIL','Confirmado sin ventas'); st.success('POS de cócteles confirmado en cero.')
+            record_pos_batch(d,'COCKTAIL','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de cócteles fue confirmado correctamente',d,'Ventas registradas: **0**'))
 
     with tab_shot:
         liquors=products('Licor')
@@ -1981,10 +2231,10 @@ elif page=='POS / Ventas':
                     for pid,qty,oz in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Shot',qty,oz,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'SHOT',obs); st.success(f"Ventas de shots guardadas: {len(rows)} registro(s). POS de shots confirmado.")
+                    con.commit(); record_pos_batch(d,'SHOT',obs); st.success(operation_confirmation('Sus ventas POS de shots fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de shots confirmado"))
 
         if st.button('Confirmar 0 ventas de shots',key='pos_s_zero',width='stretch'):
-            record_pos_batch(d,'SHOT','Confirmado sin ventas'); st.success('POS de shots confirmado en cero.')
+            record_pos_batch(d,'SHOT','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de shots fue confirmado correctamente',d,'Ventas registradas: **0**'))
 
     with tab_beer:
         beers=products('Cerveza')
@@ -2005,10 +2255,10 @@ elif page=='POS / Ventas':
                     for pid,qty in beer_rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Cerveza',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'BEER',obs); st.success(f"Ventas de cerveza guardadas: {len(beer_rows)} producto(s). POS de cervezas confirmado.")
+                    con.commit(); record_pos_batch(d,'BEER',obs); st.success(operation_confirmation('Sus ventas POS de cervezas fueron guardadas correctamente',d,f"{len(beer_rows)} producto(s) · POS de cervezas confirmado"))
 
         if st.button('Confirmar 0 ventas de cervezas',key='pos_b_zero',width='stretch'):
-            record_pos_batch(d,'BEER','Confirmado sin ventas'); st.success('POS de cervezas confirmado en cero.')
+            record_pos_batch(d,'BEER','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de cervezas fue confirmado correctamente',d,'Ventas registradas: **0**'))
 
     with tab_bottle:
         liquors=products('Licor')
@@ -2030,10 +2280,10 @@ elif page=='POS / Ventas':
                     for pid,qty in rows:
                         con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                     (d.isoformat(),None,pid,'Botella de licor',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'LIQUOR_BOTTLE',obs); st.success(f"Ventas por botella guardadas: {len(rows)} registro(s). POS de botellas confirmado.")
+                    con.commit(); record_pos_batch(d,'LIQUOR_BOTTLE',obs); st.success(operation_confirmation('Sus ventas POS de botellas de licor fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de botellas confirmado"))
 
         if st.button('Confirmar 0 ventas de botellas de licor',key='pos_l_zero',width='stretch'):
-            record_pos_batch(d,'LIQUOR_BOTTLE','Confirmado sin ventas'); st.success('POS de botellas de licor confirmado en cero.')
+            record_pos_batch(d,'LIQUOR_BOTTLE','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de botellas de licor fue confirmado correctamente',d,'Ventas registradas: **0**'))
 
 elif page=='Dashboard':
     page_header("Dashboard Operacional", "Inventario, ventas, diferencias, alertas y actividad en una sola vista.")
@@ -2724,6 +2974,47 @@ elif page=='Administración':
             with open(DB,'rb') as fh:
                 st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{local_today().isoformat()}.db",mime="application/octet-stream",width="stretch")
         st.divider()
+        owner_for_correction=normalized_email(user['email'])==normalized_email(secret_value('app','bootstrap_admin_email'))
+        if owner_for_correction:
+            st.subheader("Corrección controlada de una captura")
+            st.caption("Herramienta de contingencia para corregir una captura guardada con tipo o fecha operativa incorrectos. No elimina conteos, usuario ni hora original; solo reclasifica la sesión y deja trazabilidad en Observaciones.")
+            recent_sessions=q("""SELECT s.id,s.session_date,s.session_type,COALESCE(s.inventory_cycle,'DAILY') inventory_cycle,
+                                      s.created_at,COALESCE(s.notes,'') notes,u.name employee,COUNT(ic.id) item_count
+                               FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                               LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                               GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC LIMIT 20""")
+            if recent_sessions:
+                session_labels={f"ID {r['id']} · {'Apertura' if r['session_type']=='OPENING' else 'Cierre'} · {r['session_date']} · {format_local_time(r['created_at'])} · {r['employee'] or 'Usuario'} · {int(r['item_count'] or 0)} productos":r for r in recent_sessions}
+                corr_label=st.selectbox("Captura a corregir",list(session_labels.keys()),key='session_correction_select')
+                corr=session_labels[corr_label]
+                cc1,cc2=st.columns(2)
+                corrected_type=cc1.selectbox("Tipo correcto",['OPENING','CLOSING'],index=(0 if corr['session_type']=='OPENING' else 1),format_func=lambda x:'Apertura' if x=='OPENING' else 'Cierre',key='session_correction_type')
+                corrected_date=cc2.date_input("Fecha operativa correcta",value=date.fromisoformat(corr['session_date']),key='session_correction_date')
+                st.info(f"La hora real del registro se conservará: {format_local_datetime(corr['created_at'],'%d/%m/%Y %I:%M %p')}.")
+                corr_confirm=st.text_input(f"Para aplicar escribe: CORREGIR {corr['id']}",key='session_correction_confirm')
+                if st.button("Aplicar corrección de captura",type='secondary',width='stretch',key='apply_session_correction'):
+                    if corr_confirm.strip()!=f"CORREGIR {corr['id']}":
+                        st.error(f"Confirmación incorrecta. Escribe exactamente: CORREGIR {corr['id']}")
+                    else:
+                        new_ds=corrected_date.isoformat(); cycle=str(corr['inventory_cycle'] or 'DAILY'); paired=None
+                        if corrected_type=='CLOSING':
+                            opening_candidate=_inventory_session(new_ds,'OPENING',cycle,corr['created_at'])
+                            if not opening_candidate:
+                                st.error("No existe una apertura anterior del mismo ciclo en la fecha seleccionada. No se puede reclasificar como Cierre sin una base válida.")
+                                opening_candidate=None
+                            else:
+                                paired=int(opening_candidate['id'])
+                        if corrected_type!='CLOSING' or paired is not None:
+                            stamp=local_now().strftime('%d/%m/%Y %I:%M %p')
+                            audit_note=f"[CORRECCIÓN Developer/Owner {stamp}: {corr['session_type']} {corr['session_date']} → {corrected_type} {new_ds}]"
+                            notes=(str(corr['notes'] or '').strip()+"\n"+audit_note).strip()
+                            con.execute("UPDATE inventory_sessions SET session_date=?,session_type=?,paired_opening_session_id=?,notes=? WHERE id=?",(new_ds,corrected_type,paired,notes,corr['id']))
+                            con.commit(); backup_db_to_drive()
+                            st.success("Captura reclasificada sin borrar conteos, usuario ni timestamp original. Revisa el Dashboard y Detalle para auditoría.")
+                            st.rerun()
+            else:
+                st.info("No hay sesiones para corregir.")
+            st.divider()
         if user['role']=='ADMIN':
             st.subheader("Inicio de operación / limpiar datos históricos")
             st.caption("Solo ADMIN puede ejecutar este reinicio. La herramienta elimina datos transaccionales anteriores: inventarios, POS/ventas y movimientos. Conserva productos, categorías, presentaciones, recetas, usuarios, roles y configuración.")
