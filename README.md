@@ -1,104 +1,126 @@
-# Inventario La Ramona — V0.4.8
+# Inventario La Ramona — V0.5.0
 
 ## Objetivo de esta versión
 
-V0.4.8 corrige la lectura y reconciliación de inventarios cuando existen varios registros el mismo día, realizados por diferentes usuarios y a diferentes horas. La actualización es **no destructiva**: no elimina ni reemplaza aperturas, cierres, conteos, POS o movimientos históricos.
+V0.5.0 refuerza el flujo operativo de **Apertura → Cierre** para evitar registros fuera de secuencia, doble/triple envío accidental y pérdida de trazabilidad. También añade confirmaciones claras y personalizadas para que cada usuario sepa exactamente qué acción quedó guardada, con su nombre, fecha y hora real.
 
-## 1. Apertura y cierre vinculados por sesión
+La actualización conserva la arquitectura append-only: los conteos parciales, usuarios, timestamps y sesiones históricas permanecen almacenados sin sobrescribirse.
 
-Cada cierre nuevo guarda como metadato la apertura más reciente del mismo ciclo y, para cada producto, la reconciliación utiliza el conteo de apertura más reciente del mismo día/ciclo registrado antes de ese cierre. Esto evita mezclar por error:
+## 1. Flujo de inventario controlado
 
-- una apertura diaria con un cierre semanal;
-- una apertura semanal con un cierre diario;
-- registros hechos a distintas horas;
-- correcciones o conteos repetidos del mismo día.
+La aplicación determina automáticamente cuál es la única acción válida:
 
-Para cierres históricos existentes, la aplicación crea únicamente el vínculo de metadatos con la apertura del mismo día y ciclo registrada antes del cierre. **Los valores originales de inventario no se modifican.**
+1. **Sin apertura:** solo se habilita **Apertura**.
+2. **Apertura parcial:** Apertura continúa habilitada hasta completar los productos requeridos.
+3. **Apertura completa:** solo se habilita **Cierre**.
+4. **Cierre parcial:** Cierre continúa habilitado hasta completar los productos requeridos.
+5. **Cierre completo:** el turno queda cerrado y la siguiente acción válida será una nueva Apertura.
 
-Si existen varias capturas del mismo ciclo, cada producto conserva su usuario, hora e ID de sesión. La aplicación usa la captura más reciente aplicable a ese producto y todos los registros permanecen disponibles en el historial.
+La validación se realiza en la navegación y nuevamente dentro de una transacción de base de datos al guardar. Esto reduce errores cuando existen varios usuarios, pestañas abiertas o solicitudes casi simultáneas.
 
+## 2. Cierres después de medianoche
 
-## 2. Capturas parciales sin convertir pendientes en cero
+La fecha del turno se maneja como **fecha operativa**, separada de la fecha/hora real del registro.
 
-Apertura y Cierre permiten elegir **Todo el inventario**, **Solo cervezas** o **Solo licores**. Esto permite que diferentes personas completen el inventario a distintas horas sin crear falsos ceros para productos que todavía no han sido contados.
+Ejemplo:
 
-Cada captura se agrega al historial. Para reconciliar cada producto, la aplicación utiliza el conteo más reciente del **mismo día, mismo ciclo y mismo producto**. Así, una captura de cervezas a una hora y una captura de licores más tarde pueden coexistir sin sobrescribirse.
+- Apertura: 03/09/2026 a las 4:00 PM.
+- Cierre físico: 04/09/2026 a las 12:20 AM.
 
-Si un producto realmente queda en cero, la aplicación solicita una confirmación explícita antes de guardar. Esto evita que un campo dejado en su valor inicial `0` sea interpretado accidentalmente como un conteo físico real.
+El cierre se conserva como:
 
-## 3. Corrección del Dashboard histórico
+- **Fecha operativa:** 03/09/2026.
+- **Timestamp real:** 04/09/2026 12:20 AM.
 
-El Dashboard reconcilia cada producto únicamente con registros del mismo día y del mismo ciclo de inventario. Puede combinar de forma segura capturas parciales hechas a distintas horas, pero nunca mezcla un registro diario con uno semanal.
+Así el cambio de día no crea una nueva apertura ni rompe la comparación entre Apertura y Cierre.
 
-En fechas con varias capturas, el historial permite revisar todas las sesiones y el Dashboard utiliza el registro más reciente aplicable a cada producto sin eliminar información.
+## 3. Capturas parciales
 
-La lógica continúa siendo:
+Se mantiene la posibilidad de registrar:
 
-- **Salida física = Apertura + Entradas al bar − Cierre**
-- **Venta por conteo = max(Salida física − Ajustes autorizados, 0)**
-- **Diferencia = Venta por conteo − Ventas POS / recetas**
+- Todo el inventario;
+- Solo cervezas;
+- Solo licores.
 
-Una diferencia positiva o negativa puede generar alerta si supera la tolerancia configurada.
+Cada captura conserva usuario, fecha/hora real, fecha operativa, ciclo e ID de sesión. Cervezas y licores pueden registrarse a horas diferentes sin perder información.
 
-## 4. Licores sin presentación en ml
+## 4. Protección reforzada contra duplicados
 
-Los conteos de licor ya no aparecen como `0 oz` cuando la presentación en ml todavía no ha sido configurada.
+V0.5.0 añade una segunda capa de protección contra doble toque, reintentos del navegador y reruns de Streamlit.
 
-Mientras falten los ml, la aplicación conserva y muestra la cantidad física en **botellas equivalentes**, por ejemplo:
+Antes de insertar una sesión, la aplicación comprueba si el mismo usuario ya guardó una captura idéntica del mismo tipo, fecha y ciclo dentro de una ventana corta. Si detecta el reintento:
 
-`2.25 bot · oz pendiente`
+- no crea otra sesión;
+- no duplica los conteos;
+- no duplica movimientos pendientes;
+- muestra al usuario que la captura ya había sido recibida.
 
-También calcula en botellas:
+Además, el guardado de la sesión, todos sus conteos y los movimientos pendientes incluidos en el Cierre se realiza dentro de **una transacción SQLite atómica**. O se guarda todo correctamente o se revierte todo el intento.
 
-- Salida física;
-- Entradas;
-- Pruebas;
-- Desperdicios;
-- Cortesías;
-- Roturas;
-- Venta por conteo física.
+## 5. Confirmaciones personalizadas para cada usuario
 
-La comparación contra cócteles, shots y recetas permanece como **Falta ml para POS** porque las recetas están expresadas en onzas. Cuando se registre la presentación en ml, la conversión histórica a oz se realiza con el mecanismo de backfill existente.
+Después de una acción exitosa, la aplicación muestra un mensaje con:
 
-## 5. Abastecimiento y stock
+- nombre del usuario;
+- acción realizada;
+- fecha y hora real en Ontario;
+- fecha operativa cuando corresponde;
+- estado de la captura (parcial/completa);
+- cantidad de productos o registros procesados cuando aplica.
 
-Abastecimiento mantiene por defecto el análisis de **últimos 7 días** y la proyección para los próximos 7 días.
+Ejemplo:
 
-- Cervezas: unidades.
-- Licor con ml configurado: oz + botellas equivalentes; compra sugerida en botellas completas.
-- Licor con ml pendiente: el control puede continuar en botellas equivalentes y la compra se expresa en botellas completas.
+> ✅ Marlon · Su cierre fue guardado correctamente.  
+> Registrado: **04/09/2026 · 12:20:18 AM**  
+> Fecha operativa: **03/09/2026**  
+> Cierre diario **completo** · 15/15 productos.
 
-El cálculo de stock actual también incorpora movimientos registrados después del último conteo, incluso cuando ocurren el mismo día.
+Las confirmaciones también se aplican a:
 
-## 6. Trazabilidad y conservación de datos
+- recepción de productos;
+- traslados Bodega → Bar;
+- ventas POS de cócteles;
+- ventas POS de shots;
+- ventas POS de cervezas;
+- ventas POS de botellas de licor;
+- confirmaciones POS en cero.
 
-El Dashboard incorpora un detalle de auditoría que muestra:
+## 6. Corrección controlada de capturas
 
-- ID de sesión;
-- fecha;
-- hora local de Ontario;
-- usuario;
-- tipo Apertura/Cierre;
-- ciclo Diario/Semanal;
-- producto;
-- conteo registrado en la unidad correcta.
+Se mantiene en **Administración → Configuración / Respaldo** la herramienta exclusiva para **Developer/Owner** llamada **Corrección controlada de una captura**.
 
-Para licores sin ml se muestra el conteo real en botellas equivalentes en lugar de `0 oz`.
+Permite corregir una sesión que realmente exista en SQLite y haya sido guardada con tipo o fecha operativa incorrectos.
 
-Además, **Historial íntegro de sesiones** permite verificar todos los registros realizados a diferentes horas. Una nueva sesión no borra las anteriores.
+La corrección:
 
-## 7. Cierre con base visible
+- no elimina conteos;
+- no modifica el usuario original;
+- no modifica la hora real `created_at`;
+- conserva el ID de sesión;
+- registra una nota de auditoría;
+- al convertir en Cierre exige una Apertura anterior válida del mismo ciclo y fecha operativa.
 
-Al realizar un cierre, cada producto busca únicamente una apertura del **mismo día y mismo ciclo**. La base visible incluye usuario, hora e ID de sesión para que el empleado pueda comprobar de dónde proviene el valor de referencia.
+Si una captura no existe físicamente en SQLite, la herramienta no inventa ni reconstruye valores.
 
-El cierre conserva además un vínculo de metadatos con la apertura más reciente del ciclo, mientras la reconciliación por producto mantiene la trazabilidad exacta de capturas parciales.
+## 7. Trazabilidad y auditoría
 
-## 8. Reporte Ejecutivo
+Se mantiene la distinción entre:
 
-El PDF utiliza la misma reconciliación por sesiones. Los licores sin ml se conservan en botellas equivalentes y se presentan como pendientes de conversión, sin generar valores falsos de `0 oz` ni comparaciones POS incorrectas.
+- **Fecha operativa:** día al que pertenece el turno.
+- **Fecha/hora real:** momento exacto en que el usuario guardó la captura.
 
-## Compatibilidad
+El Dashboard y el detalle de auditoría continúan mostrando quién registró cada captura y a qué hora, incluso cuando diferentes categorías se ingresan en momentos distintos o después de medianoche.
 
-No requiere cambios en `requirements.txt`, Google OAuth, Streamlit Secrets ni reinicio de la base de datos.
+## 8. Compatibilidad
 
-La migración V0.4.8 añade únicamente el campo de vínculo `paired_opening_session_id` e índices de lectura. Los registros históricos permanecen intactos.
+No requiere cambios en:
+
+- `requirements.txt`;
+- Google OAuth;
+- Streamlit Secrets;
+- productos;
+- recetas;
+- POS existente;
+- datos históricos de inventario.
+
+No es necesario reiniciar la base SQLite.
