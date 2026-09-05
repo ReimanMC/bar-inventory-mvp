@@ -1,126 +1,77 @@
-# Inventario La Ramona — V0.5.0
+# Inventario La Ramona — V0.5.1
 
 ## Objetivo de esta versión
 
-V0.5.0 refuerza el flujo operativo de **Apertura → Cierre** para evitar registros fuera de secuencia, doble/triple envío accidental y pérdida de trazabilidad. También añade confirmaciones claras y personalizadas para que cada usuario sepa exactamente qué acción quedó guardada, con su nombre, fecha y hora real.
+V0.5.1 es una versión de recuperación segura construida sobre V0.5.0. Su objetivo es restaurar automáticamente el último respaldo SQLite validado proporcionado por el Developer/Owner cuando Streamlit inicia con una base ausente o claramente reiniciada, sin sobrescribir una base que ya contiene operación válida.
 
-La actualización conserva la arquitectura append-only: los conteos parciales, usuarios, timestamps y sesiones históricas permanecen almacenados sin sobrescribirse.
+## Respaldo integrado y validado
 
-## 1. Flujo de inventario controlado
+El snapshot de recuperación integrado corresponde al archivo proporcionado por el Developer/Owner y fue validado con `PRAGMA quick_check = ok`.
 
-La aplicación determina automáticamente cuál es la única acción válida:
+Contenido del snapshot:
 
-1. **Sin apertura:** solo se habilita **Apertura**.
-2. **Apertura parcial:** Apertura continúa habilitada hasta completar los productos requeridos.
-3. **Apertura completa:** solo se habilita **Cierre**.
-4. **Cierre parcial:** Cierre continúa habilitado hasta completar los productos requeridos.
-5. **Cierre completo:** el turno queda cerrado y la siguiente acción válida será una nueva Apertura.
+- 12 usuarios autorizados y activos.
+- 67 productos.
+- 14 sesiones de inventario.
+- 309 conteos físicos.
+- 1 cóctel y 2 componentes de receta.
+- 0 movimientos registrados en ese respaldo.
+- 0 filas POS registradas en ese respaldo.
 
-La validación se realiza en la navegación y nuevamente dentro de una transacción de base de datos al guardar. Esto reduce errores cuando existen varios usuarios, pestañas abiertas o solicitudes casi simultáneas.
+La restauración conserva nombres, emails, roles, permisos de Reporte Ejecutivo, fechas de login e historial existente exactamente como están en el respaldo. Todos los usuarios contenidos en el snapshot tienen `active = 1`.
 
-## 2. Cierres después de medianoche
+## Recuperación automática segura
 
-La fecha del turno se maneja como **fecha operativa**, separada de la fecha/hora real del registro.
+Antes de abrir SQLite, la aplicación:
 
-Ejemplo:
+1. intenta el mecanismo de recuperación Drive ya existente, si está configurado;
+2. valida la base local con `PRAGMA quick_check` y tablas requeridas;
+3. si la base está ausente o presenta el patrón de reinicio observado (0 sesiones, 0 conteos y 0/1 usuarios), restaura el snapshot integrado;
+4. si la base ya tiene operación válida, no realiza ninguna restauración.
 
-- Apertura: 03/09/2026 a las 4:00 PM.
-- Cierre físico: 04/09/2026 a las 12:20 AM.
+Antes de una recuperación automática sobre un archivo existente, intenta conservar una copia local de contingencia con nombre `bar_inventory_v3_before_auto_recovery_*.db`.
 
-El cierre se conserva como:
+## Recuperación manual desde la aplicación
 
-- **Fecha operativa:** 03/09/2026.
-- **Timestamp real:** 04/09/2026 12:20 AM.
+Solo el Developer/Owner dispone ahora de una sección **Administración → Configuración → Recuperación de base de datos**.
 
-Así el cambio de día no crea una nueva apertura ni rompe la comparación entre Apertura y Cierre.
+Desde allí puede:
 
-## 3. Capturas parciales
+- ver el estado de salud y los conteos de la base actual;
+- cargar un `.db`, `.sqlite` o `.sqlite3`;
+- validar integridad y tablas antes de restaurar;
+- visualizar usuarios activos, productos, sesiones, conteos, movimientos y POS del respaldo candidato;
+- confirmar la restauración escribiendo `RESTAURAR BASE`;
+- reemplazar la base sin volver a desplegar código.
 
-Se mantiene la posibilidad de registrar:
+Antes de una restauración manual se conserva una copia local de contingencia `bar_inventory_v3_before_manual_restore_*.db`.
 
-- Todo el inventario;
-- Solo cervezas;
-- Solo licores.
+## Autorización de usuarios restaurados
 
-Cada captura conserva usuario, fecha/hora real, fecha operativa, ciclo e ID de sesión. Cervezas y licores pueden registrarse a horas diferentes sin perder información.
+Los 12 usuarios incluidos en el respaldo están activos. Se conservan sus roles:
 
-## 4. Protección reforzada contra duplicados
+- ADMIN / Developer-Owner.
+- MANAGER.
+- GENERAL_MANAGER.
+- STAFF.
 
-V0.5.0 añade una segunda capa de protección contra doble toque, reintentos del navegador y reruns de Streamlit.
+La cuenta configurada en `bootstrap_admin_email` continúa teniendo la protección existente: al iniciar sesión se garantiza que permanezca activa como ADMIN y con acceso al Reporte Ejecutivo.
 
-Antes de insertar una sesión, la aplicación comprueba si el mismo usuario ya guardó una captura idéntica del mismo tipo, fecha y ciclo dentro de una ventana corta. Si detecta el reintento:
+## Importante sobre el alcance del respaldo
 
-- no crea otra sesión;
-- no duplica los conteos;
-- no duplica movimientos pendientes;
-- muestra al usuario que la captura ya había sido recibida.
+V0.5.1 restaura únicamente lo que existe físicamente en el respaldo suministrado. No reconstruye registros que nunca llegaron a SQLite. En particular, el snapshot conserva la información existente hasta la apertura registrada del 03/09; no inventa un cierre posterior que no esté contenido en el archivo.
 
-Además, el guardado de la sesión, todos sus conteos y los movimientos pendientes incluidos en el Cierre se realiza dentro de **una transacción SQLite atómica**. O se guarda todo correctamente o se revierte todo el intento.
+## Persistencia
 
-## 5. Confirmaciones personalizadas para cada usuario
+El snapshot integrado funciona como un **piso de recuperación**, no como backup continuo. Los registros nuevos posteriores a ese snapshot siguen necesitando respaldo periódico. La opción **Descargar copia de la base SQLite** continúa disponible y más adelante debe complementarse con un almacenamiento persistente automático.
 
-Después de una acción exitosa, la aplicación muestra un mensaje con:
-
-- nombre del usuario;
-- acción realizada;
-- fecha y hora real en Ontario;
-- fecha operativa cuando corresponde;
-- estado de la captura (parcial/completa);
-- cantidad de productos o registros procesados cuando aplica.
-
-Ejemplo:
-
-> ✅ Marlon · Su cierre fue guardado correctamente.  
-> Registrado: **04/09/2026 · 12:20:18 AM**  
-> Fecha operativa: **03/09/2026**  
-> Cierre diario **completo** · 15/15 productos.
-
-Las confirmaciones también se aplican a:
-
-- recepción de productos;
-- traslados Bodega → Bar;
-- ventas POS de cócteles;
-- ventas POS de shots;
-- ventas POS de cervezas;
-- ventas POS de botellas de licor;
-- confirmaciones POS en cero.
-
-## 6. Corrección controlada de capturas
-
-Se mantiene en **Administración → Configuración / Respaldo** la herramienta exclusiva para **Developer/Owner** llamada **Corrección controlada de una captura**.
-
-Permite corregir una sesión que realmente exista en SQLite y haya sido guardada con tipo o fecha operativa incorrectos.
-
-La corrección:
-
-- no elimina conteos;
-- no modifica el usuario original;
-- no modifica la hora real `created_at`;
-- conserva el ID de sesión;
-- registra una nota de auditoría;
-- al convertir en Cierre exige una Apertura anterior válida del mismo ciclo y fecha operativa.
-
-Si una captura no existe físicamente en SQLite, la herramienta no inventa ni reconstruye valores.
-
-## 7. Trazabilidad y auditoría
-
-Se mantiene la distinción entre:
-
-- **Fecha operativa:** día al que pertenece el turno.
-- **Fecha/hora real:** momento exacto en que el usuario guardó la captura.
-
-El Dashboard y el detalle de auditoría continúan mostrando quién registró cada captura y a qué hora, incluso cuando diferentes categorías se ingresan en momentos distintos o después de medianoche.
-
-## 8. Compatibilidad
+## Compatibilidad
 
 No requiere cambios en:
 
 - `requirements.txt`;
 - Google OAuth;
 - Streamlit Secrets;
-- productos;
-- recetas;
-- POS existente;
-- datos históricos de inventario.
+- assets/logo.
 
-No es necesario reiniciar la base SQLite.
+Para desplegar la recuperación automática basta con reemplazar `app.py`. El paquete también incluye `bar_inventory_v3.db` y `bar_inventory_restore_2026_09_03.db` como copias verificables del respaldo fuente.
