@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata, json, os
+import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,6 +14,132 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
+
+# V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
+# It is only used when the runtime database is missing or clearly reset (no operational
+# sessions/counts and no authorized-user roster). It never overwrites a healthy database.
+RECOVERY_SNAPSHOT_SHA256 = "a6057e92fae6cea9e737eed41b1e1ccaddfe88d65816ac79cfd57542c480985e"
+RECOVERY_SNAPSHOT_GZIP_B64 = """
+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
+"""
+RECOVERY_REQUIRED_TABLES = {
+    "users","categories","products","locations","inventory_sessions","inventory_counts",
+    "movements","cocktails","recipes","pos_sales","settings"
+}
+AUTO_RECOVERY_APPLIED = False
 
 st.set_page_config(page_title="Inventario La Ramona", page_icon="❤️", layout="wide", initial_sidebar_state="expanded")
 
@@ -73,7 +199,7 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.5.0"):
+def page_header(title, subtitle="", badge="V0.5.1"):
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -177,6 +303,82 @@ def backup_db_to_drive(force=False):
         st.session_state['_drive_backup_error']=str(e)
         return False,f"No se pudo respaldar en Drive: {e}"
 
+def _sqlite_health(path):
+    """Read-only integrity/row-count check used before any recovery action."""
+    info={"valid":False,"reason":"","users":0,"active_users":0,"products":0,
+          "inventory_sessions":0,"inventory_counts":0,"movements":0,"pos_sales":0}
+    if not path or not os.path.exists(path) or os.path.getsize(path)<=0:
+        info["reason"]="missing_or_empty"
+        return info
+    c=None
+    try:
+        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True)
+        quick=c.execute("PRAGMA quick_check").fetchone()
+        if not quick or str(quick[0]).lower()!="ok":
+            info["reason"]="quick_check_failed"
+            return info
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        missing=RECOVERY_REQUIRED_TABLES-tables
+        if missing:
+            info["reason"]="missing_tables:"+",".join(sorted(missing))
+            return info
+        info["users"]=int(c.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+        info["active_users"]=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
+        info["products"]=int(c.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+        info["inventory_sessions"]=int(c.execute("SELECT COUNT(*) FROM inventory_sessions").fetchone()[0])
+        info["inventory_counts"]=int(c.execute("SELECT COUNT(*) FROM inventory_counts").fetchone()[0])
+        info["movements"]=int(c.execute("SELECT COUNT(*) FROM movements").fetchone()[0])
+        info["pos_sales"]=int(c.execute("SELECT COUNT(*) FROM pos_sales").fetchone()[0])
+        info["valid"]=True
+        info["reason"]="ok"
+        return info
+    except Exception as e:
+        info["reason"]=f"sqlite_error:{e}"
+        return info
+    finally:
+        if c is not None:
+            try: c.close()
+            except Exception: pass
+
+
+def _write_embedded_recovery_snapshot(dest):
+    payload=gzip.decompress(base64.b64decode("".join(RECOVERY_SNAPSHOT_GZIP_B64.split())))
+    if hashlib.sha256(payload).hexdigest()!=RECOVERY_SNAPSHOT_SHA256:
+        raise RuntimeError("La huella del respaldo de recuperación no coincide.")
+    tmp=dest+".recovery_tmp"
+    with open(tmp,"wb") as fh:
+        fh.write(payload)
+        fh.flush(); os.fsync(fh.fileno())
+    check=_sqlite_health(tmp)
+    if not check["valid"]:
+        try: os.remove(tmp)
+        except Exception: pass
+        raise RuntimeError("El respaldo integrado no superó la validación SQLite.")
+    os.replace(tmp,dest)
+    return check
+
+
+def restore_db_from_embedded_snapshot_if_reset():
+    """Fallback recovery. Preserve any suspicious current DB before restoring.
+
+    A normal empty-operation state still retains the authorized user roster. Therefore
+    auto-recovery is limited to a missing DB or the specific reset symptom observed in
+    Community Cloud: no sessions/counts plus <=1 user. Healthy/non-empty DBs are untouched.
+    """
+    global AUTO_RECOVERY_APPLIED
+    health=_sqlite_health(DB)
+    should_restore=(not health["valid"] or
+                    (health["inventory_sessions"]==0 and health["inventory_counts"]==0 and health["users"]<=1))
+    if not should_restore:
+        return False
+    if os.path.exists(DB) and os.path.getsize(DB)>0:
+        stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        try: shutil.copy2(DB,f"bar_inventory_v3_before_auto_recovery_{stamp}.db")
+        except Exception: pass
+    _write_embedded_recovery_snapshot(DB)
+    AUTO_RECOVERY_APPLIED=True
+    return True
+
 def restore_db_from_drive_if_missing():
     if os.path.exists(DB) and os.path.getsize(DB)>0: return
     service=_drive_service(); cfg=_gdrive_cfg()
@@ -193,6 +395,7 @@ def restore_db_from_drive_if_missing():
         pass
 
 restore_db_from_drive_if_missing()
+restore_db_from_embedded_snapshot_if_reset()
 
 # --------------------------- DB ---------------------------
 @st.cache_resource
@@ -835,7 +1038,7 @@ def _session_trace_label(session):
     return f"{kind} {cyc} · {session['employee'] or 'Usuario'} · {format_local_time(session['created_at'])} · ID {session['id']}"
 
 
-# ---------------------- V0.5.0 reliable opening/closing workflow ----------------------
+# ---------------------- V0.5.1 reliable opening/closing + recovery workflow ----------------------
 def _cycle_for_date(ds):
     """Latest inventory cycle started for a business date."""
     r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle
@@ -1908,7 +2111,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.5.0 · Acceso seguro con Google")
+    st.caption("Control de inventario · V0.5.1 · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -2975,6 +3178,46 @@ elif page=='Administración':
                 st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{local_today().isoformat()}.db",mime="application/octet-stream",width="stretch")
         st.divider()
         owner_for_correction=normalized_email(user['email'])==normalized_email(secret_value('app','bootstrap_admin_email'))
+        if owner_for_correction:
+            st.subheader("Recuperación de base de datos")
+            st.caption("Solo Developer/Owner. Permite validar y restaurar un respaldo SQLite completo sin volver a desplegar código. Antes de reemplazar la base se conserva una copia local de contingencia.")
+            current_health=_sqlite_health(DB)
+            if current_health['valid']:
+                st.info(f"Base actual: {current_health['active_users']}/{current_health['users']} usuarios activos · {current_health['products']} productos · {current_health['inventory_sessions']} sesiones · {current_health['inventory_counts']} conteos · {current_health['movements']} movimientos · {current_health['pos_sales']} filas POS.")
+            else:
+                st.warning(f"La base actual no supera la validación: {current_health['reason']}")
+            restore_upload=st.file_uploader("Seleccionar respaldo SQLite (.db)",type=['db','sqlite','sqlite3'],key='db_restore_upload')
+            if restore_upload is not None:
+                raw_restore=restore_upload.getvalue()
+                fd,tmp_restore=tempfile.mkstemp(prefix='ramona_restore_',suffix='.db')
+                os.close(fd)
+                with open(tmp_restore,'wb') as fh:
+                    fh.write(raw_restore)
+                candidate=_sqlite_health(tmp_restore)
+                if not candidate['valid']:
+                    st.error(f"El archivo no es un respaldo válido de La Ramona: {candidate['reason']}")
+                else:
+                    st.success(f"Respaldo válido: {candidate['active_users']}/{candidate['users']} usuarios activos · {candidate['products']} productos · {candidate['inventory_sessions']} sesiones · {candidate['inventory_counts']} conteos · {candidate['movements']} movimientos · {candidate['pos_sales']} filas POS.")
+                    restore_confirm=st.text_input("Para restaurar escribe exactamente: RESTAURAR BASE",key='db_restore_confirm')
+                    if st.button("Restaurar este respaldo",type='secondary',width='stretch',key='db_restore_apply'):
+                        if restore_confirm.strip()!='RESTAURAR BASE':
+                            st.error("Confirmación incorrecta. Escribe exactamente: RESTAURAR BASE")
+                        else:
+                            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                            pre=f"bar_inventory_v3_before_manual_restore_{stamp}.db"
+                            try:
+                                con.commit()
+                                if os.path.exists(DB): shutil.copy2(DB,pre)
+                                con.close()
+                                shutil.copy2(tmp_restore,DB)
+                                db.clear()
+                                st.success("Base restaurada. La aplicación se recargará con usuarios, productos e historial del respaldo.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"No se pudo restaurar la base: {e}")
+                try: os.remove(tmp_restore)
+                except Exception: pass
+            st.divider()
         if owner_for_correction:
             st.subheader("Corrección controlada de una captura")
             st.caption("Herramienta de contingencia para corregir una captura guardada con tipo o fecha operativa incorrectos. No elimina conteos, usuario ni hora original; solo reclasifica la sesión y deja trazabilidad en Observaciones.")
