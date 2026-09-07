@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.4"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -740,6 +740,16 @@ def ensure_v048_schema():
     con.commit()
 ensure_v048_schema()
 
+# V0.5.3 migration: audit trail for product deletion / merge / deactivation.
+def ensure_v053_schema():
+    con.execute("""CREATE TABLE IF NOT EXISTS product_admin_audit(
+      id INTEGER PRIMARY KEY, action TEXT NOT NULL, source_product_id INTEGER, source_name TEXT,
+      target_product_id INTEGER, target_name TEXT, user_id INTEGER, created_at TEXT NOT NULL, details TEXT
+    )""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_product_admin_audit_created ON product_admin_audit(created_at)")
+    con.commit()
+ensure_v053_schema()
+
 # ---------------------- catalog seed from current sheet ----------------------
 BEERS = ["Corona","Corona Sunbrew","XX","Negra","Especial","Sol","Coors","Molson"]
 LIQUORS = [
@@ -901,6 +911,140 @@ def product_label(p):
     ml = f" · {int(p['bottle_ml'])} ml" if p['bottle_ml'] else ""
     pkg = f" · {p['package_type']}" if p['package_type'] and p['package_type'] != 'Botella' else ""
     return f"{p['name']}{ml}{pkg}"
+
+def product_usage_summary(pid):
+    """Return all references to a product before any destructive catalog action.
+
+    A row whose quantity is 0 is still a historical reference.  V0.5.3 therefore
+    distinguishes total references from references with a non-zero business value.
+    """
+    pid=int(pid)
+    inv=one("""SELECT COUNT(*) rows,
+                      SUM(CASE WHEN ABS(COALESCE(qty_base,0))>1e-9 OR ABS(COALESCE(qty_bottle_equiv,0))>1e-9 THEN 1 ELSE 0 END) nonzero
+               FROM inventory_counts WHERE product_id=?""",(pid,))
+    mov=one("""SELECT COUNT(*) rows,
+                      SUM(CASE WHEN ABS(COALESCE(qty_base,0))>1e-9 OR ABS(COALESCE(qty_bottle_equiv,0))>1e-9 THEN 1 ELSE 0 END) nonzero
+               FROM movements WHERE product_id=?""",(pid,))
+    pos=one("""SELECT COUNT(*) rows,
+                      SUM(CASE WHEN ABS(COALESCE(quantity,0))>1e-9 THEN 1 ELSE 0 END) nonzero
+               FROM pos_sales WHERE product_id=?""",(pid,))
+    rec=one("""SELECT COUNT(*) rows,
+                      SUM(CASE WHEN ABS(COALESCE(oz_qty,0))>1e-9 THEN 1 ELSE 0 END) nonzero
+               FROM recipes WHERE product_id=?""",(pid,))
+    out={
+        'inventory_rows':int(inv['rows'] or 0),'inventory_nonzero':int(inv['nonzero'] or 0),
+        'movement_rows':int(mov['rows'] or 0),'movement_nonzero':int(mov['nonzero'] or 0),
+        'pos_rows':int(pos['rows'] or 0),'pos_nonzero':int(pos['nonzero'] or 0),
+        'recipe_rows':int(rec['rows'] or 0),'recipe_nonzero':int(rec['nonzero'] or 0),
+    }
+    out['total_rows']=out['inventory_rows']+out['movement_rows']+out['pos_rows']+out['recipe_rows']
+    out['nonzero_rows']=out['inventory_nonzero']+out['movement_nonzero']+out['pos_nonzero']+out['recipe_nonzero']
+    out['safe_delete_unused']=out['total_rows']==0
+    # A duplicate that only generated zero-valued inventory/movement/POS rows and
+    # is not used in any recipe can be cleaned without losing physical or sales quantities.
+    out['safe_delete_zero_only']=(
+        out['total_rows']>0 and out['inventory_nonzero']==0 and out['movement_nonzero']==0
+        and out['pos_nonzero']==0 and out['recipe_rows']==0
+    )
+    return out
+
+def _audit_product_admin(action,source,target,user_id,details=''):
+    con.execute("""INSERT INTO product_admin_audit(action,source_product_id,source_name,target_product_id,target_name,user_id,created_at,details)
+                   VALUES(?,?,?,?,?,?,?,?)""",(
+        action, int(source['id']) if source else None, source['name'] if source else None,
+        int(target['id']) if target else None, target['name'] if target else None,
+        int(user_id) if user_id else None, now_iso(), details or ''
+    ))
+
+def delete_product_safely(pid,user_id,allow_zero_references=False):
+    """Delete a duplicate only when doing so cannot remove a non-zero business quantity.
+
+    - No references at all: direct delete.
+    - Only zero-valued inventory/movement/POS references and no recipes: those zero rows
+      may be removed together with the duplicate when explicitly requested by Developer/Owner.
+    """
+    source=one("SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=?",(int(pid),))
+    if not source: return False,'Producto no encontrado.'
+    usage=product_usage_summary(pid)
+    if not usage['safe_delete_unused'] and not (allow_zero_references and usage['safe_delete_zero_only']):
+        return False,'El producto tiene información relacionada con valor o una receta; no puede borrarse directamente.'
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        if usage['safe_delete_zero_only']:
+            con.execute("DELETE FROM inventory_counts WHERE product_id=? AND ABS(COALESCE(qty_base,0))<=1e-9 AND ABS(COALESCE(qty_bottle_equiv,0))<=1e-9",(int(pid),))
+            con.execute("DELETE FROM movements WHERE product_id=? AND ABS(COALESCE(qty_base,0))<=1e-9 AND ABS(COALESCE(qty_bottle_equiv,0))<=1e-9",(int(pid),))
+            con.execute("DELETE FROM pos_sales WHERE product_id=? AND ABS(COALESCE(quantity,0))<=1e-9",(int(pid),))
+        _audit_product_admin('DELETE_ZERO_ONLY' if usage['safe_delete_zero_only'] else 'DELETE_UNUSED',source,None,user_id,json.dumps(usage,ensure_ascii=False))
+        con.execute('DELETE FROM products WHERE id=?',(int(pid),))
+        con.commit()
+        backup_db(force=True)
+        return True,'Producto eliminado de forma segura.'
+    except Exception as e:
+        con.rollback()
+        return False,f'No se pudo eliminar el producto: {e}'
+
+def product_merge_conflicts(source_pid,target_pid):
+    """Return collisions that need explicit protection before merging two catalog rows."""
+    source_pid,target_pid=int(source_pid),int(target_pid)
+    inv=q("""SELECT s.session_date,ic1.session_id,ic1.location_id,ic1.qty_base source_qty,ic1.qty_bottle_equiv source_beq,
+                    ic2.qty_base target_qty,ic2.qty_bottle_equiv target_beq
+             FROM inventory_counts ic1 JOIN inventory_counts ic2
+               ON ic2.session_id=ic1.session_id AND ic2.location_id=ic1.location_id AND ic2.product_id=?
+             JOIN inventory_sessions s ON s.id=ic1.session_id
+             WHERE ic1.product_id=?""",(target_pid,source_pid))
+    unsafe_inv=[r for r in inv if abs(float(r['source_qty'] or 0))>1e-9 or abs(float(r['source_beq'] or 0))>1e-9]
+    rec=q("""SELECT c.name cocktail,r1.oz_qty source_oz,r2.oz_qty target_oz
+             FROM recipes r1 JOIN recipes r2 ON r2.cocktail_id=r1.cocktail_id AND r2.product_id=?
+             JOIN cocktails c ON c.id=r1.cocktail_id WHERE r1.product_id=?""",(target_pid,source_pid))
+    unsafe_rec=[r for r in rec if abs(float(r['source_oz'] or 0))>1e-9]
+    return {'inventory_collisions':inv,'unsafe_inventory':unsafe_inv,'recipe_collisions':rec,'unsafe_recipes':unsafe_rec}
+
+def merge_duplicate_product(source_pid,target_pid,user_id):
+    """Move references to the correct product and retire the duplicate atomically.
+
+    Non-zero same-session inventory collisions and duplicate recipe ingredients are blocked
+    because automatically summing them could change historical meaning. Zero collisions are
+    safely discarded as duplicate placeholders.
+    """
+    source=one("SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=?",(int(source_pid),))
+    target=one("SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=?",(int(target_pid),))
+    if not source or not target or int(source_pid)==int(target_pid): return False,'Selecciona dos productos diferentes.'
+    if source['category']!=target['category']: return False,'Solo se pueden fusionar productos de la misma categoría.'
+    sm=float(source['bottle_ml'] or 0); tm=float(target['bottle_ml'] or 0)
+    if sm>0 and tm>0 and abs(sm-tm)>1e-6:
+        return False,'Las presentaciones en ml son diferentes. No se fusionan automáticamente para no reinterpretar botellas históricas.'
+    if str(source['package_type'] or '')!=str(target['package_type'] or ''):
+        return False,'Los tipos de envase son diferentes. Revisa el catálogo antes de fusionar.'
+    conflicts=product_merge_conflicts(source_pid,target_pid)
+    if conflicts['unsafe_inventory']:
+        return False,'Hay sesiones donde ambos productos tienen conteos no cero. La fusión automática está bloqueada para no duplicar o sumar inventario histórico.'
+    if conflicts['unsafe_recipes']:
+        return False,'Ambos productos aparecen en la misma receta con cantidades. Revisa esa receta antes de fusionar.'
+    usage_before=product_usage_summary(source_pid)
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        # Remove only zero-valued source rows that collide with an existing target row.
+        con.execute("""DELETE FROM inventory_counts
+                     WHERE product_id=? AND ABS(COALESCE(qty_base,0))<=1e-9 AND ABS(COALESCE(qty_bottle_equiv,0))<=1e-9
+                       AND EXISTS(SELECT 1 FROM inventory_counts t WHERE t.product_id=?
+                                  AND t.session_id=inventory_counts.session_id AND t.location_id=inventory_counts.location_id)""",(int(source_pid),int(target_pid)))
+        # A zero recipe collision is safe to drop; non-zero collisions were blocked above.
+        con.execute("""DELETE FROM recipes WHERE product_id=? AND ABS(COALESCE(oz_qty,0))<=1e-9
+                     AND EXISTS(SELECT 1 FROM recipes t WHERE t.product_id=? AND t.cocktail_id=recipes.cocktail_id)""",(int(source_pid),int(target_pid)))
+        con.execute('UPDATE inventory_counts SET product_id=? WHERE product_id=?',(int(target_pid),int(source_pid)))
+        con.execute('UPDATE movements SET product_id=? WHERE product_id=?',(int(target_pid),int(source_pid)))
+        con.execute('UPDATE pos_sales SET product_id=? WHERE product_id=?',(int(target_pid),int(source_pid)))
+        con.execute('UPDATE recipes SET product_id=? WHERE product_id=?',(int(target_pid),int(source_pid)))
+        if int(source['daily_inventory'] or 0)==1:
+            con.execute('UPDATE products SET daily_inventory=1 WHERE id=?',(int(target_pid),))
+        _audit_product_admin('MERGE_DUPLICATE',source,target,user_id,json.dumps(usage_before,ensure_ascii=False))
+        con.execute('DELETE FROM products WHERE id=?',(int(source_pid),))
+        con.commit()
+        backup_db(force=True)
+        return True,f"{source['name']} fue fusionado con {target['name']} y el duplicado fue retirado."
+    except Exception as e:
+        con.rollback()
+        return False,f'No se pudo fusionar el producto: {e}'
 
 def unit_label(p): return "botellas" if p['category']=="Cerveza" else "oz"
 
@@ -3139,6 +3283,101 @@ elif page=='Administración':
                     backfill_product_bottle_counts(pid)
                 st.success(f"{selected_product['name']} actualizado. Si había conteos guardados por botellas, sus oz fueron recalculadas automáticamente.")
                 st.rerun()
+
+        st.markdown("---")
+        st.markdown("### 🧹 Gestionar producto duplicado")
+        st.caption("Solo Developer/Owner. La app revisa todas las relaciones antes de permitir borrar. Un conteo actual en 0 no basta por sí solo: se verifican también inventarios históricos, movimientos, POS y recetas.")
+        if is_developer_user(user):
+            all_catalog=products(active=False)
+            # Detect likely duplicates using normalized category + name, while keeping presentation visible.
+            dup_groups={}
+            for r in all_catalog:
+                key=(r['category'],normalized_text(r['name']))
+                dup_groups.setdefault(key,[]).append(r)
+            likely=[grp for grp in dup_groups.values() if len(grp)>1]
+            if likely:
+                dup_preview=[]
+                for grp in likely:
+                    dup_preview.append({
+                        'Categoría':grp[0]['category'],
+                        'Nombre':grp[0]['name'],
+                        'Registros duplicados':len(grp),
+                        'Presentaciones':' / '.join((f"{int(r['bottle_ml'])} ml" if r['bottle_ml'] else 'ml pendiente') for r in grp)
+                    })
+                st.warning(f"Se detectaron {len(likely)} nombre(s) posiblemente duplicados en el catálogo.")
+                st.dataframe(pd.DataFrame(dup_preview),width='stretch',hide_index=True)
+            else:
+                st.info("No se detectan nombres duplicados exactos/normalizados en este momento. Igual puedes revisar cualquier producto manualmente.")
+
+            dup_map={update_product_label(r):r for r in all_catalog}
+            source_label=st.selectbox("Producto duplicado a revisar",list(dup_map.keys()),key='duplicate_source_product')
+            source=dup_map[source_label]
+            usage=product_usage_summary(source['id'])
+            u1,u2,u3,u4,u5=st.columns(5)
+            u1.metric("Conteos históricos",usage['inventory_rows'],delta=f"{usage['inventory_nonzero']} con valor")
+            u2.metric("Movimientos",usage['movement_rows'],delta=f"{usage['movement_nonzero']} con valor")
+            u3.metric("POS",usage['pos_rows'],delta=f"{usage['pos_nonzero']} con valor")
+            u4.metric("Recetas",usage['recipe_rows'])
+            u5.metric("Referencias totales",usage['total_rows'])
+
+            if usage['safe_delete_unused']:
+                st.success("✅ Este producto tiene 0 registros relacionados. Se puede eliminar definitivamente sin perder inventario, movimientos, POS ni recetas.")
+                confirm_delete=st.text_input("Para eliminar escribe: ELIMINAR PRODUCTO",key='confirm_delete_unused')
+                if st.button("Eliminar producto definitivamente",type='primary',disabled=(confirm_delete.strip().upper()!='ELIMINAR PRODUCTO'),key='delete_unused_product'):
+                    ok,msg=delete_product_safely(source['id'],user['id'],allow_zero_references=False)
+                    (st.success if ok else st.error)(msg)
+                    if ok: st.rerun()
+            elif usage['safe_delete_zero_only']:
+                st.success("✅ El producto sí tiene filas históricas relacionadas, pero todas sus cantidades son 0 y no participa en recetas. Para un duplicado, la app puede limpiar únicamente esas referencias cero y eliminar el producto sin perder cantidades físicas o ventas.")
+                st.caption("Esta acción sí cambia la auditoría de esas filas cero porque eran referencias del producto duplicado. La eliminación queda registrada en product_admin_audit y se respalda inmediatamente en Supabase.")
+                confirm_zero=st.text_input("Para limpiar el duplicado escribe: ELIMINAR DUPLICADO CERO",key='confirm_delete_zero')
+                if st.button("Eliminar duplicado con referencias en cero",type='primary',disabled=(confirm_zero.strip().upper()!='ELIMINAR DUPLICADO CERO'),key='delete_zero_product'):
+                    ok,msg=delete_product_safely(source['id'],user['id'],allow_zero_references=True)
+                    (st.success if ok else st.error)(msg)
+                    if ok: st.rerun()
+            else:
+                st.warning("⚠️ Este producto tiene información con valor o participa en recetas. No se permite borrarlo directamente porque se perdería trazabilidad o se alterarían cálculos.")
+                c1,c2=st.columns(2)
+                if int(source['active'] or 0)==1:
+                    if c1.button("Desactivar producto",key='deactivate_duplicate'):
+                        try:
+                            con.execute('BEGIN IMMEDIATE')
+                            con.execute('UPDATE products SET active=0,daily_inventory=0 WHERE id=?',(int(source['id']),))
+                            _audit_product_admin('DEACTIVATE',source,None,user['id'],json.dumps(usage,ensure_ascii=False))
+                            con.commit(); backup_db(force=True); st.success("Producto desactivado. El historial permanece intacto y ya no aparecerá en nuevos registros."); st.rerun()
+                        except Exception as e:
+                            con.rollback(); st.error(f"No se pudo desactivar: {e}")
+                else:
+                    if c1.button("Reactivar producto",key='reactivate_duplicate'):
+                        try:
+                            con.execute('BEGIN IMMEDIATE')
+                            con.execute('UPDATE products SET active=1 WHERE id=?',(int(source['id']),))
+                            _audit_product_admin('REACTIVATE',source,None,user['id'],json.dumps(usage,ensure_ascii=False))
+                            con.commit(); backup_db(force=True); st.success("Producto reactivado."); st.rerun()
+                        except Exception as e:
+                            con.rollback(); st.error(f"No se pudo reactivar: {e}")
+
+                target_rows=[r for r in all_catalog if int(r['id'])!=int(source['id']) and r['category']==source['category']]
+                if target_rows:
+                    target_map={update_product_label(r):r for r in target_rows}
+                    target_label=st.selectbox("Fusionar con el producto correcto",list(target_map.keys()),key='duplicate_target_product')
+                    target=target_map[target_label]
+                    conflicts=product_merge_conflicts(source['id'],target['id'])
+                    if float(source['bottle_ml'] or 0)>0 and float(target['bottle_ml'] or 0)>0 and abs(float(source['bottle_ml'])-float(target['bottle_ml']))>1e-6:
+                        st.error("Presentaciones diferentes: la fusión automática estará bloqueada para proteger la equivalencia histórica de botellas.")
+                    elif conflicts['unsafe_inventory']:
+                        st.error(f"Hay {len(conflicts['unsafe_inventory'])} sesión(es) donde ambos productos tienen conteos no cero. Requiere revisión manual antes de fusionar.")
+                    elif conflicts['unsafe_recipes']:
+                        st.error(f"Hay {len(conflicts['unsafe_recipes'])} receta(s) donde ambos productos tienen cantidades. Requiere revisión manual antes de fusionar.")
+                    else:
+                        st.info("La fusión reasignará conteos, movimientos, POS y recetas al producto correcto. Cualquier colisión histórica con cantidad 0 se elimina como marcador duplicado; luego el producto duplicado se retira.")
+                        confirm_merge=st.text_input("Para fusionar escribe: FUSIONAR PRODUCTO",key='confirm_merge_product')
+                        if st.button("Fusionar y retirar duplicado",disabled=(confirm_merge.strip().upper()!='FUSIONAR PRODUCTO'),key='merge_duplicate_product_button'):
+                            ok,msg=merge_duplicate_product(source['id'],target['id'],user['id'])
+                            (st.success if ok else st.error)(msg)
+                            if ok: st.rerun()
+        else:
+            st.info("🔒 La eliminación, desactivación y fusión de productos duplicados está reservada a Developer/Owner.")
     with t2:
         st.subheader("Cócteles y recetas")
         st.caption("Las recetas se registran exclusivamente en onzas (oz) de licor por cóctel. Estas cantidades alimentan el consumo teórico del Dashboard cuando se registran las ventas del POS.")
@@ -3526,7 +3765,7 @@ elif page=='Administración':
             if hist_kind=='CLOSING':
                 hist_opening=_inventory_session(hist_date.isoformat(),'OPENING',hist_cycle)
                 if not hist_opening:
-                    st.error("Para transcribir un Cierre histórico primero debe existir una Apertura del mismo día y ciclo. Ingresa la Apertura histórica y luego vuelve a esta sección para registrar el Cierre.")
+                    st.warning("No existe una Apertura registrada para esta fecha/ciclo. Puedes transcribir el Cierre conservado en papel igualmente. Quedará como captura histórica independiente y los cálculos comparativos permanecerán pendientes hasta que exista una Apertura compatible; no se generarán diferencias falsas.")
                 else:
                     st.info(f"Base histórica encontrada: Apertura sesión {hist_opening['id']} · {hist_opening['employee'] or 'Usuario'} · registrada {format_local_datetime(hist_opening['created_at'],'%d/%m/%Y %I:%M %p')}.")
             hist_counts=[]
@@ -3547,29 +3786,24 @@ elif page=='Administración':
                         st.info("📌 "+ref_txt)
                         rr=bottle_count_input(p,f"hist_{hist_kind}_{hist_cycle}_{hist_date}_{p['id']}",default,default_beq)
                         hist_counts.append({'pid':p['id'],'lid':hist_bar,'qty':rr['base'],'prev':None,'var':None,'obs':'','bottle_equiv':rr['bottles'],'name':p['name'],'category':p['category']})
-            hist_zero=[x['name'] for x in hist_counts if ((x['category']=='Cerveza' and float(x['qty'] or 0)<=0) or (x['category']=='Licor' and float(x.get('bottle_equiv') or 0)<=0))]
-            hist_zero_ok=True
-            if hist_zero:
-                st.warning("Productos históricos en cero: "+", ".join(hist_zero))
-                hist_zero_ok=st.checkbox("Confirmo que esos productos estaban realmente en cero según el registro en papel.",key='hist_zero_confirm')
-            hist_ack=st.checkbox("Confirmo que estoy transcribiendo datos históricos y que la fecha operativa seleccionada corresponde al documento en papel.",key='hist_ack')
+            st.caption("Los valores digitados, incluidos los ceros, se guardarán exactamente como aparecen en el registro físico en papel. No se exige justificar diferencias contra otros días para poder transcribir la captura.")
+            hist_ack=st.checkbox("Confirmo que este conteo fue realizado físicamente y quedó registrado en papel debido a un inconveniente del sistema, y que los valores digitados corresponden al registro físico.",key='hist_ack')
             if st.button("Guardar registro histórico",type='secondary',width='stretch',key='save_historical_inventory'):
-                if hist_kind=='CLOSING' and not hist_opening:
-                    st.error("No se puede guardar el cierre histórico sin una apertura del mismo día/ciclo.")
-                elif not hist_zero_ok:
-                    st.error("Confirma los productos históricos en cero antes de guardar.")
-                elif not hist_ack:
-                    st.error("Debes confirmar que se trata de una transcripción histórica.")
+                if not hist_ack:
+                    st.error("Debes confirmar que el conteo físico quedó registrado en papel por una contingencia del sistema y que los valores digitados corresponden a ese registro.")
                 else:
                     operator_txt=hist_operator if hist_operator!='No especificado' else 'No especificado'
-                    audit=f"[REGISTRO HISTÓRICO ingresado por Developer/Owner el {local_now().strftime('%d/%m/%Y %I:%M:%S %p')} · Responsable reportado: {operator_txt} · Fuente: {hist_source or 'sin referencia'}]"
-                    full_notes=(audit+("\n"+hist_general.strip() if hist_general.strip() else '')).strip()
                     pair=(int(hist_opening['id']) if hist_kind=='CLOSING' and hist_opening else None)
+                    pair_status=(f"Apertura vinculada: sesión {pair}" if pair else ("Sin apertura vinculada; pendiente de emparejar" if hist_kind=='CLOSING' else "Apertura histórica"))
+                    audit=f"[TRANSCRIPCIÓN HISTÓRICA POR CONTINGENCIA ingresada por Developer/Owner el {local_now().strftime('%d/%m/%Y %I:%M:%S %p')} · Responsable reportado: {operator_txt} · Fuente: {hist_source or 'Registro en papel'} · {pair_status}]"
+                    full_notes=(audit+("\n"+hist_general.strip() if hist_general.strip() else '')).strip()
                     result=save_historical_session(hist_kind,hist_counts,hist_date,full_notes,hist_cycle,pair)
                     if not result.get('ok'):
                         st.error(result.get('error','No se pudo guardar el registro histórico.'))
                     else:
                         detail=("La captura ya existía y no se duplicó." if result.get('duplicate') else f"{len(hist_counts)} productos transcritos. El historial anterior se conserva.")
+                        if hist_kind=='CLOSING' and not hist_opening:
+                            detail += "  \nEste cierre quedó guardado sin apertura vinculada. Las comparaciones Apertura→Cierre permanecerán pendientes hasta que se transcriba una apertura compatible; no se generan diferencias falsas."
                         if result.get('saved'):
                             detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ Registro histórico guardado en SQLite; backup: {result.get('backup_message','pendiente')}")
                         st.session_state['_inventory_flash']=operation_confirmation(f"Registro histórico de {'apertura' if hist_kind=='OPENING' else 'cierre'} guardado",hist_date,detail,result.get('created_at'))
