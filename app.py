@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile
+import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,6 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
+APP_VERSION = "0.5.2"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -262,6 +263,148 @@ def operation_confirmation(action, business_date=None, detail="", event_ts=None)
         parts.append(str(detail))
     return "  \n".join(parts)
 
+# ---------------------- Supabase Storage backup (primary) ----------------------
+def _supabase_cfg():
+    try:
+        sec=st.secrets.get("supabase_backup", {})
+        return {
+            "enabled": bool(sec.get("enabled", False)),
+            "api_url": str(sec.get("api_url", "")).strip().rstrip('/'),
+            "secret_key": str(sec.get("secret_key", "")).strip(),
+            "bucket": str(sec.get("bucket", "")).strip(),
+        }
+    except Exception:
+        return {"enabled":False,"api_url":"","secret_key":"","bucket":""}
+
+
+def _supabase_ready():
+    cfg=_supabase_cfg()
+    return bool(cfg['enabled'] and cfg['api_url'] and cfg['secret_key'] and cfg['bucket'])
+
+
+def _supabase_headers(extra=None):
+    cfg=_supabase_cfg(); key=cfg['secret_key']
+    h={"Authorization":f"Bearer {key}","apikey":key}
+    if extra: h.update(extra)
+    return h
+
+
+def _supabase_object_url(remote_path, authenticated=False):
+    cfg=_supabase_cfg()
+    bucket=urllib.parse.quote(cfg['bucket'],safe='')
+    path=urllib.parse.quote(str(remote_path).lstrip('/'),safe='/')
+    mode='authenticated/' if authenticated else ''
+    return f"{cfg['api_url']}/storage/v1/object/{mode}{bucket}/{path}"
+
+
+def _safe_sqlite_snapshot():
+    """Create a consistent SQLite snapshot without copying a file mid-write."""
+    if not os.path.exists(DB):
+        raise FileNotFoundError(DB)
+    fd,tmp=tempfile.mkstemp(prefix='ramona_snapshot_',suffix='.db'); os.close(fd)
+    src=dst=None
+    try:
+        src=sqlite3.connect(DB,timeout=15)
+        dst=sqlite3.connect(tmp)
+        src.backup(dst)
+        dst.commit()
+        dst.close(); dst=None
+        src.close(); src=None
+        check=_sqlite_health(tmp)
+        if not check['valid']:
+            raise RuntimeError(f"Snapshot SQLite no válido: {check['reason']}")
+        return tmp,check
+    except Exception:
+        for c in (dst,src):
+            try:
+                if c: c.close()
+            except Exception: pass
+        try: os.remove(tmp)
+        except Exception: pass
+        raise
+
+
+def _supabase_upload_snapshot(snapshot_path,remote_path):
+    with open(snapshot_path,'rb') as fh:
+        payload=fh.read()
+    req=urllib.request.Request(
+        _supabase_object_url(remote_path),data=payload,method='POST',
+        headers=_supabase_headers({
+            'Content-Type':'application/octet-stream',
+            'x-upsert':'true',
+            'Cache-Control':'no-cache',
+        })
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=25) as resp:
+            return 200 <= int(getattr(resp,'status',200)) < 300
+    except urllib.error.HTTPError as e:
+        body=e.read().decode('utf-8','ignore')[:500]
+        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+
+
+def _supabase_download(remote_path):
+    req=urllib.request.Request(
+        _supabase_object_url(remote_path,authenticated=True),method='GET',
+        headers=_supabase_headers({'Cache-Control':'no-cache'})
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=25) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body=e.read().decode('utf-8','ignore')[:500]
+        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+
+
+def backup_db_to_supabase(force=False):
+    """Backup a verified snapshot to one rolling latest, one daily and one weekly file.
+
+    `latest` is overwritten after each successful write. Daily and weekly filenames are
+    also upserted, so repeated operations do not create hundreds of files.
+    """
+    if not _supabase_ready():
+        return False,"Supabase backup no configurado"
+    snap=None
+    try:
+        snap,health=_safe_sqlite_snapshot()
+        today=local_today(); iso=today.isocalendar()
+        paths=[
+            'latest/bar_inventory_v3.db',
+            f"daily/bar_inventory_{today.isoformat()}.db",
+            f"weekly/bar_inventory_{iso.year}-W{iso.week:02d}.db",
+        ]
+        for remote in paths:
+            if not _supabase_upload_snapshot(snap,remote):
+                raise RuntimeError(f"No se confirmó la carga de {remote}")
+        stamp=local_now().isoformat(timespec='seconds')
+        st.session_state['_last_supabase_backup']=stamp
+        st.session_state['_last_supabase_backup_health']=health
+        st.session_state.pop('_supabase_backup_error',None)
+        return True,f"Backup Supabase OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos"
+    except Exception as e:
+        st.session_state['_supabase_backup_error']=str(e)
+        return False,f"No se pudo respaldar en Supabase: {e}"
+    finally:
+        if snap:
+            try: os.remove(snap)
+            except Exception: pass
+
+
+def restore_latest_from_supabase_to_temp():
+    """Download and validate latest backup. Does not replace the live DB."""
+    if not _supabase_ready():
+        return None,{"valid":False,"reason":"supabase_not_configured"}
+    raw=_supabase_download('latest/bar_inventory_v3.db')
+    fd,tmp=tempfile.mkstemp(prefix='ramona_supabase_restore_',suffix='.db'); os.close(fd)
+    with open(tmp,'wb') as fh:
+        fh.write(raw); fh.flush(); os.fsync(fh.fileno())
+    health=_sqlite_health(tmp)
+    if not health['valid']:
+        try: os.remove(tmp)
+        except Exception: pass
+        return None,health
+    return tmp,health
+
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
     try:
@@ -302,6 +445,13 @@ def backup_db_to_drive(force=False):
     except Exception as e:
         st.session_state['_drive_backup_error']=str(e)
         return False,f"No se pudo respaldar en Drive: {e}"
+
+def backup_db(force=False):
+    """Primary backup dispatcher. Supabase wins when configured; Drive remains legacy fallback."""
+    if _supabase_ready():
+        return backup_db_to_supabase(force=force)
+    return backup_db_to_drive(force=force)
+
 
 def _sqlite_health(path):
     """Read-only integrity/row-count check used before any recovery action."""
@@ -379,6 +529,42 @@ def restore_db_from_embedded_snapshot_if_reset():
     AUTO_RECOVERY_APPLIED=True
     return True
 
+def restore_db_from_supabase_if_reset():
+    """Prefer a validated Supabase `latest` when the local runtime DB disappears/resets.
+
+    This only becomes active after at least one successful Supabase backup exists. If
+    `latest` is unavailable, the existing legacy/embedded recovery path remains intact.
+    """
+    global AUTO_RECOVERY_APPLIED
+    if not _supabase_ready():
+        return False
+    health=_sqlite_health(DB)
+    should_restore=(not health['valid'] or
+                    (health['inventory_sessions']==0 and health['inventory_counts']==0 and health['users']<=1))
+    if not should_restore:
+        return False
+    tmp=None
+    try:
+        tmp,h=restore_latest_from_supabase_to_temp()
+        if not tmp or not h.get('valid'):
+            return False
+        if os.path.exists(DB) and os.path.getsize(DB)>0:
+            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            try: shutil.copy2(DB,f"bar_inventory_v3_before_supabase_auto_restore_{stamp}.db")
+            except Exception: pass
+        os.replace(tmp,DB); tmp=None
+        AUTO_RECOVERY_APPLIED=True
+        return True
+    except Exception as e:
+        try: st.session_state['_supabase_auto_restore_error']=str(e)
+        except Exception: pass
+        return False
+    finally:
+        if tmp:
+            try: os.remove(tmp)
+            except Exception: pass
+
+
 def restore_db_from_drive_if_missing():
     if os.path.exists(DB) and os.path.getsize(DB)>0: return
     service=_drive_service(); cfg=_gdrive_cfg()
@@ -394,6 +580,7 @@ def restore_db_from_drive_if_missing():
     except Exception:
         pass
 
+restore_db_from_supabase_if_reset()
 restore_db_from_drive_if_missing()
 restore_db_from_embedded_snapshot_if_reset()
 
@@ -408,7 +595,9 @@ con = db()
 
 def q(sql, p=()): return con.execute(sql, p).fetchall()
 def one(sql, p=()): return con.execute(sql, p).fetchone()
-def ex(sql, p=()): con.execute(sql, p); con.commit(); backup_db_to_drive()
+def ex(sql, p=(), do_backup=True):
+    con.execute(sql, p); con.commit()
+    if do_backup: backup_db()
 
 def hash_pin(pin): return hashlib.sha256(pin.encode()).hexdigest()
 
@@ -818,8 +1007,40 @@ def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAI
     except Exception:
         con.rollback()
         raise
-    backup_db_to_drive()
-    return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at}
+    backup_ok,backup_msg=backup_db()
+    return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at,'backup_ok':backup_ok,'backup_message':backup_msg}
+
+def save_historical_session(kind, counts, session_date, notes="", inventory_cycle="DAILY", paired_opening_session_id=None):
+    """Developer/Owner historical capture from paper records.
+
+    This intentionally bypasses the live Opening→Closing workflow because it edits an
+    earlier business date. The real entry timestamp and Developer user are preserved.
+    """
+    d=session_date.isoformat() if hasattr(session_date,'isoformat') else str(session_date)
+    duplicate=_recent_identical_inventory_session(kind,counts,session_date,inventory_cycle,paired_opening_session_id)
+    if duplicate:
+        return {'ok':True,'saved':False,'duplicate':True,'id':int(duplicate['id']),'created_at':duplicate['created_at']}
+    created_at=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        duplicate=_recent_identical_inventory_session(kind,counts,session_date,inventory_cycle,paired_opening_session_id)
+        if duplicate:
+            con.rollback()
+            return {'ok':True,'saved':False,'duplicate':True,'id':int(duplicate['id']),'created_at':duplicate['created_at']}
+        cur=con.execute("""INSERT INTO inventory_sessions(session_date,session_type,user_id,created_at,notes,inventory_cycle,paired_opening_session_id)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (d,kind,user['id'],created_at,notes,inventory_cycle,paired_opening_session_id))
+        sid=cur.lastrowid
+        for x in counts:
+            con.execute("""INSERT INTO inventory_counts(session_id,product_id,location_id,qty_base,previous_qty,variance,observation,qty_bottle_equiv)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (sid,x['pid'],x['lid'],x['qty'],x.get('prev'),x.get('var'),x.get('obs'),x.get('bottle_equiv')))
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    backup_ok,backup_msg=backup_db()
+    return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at,'backup_ok':backup_ok,'backup_message':backup_msg}
+
 
 def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
     if p['category']=='Cerveza':
@@ -865,7 +1086,7 @@ def backfill_product_bottle_counts(pid):
     boz=float(p['bottle_ml'])/ML_PER_OZ
     con.execute("UPDATE inventory_counts SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
     con.execute("UPDATE movements SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
-    con.commit(); backup_db_to_drive()
+    con.commit(); backup_db()
 
 def movement_qty_input(p,key,label="Cantidad"):
     if p['category']=='Cerveza':
@@ -883,10 +1104,11 @@ def movement_qty_input(p,key,label="Cantidad"):
         if bottles>0: st.caption(f"Movimiento: {bottles:.2f} botellas · ml pendiente; se convertirán a oz cuando se complete la presentación.")
     return {'base':base,'bottles':bottles}
 
-def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None):
+def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None,do_backup=True):
     con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or local_today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
-    con.commit(); backup_db_to_drive()
+    con.commit()
+    if do_backup: backup_db()
 
 def session_qty(d, pid, kind, lid):
     r=one("""SELECT ic.qty_base FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
@@ -1203,7 +1425,7 @@ def record_pos_batch(d,sale_group,note=""):
     ds=d.isoformat() if hasattr(d,'isoformat') else str(d)
     con.execute("INSERT INTO pos_batches(sale_date,sale_group,user_id,note,created_at) VALUES(?,?,?,?,?)",
                 (ds,sale_group,user['id'],note,now_iso()))
-    con.commit(); backup_db_to_drive()
+    con.commit(); backup_db()
 
 
 def pos_group_submitted(ds,sale_group):
@@ -2132,7 +2354,7 @@ if not user_row or not user_row['active']:
     st.stop()
 
 user=dict(user_row)
-ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']))
+ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']),do_backup=False)
 
 workflow=inventory_workflow_state()
 allowed_inventory_page='Cierre' if workflow['stage']=='CLOSING' else 'Apertura'
@@ -2189,7 +2411,7 @@ if page=='Apertura':
     if scope=='Solo cervezas': ps=[p for p in ps if p['category']=='Cerveza']
     elif scope=='Solo licores': ps=[p for p in ps if p['category']=='Licor']
     st.caption("Puedes guardar cervezas y licores en momentos distintos. Cada captura se conserva con usuario y hora; no sobrescribe las anteriores.")
-    counts=[]; missing_obs=False
+    counts=[]
     for cat in ['Cerveza','Licor']:
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
@@ -2217,11 +2439,11 @@ if page=='Apertura':
                         else:
                             var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
                         if var is not None and abs(var)>tol:
-                            st.warning(f"Diferencia contra cierre anterior: {var:+.2f} {var_unit}")
-                            obs=st.text_input("Observación obligatoria",key=f"opobs_{cycle}_{d}_{p['id']}")
-                            missing_obs |= not bool(obs.strip())
-                        elif var is not None: st.caption(f"Diferencia: {var:+.2f} {var_unit} · dentro de tolerancia")
+                            st.warning(f"Referencia contra cierre anterior: {var:+.2f} {var_unit}. Este valor NO bloquea la apertura ni se considera una venta; el conteo físico que ingreses se guardará tal cual.")
+                            obs=st.text_input("Observación (opcional)",key=f"opobs_{cycle}_{d}_{p['id']}",help="Úsala solo si quieres dejar contexto para auditoría. No es obligatoria para guardar la apertura.")
+                        elif var is not None: st.caption(f"Referencia contra cierre anterior: {var:+.2f} {var_unit} · no afecta el cálculo de ventas del nuevo turno")
                 counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv,'name':p['name'],'category':p['category']})
+    st.caption("Regla de control: Apertura y Cierre son conteos físicos y nunca se rechazan por ser diferentes a una referencia anterior. Las diferencias reales se calculan después con Apertura + Entradas − Cierre − Ajustes y se comparan con POS.")
     st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label} · Captura: {scope}")
     zero_items=[x['name'] for x in counts if ((x['category']=='Cerveza' and float(x['qty'] or 0)<=0) or (x['category']=='Licor' and float(x.get('bottle_equiv') or 0)<=0))]
     zero_confirm=True
@@ -2231,7 +2453,6 @@ if page=='Apertura':
     if st.button("Guardar apertura",type="primary",width="stretch"):
         valid,msg=_validate_inventory_save('OPENING',d,cycle)
         if not valid: st.error(msg)
-        elif missing_obs: st.error("Falta explicar una diferencia marcada como alerta.")
         elif not zero_confirm: st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
         else:
             result=save_session('OPENING',counts,d,inventory_cycle=cycle)
@@ -2245,6 +2466,8 @@ if page=='Apertura':
                     detail=f"Apertura {cycle_label.lower()} **completa** · {new_prog['opening_count']}/{new_prog['required_count']} productos. Ahora Cierre es la única acción de inventario habilitada para este turno."
                 else:
                     detail=f"Apertura {cycle_label.lower()} **parcial** · {new_prog['opening_count']}/{new_prog['required_count']} productos. Puedes continuar la apertura sin perder las capturas anteriores."
+                if result.get('saved'):
+                    detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ El inventario quedó guardado en SQLite, pero el backup automático reportó: {result.get('backup_message','pendiente')}")
                 st.session_state['_inventory_flash']=operation_confirmation('Su apertura fue exitosa',d,detail,result.get('created_at'))
                 st.rerun()
 
@@ -2347,6 +2570,8 @@ elif page=='Cierre':
                     detail=f"Cierre {cycle_label.lower()} **completo** · {new_prog['closing_count']}/{new_prog['required_count']} productos. El turno quedó cerrado y la próxima acción válida será una nueva Apertura."
                 else:
                     detail=f"Cierre {cycle_label.lower()} **parcial** · {new_prog['closing_count']}/{new_prog['required_count']} productos. Cierre seguirá siendo la única acción habilitada hasta completarlo."
+                if result.get('saved'):
+                    detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ El inventario quedó guardado en SQLite, pero el backup automático reportó: {result.get('backup_message','pendiente')}")
                 st.session_state['_inventory_flash']=operation_confirmation('Su cierre fue exitoso',d,detail,result.get('created_at'))
                 st.rerun()
 
@@ -2365,8 +2590,10 @@ elif page=='Recibir pedido':
     if st.button("Confirmar recepción",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty,beq,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d,bottle_equiv=beq)
-            st.success(operation_confirmation('Su recepción de productos fue registrada correctamente',d,f"{len(rows)} producto(s) · Destino: **{dest_name}**"))
+            for pid,qty,beq,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d,bottle_equiv=beq,do_backup=False)
+            bok,bmsg=backup_db()
+            detail=f"{len(rows)} producto(s) · Destino: **{dest_name}**" + (" · Backup ✅" if bok else f" · Backup pendiente: {bmsg}")
+            st.success(operation_confirmation('Su recepción de productos fue registrada correctamente',d,detail))
 
 elif page=='Trasladar productos':
     page_header("Trasladar productos", "Registra movimientos de inventario entre bodega y bar.")
@@ -2379,8 +2606,10 @@ elif page=='Trasladar productos':
     if st.button("Confirmar traslado Bodega → Bar",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty,beq in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d,bottle_equiv=beq)
-            st.success(operation_confirmation('Su traslado Bodega → Bar fue registrado correctamente',d,f"{len(rows)} producto(s) trasladado(s)"))
+            for pid,qty,beq in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d,bottle_equiv=beq,do_backup=False)
+            bok,bmsg=backup_db()
+            detail=f"{len(rows)} producto(s) trasladado(s)" + (" · Backup ✅" if bok else f" · Backup pendiente: {bmsg}")
+            st.success(operation_confirmation('Su traslado Bodega → Bar fue registrado correctamente',d,detail))
 
 elif page=='POS / Ventas':
     page_header("POS / Ventas", "Registra ventas de cócteles, shots, cervezas y botellas para calcular el consumo teórico.")
@@ -2862,7 +3091,7 @@ elif page=='Administración':
             con.execute("UPDATE products SET daily_inventory=0 WHERE category_id=(SELECT id FROM categories WHERE name='Licor')")
             for label in selected_daily:
                 con.execute("UPDATE products SET daily_inventory=1 WHERE id=?",(liquor_map[label]['id'],))
-            con.commit(); backup_db_to_drive(); st.success("Lista de licores principales actualizada."); st.rerun()
+            con.commit(); backup_db(); st.success("Lista de licores principales actualizada."); st.rerun()
         st.markdown("#### Actualizar presentación / costo")
         st.caption("Selecciona el producto por su nombre. Ya no necesitas recordar ni escribir el ID interno.")
         update_rows=products(active=False)
@@ -2977,7 +3206,7 @@ elif page=='Administración':
                             con.execute("DELETE FROM recipes WHERE cocktail_id=?",(cocktail['id'],))
                             for pid,oz,_ in recipe_rows:
                                 con.execute("INSERT INTO recipes(cocktail_id,product_id,oz_qty) VALUES(?,?,?)",(cocktail['id'],pid,oz))
-                            con.commit(); backup_db_to_drive()
+                            con.commit(); backup_db()
                             st.success("Receta guardada correctamente en onzas de licor.")
                             st.rerun()
                         except Exception as e:
@@ -3031,7 +3260,7 @@ elif page=='Administración':
                                                    ON CONFLICT(cocktail_id,product_id) DO UPDATE SET oz_qty=excluded.oz_qty""",
                                                 (cock['id'],pmatch['id'],float(oz_raw)))
                                     imported+=1
-                                con.commit(); backup_db_to_drive()
+                                con.commit(); backup_db()
                                 if imported: st.success(f"Importación terminada: {imported} ingredientes de receta guardados/actualizados.")
                                 if skipped:
                                     st.warning(f"{len(skipped)} filas no se importaron para evitar inventar equivalencias.")
@@ -3161,21 +3390,34 @@ elif page=='Administración':
                             if pd.isna(oz): continue
                             con.execute("INSERT OR IGNORE INTO cocktails(name) VALUES(?)",(cr,)); c=one("SELECT id FROM cocktails WHERE name=?",(cr,)); p=one("SELECT id FROM products WHERE lower(name)=lower(?) ORDER BY id LIMIT 1",(lr,))
                             if c and p: con.execute("INSERT INTO recipes(cocktail_id,product_id,oz_qty) VALUES(?,?,?) ON CONFLICT(cocktail_id,product_id) DO UPDATE SET oz_qty=excluded.oz_qty",(c['id'],p['id'],float(oz))); imported+=1
-                    con.commit(); st.success(f"Importación terminada. Registros procesados: {imported}"); st.rerun()
+                    con.commit(); backup_db(); st.success(f"Importación terminada. Registros procesados: {imported}"); st.rerun()
             except Exception as e: st.error(f"No se pudo leer el archivo: {e}")
     with t5:
         st.subheader("Respaldo automático")
-        cfg=_gdrive_cfg()
-        if cfg['enabled'] and cfg['folder_id'] and cfg['service_account_json']:
-            last=st.session_state.get('_last_drive_backup','Aún no realizado en esta sesión')
-            st.success(f"Google Drive configurado · último respaldo: {last}")
-            if st.button("Respaldar ahora en Google Drive",width="stretch"):
-                ok,msg=backup_db_to_drive(force=True); (st.success if ok else st.error)(msg)
+        scfg=_supabase_cfg()
+        if _supabase_ready():
+            last=st.session_state.get('_last_supabase_backup','Aún no realizado en esta sesión')
+            st.success(f"Supabase Storage configurado · último backup en esta sesión: {last}")
+            st.caption("Cada escritura confirmada actualiza `latest/bar_inventory_v3.db`, el archivo diario de la fecha y el archivo semanal vigente. Los nombres se sobrescriben para evitar cientos de copias por día.")
+            if st.button("Crear / verificar backup ahora en Supabase",width="stretch",key='supabase_backup_now'):
+                ok,msg=backup_db_to_supabase(force=True); (st.success if ok else st.error)(msg)
+            if st.session_state.get('_supabase_backup_error'):
+                st.warning("Último error de Supabase: "+st.session_state['_supabase_backup_error'])
         else:
-            st.warning("Respaldo Drive aún no configurado. La app funciona, pero la base local de Streamlit no debe considerarse almacenamiento permanente.")
+            st.warning("Supabase backup no está configurado. Revisa [supabase_backup] en Streamlit Secrets.")
+
         if os.path.exists(DB):
             with open(DB,'rb') as fh:
-                st.download_button("Descargar copia de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{local_today().isoformat()}.db",mime="application/octet-stream",width="stretch")
+                st.download_button("Descargar copia manual de la base SQLite",data=fh.read(),file_name=f"bar_inventory_backup_{local_today().isoformat()}.db",mime="application/octet-stream",width="stretch")
+
+        with st.expander("Google Drive (configuración anterior / contingencia)"):
+            cfg=_gdrive_cfg()
+            if cfg['enabled'] and cfg['folder_id'] and cfg['service_account_json']:
+                st.caption("La configuración anterior se conserva, pero Supabase es el respaldo primario de esta versión.")
+                if st.button("Probar respaldo legacy en Google Drive",width="stretch",key='drive_legacy_backup'):
+                    ok,msg=backup_db_to_drive(force=True); (st.success if ok else st.error)(msg)
+            else:
+                st.caption("Google Drive no configurado. No es necesario para usar Supabase.")
         st.divider()
         owner_for_correction=normalized_email(user['email'])==normalized_email(secret_value('app','bootstrap_admin_email'))
         if owner_for_correction:
@@ -3186,6 +3428,44 @@ elif page=='Administración':
                 st.info(f"Base actual: {current_health['active_users']}/{current_health['users']} usuarios activos · {current_health['products']} productos · {current_health['inventory_sessions']} sesiones · {current_health['inventory_counts']} conteos · {current_health['movements']} movimientos · {current_health['pos_sales']} filas POS.")
             else:
                 st.warning(f"La base actual no supera la validación: {current_health['reason']}")
+            if _supabase_ready():
+                st.markdown("##### Restaurar `latest` desde Supabase")
+                if st.button("Verificar último backup de Supabase",width='stretch',key='check_supabase_latest'):
+                    tmp_latest=None
+                    try:
+                        tmp_latest,h=restore_latest_from_supabase_to_temp()
+                        st.session_state['_supabase_latest_health']=h
+                        st.success(f"Latest válido: {h['active_users']}/{h['users']} usuarios activos · {h['products']} productos · {h['inventory_sessions']} sesiones · {h['inventory_counts']} conteos · {h['movements']} movimientos · {h['pos_sales']} filas POS.")
+                    except Exception as e:
+                        st.error(f"No se pudo verificar latest: {e}")
+                    finally:
+                        if tmp_latest:
+                            try: os.remove(tmp_latest)
+                            except Exception: pass
+                latest_confirm=st.text_input("Para restaurar latest escribe: RESTAURAR SUPABASE",key='supabase_restore_confirm')
+                if st.button("Restaurar latest de Supabase",type='secondary',width='stretch',key='restore_supabase_latest'):
+                    if latest_confirm.strip()!='RESTAURAR SUPABASE':
+                        st.error("Confirmación incorrecta. Escribe exactamente: RESTAURAR SUPABASE")
+                    else:
+                        tmp_latest=None
+                        try:
+                            tmp_latest,h=restore_latest_from_supabase_to_temp()
+                            if not tmp_latest or not h['valid']:
+                                raise RuntimeError(h.get('reason','backup inválido'))
+                            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                            pre=f"bar_inventory_v3_before_supabase_restore_{stamp}.db"
+                            con.commit()
+                            if os.path.exists(DB): shutil.copy2(DB,pre)
+                            con.close(); shutil.copy2(tmp_latest,DB); db.clear()
+                            st.success("Último backup de Supabase restaurado y validado. La aplicación se recargará.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo restaurar latest de Supabase: {e}")
+                        finally:
+                            if tmp_latest:
+                                try: os.remove(tmp_latest)
+                                except Exception: pass
+                st.divider()
             restore_upload=st.file_uploader("Seleccionar respaldo SQLite (.db)",type=['db','sqlite','sqlite3'],key='db_restore_upload')
             if restore_upload is not None:
                 raw_restore=restore_upload.getvalue()
@@ -3218,6 +3498,84 @@ elif page=='Administración':
                 try: os.remove(tmp_restore)
                 except Exception: pass
             st.divider()
+        if owner_for_correction:
+            st.subheader("Carga histórica de Apertura / Cierre")
+            st.caption("Solo Developer/Owner. Transcribe inventarios conservados en papel sin alterar el flujo activo de hoy. La fecha operativa histórica queda separada de la fecha/hora real en que tú realizas la digitación.")
+            h1,h2,h3=st.columns(3)
+            hist_date=h1.date_input("Fecha operativa histórica",value=max(local_today()-timedelta(days=1),date(2026,1,1)),max_value=local_today(),key='hist_inventory_date')
+            hist_kind=h2.selectbox("Tipo de registro",['OPENING','CLOSING'],format_func=lambda x:'Apertura' if x=='OPENING' else 'Cierre',key='hist_inventory_kind')
+            hist_cycle=h3.selectbox("Ciclo",['DAILY','WEEKLY'],format_func=lambda x:'Diario' if x=='DAILY' else 'Semanal',key='hist_inventory_cycle')
+            hist_scope=st.radio("Productos a transcribir",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key='hist_inventory_scope')
+            hist_users=q("SELECT id,name,email FROM users WHERE active=1 ORDER BY name")
+            hist_operator=st.selectbox("Responsable indicado en el registro de papel (opcional)",['No especificado']+[f"{r['name']} · {r['email']}" for r in hist_users],key='hist_original_operator')
+            hist_source=st.text_input("Fuente / referencia (opcional)",value="Registro en papel",key='hist_source_note')
+            hist_general=st.text_area("Observación histórica (opcional)",key='hist_general_note')
+            hist_bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
+            hist_ps=inventory_products(hist_cycle)
+            if hist_scope=='Solo cervezas': hist_ps=[p for p in hist_ps if p['category']=='Cerveza']
+            elif hist_scope=='Solo licores': hist_ps=[p for p in hist_ps if p['category']=='Licor']
+            existing_hist=q("""SELECT s.id,s.session_type,s.created_at,u.name employee,COUNT(ic.id) item_count
+                               FROM inventory_sessions s LEFT JOIN users u ON u.id=s.user_id
+                               LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                               WHERE s.session_date=? AND s.session_type=? AND COALESCE(s.inventory_cycle,'DAILY')=?
+                               GROUP BY s.id ORDER BY s.created_at DESC,s.id DESC""",
+                            (hist_date.isoformat(),hist_kind,hist_cycle))
+            if existing_hist:
+                st.warning(f"Ya existen {len(existing_hist)} captura(s) de {'Apertura' if hist_kind=='OPENING' else 'Cierre'} para esta fecha/ciclo. La nueva captura no borra las anteriores; para cada producto pasará a ser la referencia más reciente de esa fecha.")
+            hist_opening=None
+            if hist_kind=='CLOSING':
+                hist_opening=_inventory_session(hist_date.isoformat(),'OPENING',hist_cycle)
+                if not hist_opening:
+                    st.error("Para transcribir un Cierre histórico primero debe existir una Apertura del mismo día y ciclo. Ingresa la Apertura histórica y luego vuelve a esta sección para registrar el Cierre.")
+                else:
+                    st.info(f"Base histórica encontrada: Apertura sesión {hist_opening['id']} · {hist_opening['employee'] or 'Usuario'} · registrada {format_local_datetime(hist_opening['created_at'],'%d/%m/%Y %I:%M %p')}.")
+            hist_counts=[]
+            for cat in ['Cerveza','Licor']:
+                group=[p for p in hist_ps if p['category']==cat]
+                if group: st.markdown(f"##### {cat}")
+                for p in group:
+                    if hist_kind=='OPENING':
+                        prev,prev_beq,prev_date=last_close_detail(p['id'],hist_bar,(hist_date-timedelta(days=1)).isoformat())
+                        default=float(prev or 0); default_beq=prev_beq
+                        ref_txt=(f"Último cierre previo ({prev_date}): {_count_text(p,prev,prev_beq)}" if prev is not None or prev_beq is not None else "Sin cierre previo registrado")
+                    else:
+                        op_rec=_latest_product_count(hist_date.isoformat(),p['id'],'OPENING',hist_bar,hist_cycle)
+                        default=float(op_rec['qty_base'] or 0) if op_rec is not None else 0.0
+                        default_beq=float(op_rec['qty_bottle_equiv']) if op_rec is not None and op_rec['qty_bottle_equiv'] is not None else None
+                        ref_txt=(f"Apertura histórica: {_count_text(p,default,default_beq)}" if op_rec is not None else "Sin apertura para este producto")
+                    with st.expander(product_label(p),expanded=True):
+                        st.info("📌 "+ref_txt)
+                        rr=bottle_count_input(p,f"hist_{hist_kind}_{hist_cycle}_{hist_date}_{p['id']}",default,default_beq)
+                        hist_counts.append({'pid':p['id'],'lid':hist_bar,'qty':rr['base'],'prev':None,'var':None,'obs':'','bottle_equiv':rr['bottles'],'name':p['name'],'category':p['category']})
+            hist_zero=[x['name'] for x in hist_counts if ((x['category']=='Cerveza' and float(x['qty'] or 0)<=0) or (x['category']=='Licor' and float(x.get('bottle_equiv') or 0)<=0))]
+            hist_zero_ok=True
+            if hist_zero:
+                st.warning("Productos históricos en cero: "+", ".join(hist_zero))
+                hist_zero_ok=st.checkbox("Confirmo que esos productos estaban realmente en cero según el registro en papel.",key='hist_zero_confirm')
+            hist_ack=st.checkbox("Confirmo que estoy transcribiendo datos históricos y que la fecha operativa seleccionada corresponde al documento en papel.",key='hist_ack')
+            if st.button("Guardar registro histórico",type='secondary',width='stretch',key='save_historical_inventory'):
+                if hist_kind=='CLOSING' and not hist_opening:
+                    st.error("No se puede guardar el cierre histórico sin una apertura del mismo día/ciclo.")
+                elif not hist_zero_ok:
+                    st.error("Confirma los productos históricos en cero antes de guardar.")
+                elif not hist_ack:
+                    st.error("Debes confirmar que se trata de una transcripción histórica.")
+                else:
+                    operator_txt=hist_operator if hist_operator!='No especificado' else 'No especificado'
+                    audit=f"[REGISTRO HISTÓRICO ingresado por Developer/Owner el {local_now().strftime('%d/%m/%Y %I:%M:%S %p')} · Responsable reportado: {operator_txt} · Fuente: {hist_source or 'sin referencia'}]"
+                    full_notes=(audit+("\n"+hist_general.strip() if hist_general.strip() else '')).strip()
+                    pair=(int(hist_opening['id']) if hist_kind=='CLOSING' and hist_opening else None)
+                    result=save_historical_session(hist_kind,hist_counts,hist_date,full_notes,hist_cycle,pair)
+                    if not result.get('ok'):
+                        st.error(result.get('error','No se pudo guardar el registro histórico.'))
+                    else:
+                        detail=("La captura ya existía y no se duplicó." if result.get('duplicate') else f"{len(hist_counts)} productos transcritos. El historial anterior se conserva.")
+                        if result.get('saved'):
+                            detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ Registro histórico guardado en SQLite; backup: {result.get('backup_message','pendiente')}")
+                        st.session_state['_inventory_flash']=operation_confirmation(f"Registro histórico de {'apertura' if hist_kind=='OPENING' else 'cierre'} guardado",hist_date,detail,result.get('created_at'))
+                        st.rerun()
+            st.divider()
+
         if owner_for_correction:
             st.subheader("Corrección controlada de una captura")
             st.caption("Herramienta de contingencia para corregir una captura guardada con tipo o fecha operativa incorrectos. No elimina conteos, usuario ni hora original; solo reclasifica la sesión y deja trazabilidad en Observaciones.")
@@ -3252,7 +3610,7 @@ elif page=='Administración':
                             audit_note=f"[CORRECCIÓN Developer/Owner {stamp}: {corr['session_type']} {corr['session_date']} → {corrected_type} {new_ds}]"
                             notes=(str(corr['notes'] or '').strip()+"\n"+audit_note).strip()
                             con.execute("UPDATE inventory_sessions SET session_date=?,session_type=?,paired_opening_session_id=?,notes=? WHERE id=?",(new_ds,corrected_type,paired,notes,corr['id']))
-                            con.commit(); backup_db_to_drive()
+                            con.commit(); backup_db()
                             st.success("Captura reclasificada sin borrar conteos, usuario ni timestamp original. Revisa el Dashboard y Detalle para auditoría.")
                             st.rerun()
             else:
@@ -3280,7 +3638,7 @@ elif page=='Administración':
                         con.execute("INSERT INTO settings(key,value) VALUES('sheet_history_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'")
                         con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
                         con.commit()
-                        backup_db_to_drive()
+                        backup_db()
                         st.success("Operación reiniciada en cero. Se eliminaron inventarios, POS/ventas y movimientos anteriores. Productos, recetas, usuarios, roles y configuración permanecen intactos. El próximo conteo será la nueva línea base.")
                         st.rerun()
                     except Exception as e:
@@ -3295,4 +3653,4 @@ elif page=='Administración':
         tl=st.number_input("Tolerancia licor (oz)",min_value=0.0,value=float(setting('tolerance_liquor','1')),step=.25)
         if st.button("Guardar configuración",type="primary"):
             for k,v in [('safety_stock_pct',safety),('tolerance_beer',tb),('tolerance_liquor',tl)]: con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,str(v)))
-            con.commit(); st.success("Configuración guardada.")
+            con.commit(); backup_db(); st.success("Configuración guardada.")
