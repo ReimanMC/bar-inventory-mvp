@@ -1,77 +1,90 @@
-# Inventario La Ramona — V0.5.1
+# Inventario La Ramona — V0.5.2
 
 ## Objetivo de esta versión
 
-V0.5.1 es una versión de recuperación segura construida sobre V0.5.0. Su objetivo es restaurar automáticamente el último respaldo SQLite validado proporcionado por el Developer/Owner cuando Streamlit inicia con una base ausente o claramente reiniciada, sin sobrescribir una base que ya contiene operación válida.
+V0.5.2 prioriza tres puntos de operación: proteger la base SQLite con Supabase Storage, permitir al Developer/Owner reconstruir aperturas y cierres históricos conservados en papel, y evitar que una diferencia contra el cierre anterior bloquee una apertura válida.
 
-## Respaldo integrado y validado
+## 1. Backup automático en Supabase Storage
 
-El snapshot de recuperación integrado corresponde al archivo proporcionado por el Developer/Owner y fue validado con `PRAGMA quick_check = ok`.
+La configuración esperada en Streamlit Secrets es:
 
-Contenido del snapshot:
+```toml
+[supabase_backup]
+enabled = true
+api_url = "https://<project>.supabase.co"
+secret_key = "sb_secret_..."
+bucket = "la-ramona-inventory-backups"
+```
 
-- 12 usuarios autorizados y activos.
-- 67 productos.
-- 14 sesiones de inventario.
-- 309 conteos físicos.
-- 1 cóctel y 2 componentes de receta.
-- 0 movimientos registrados en ese respaldo.
-- 0 filas POS registradas en ese respaldo.
+La Secret Key nunca debe guardarse en GitHub.
 
-La restauración conserva nombres, emails, roles, permisos de Reporte Ejecutivo, fechas de login e historial existente exactamente como están en el respaldo. Todos los usuarios contenidos en el snapshot tienen `active = 1`.
+Después de cada escritura relevante confirmada, la app crea primero un snapshot consistente de SQLite mediante la API de backup de SQLite, valida el snapshot con `PRAGMA quick_check` y luego actualiza:
 
-## Recuperación automática segura
+- `latest/bar_inventory_v3.db` — se sobrescribe en cada cambio confirmado.
+- `daily/bar_inventory_YYYY-MM-DD.db` — un único archivo por día, sobrescrito durante ese día.
+- `weekly/bar_inventory_YYYY-Www.db` — un único archivo por semana, sobrescrito durante la semana.
 
-Antes de abrir SQLite, la aplicación:
+Esto evita generar un archivo nuevo por cada clic o por cada producto. El simple `last_login_at` de un usuario no dispara un backup.
 
-1. intenta el mecanismo de recuperación Drive ya existente, si está configurado;
-2. valida la base local con `PRAGMA quick_check` y tablas requeridas;
-3. si la base está ausente o presenta el patrón de reinicio observado (0 sesiones, 0 conteos y 0/1 usuarios), restaura el snapshot integrado;
-4. si la base ya tiene operación válida, no realiza ninguna restauración.
+En **Administración → Configuración → Respaldo automático** el Developer/Owner puede crear/verificar un backup manual. También se mantiene la descarga manual de SQLite.
 
-Antes de una recuperación automática sobre un archivo existente, intenta conservar una copia local de contingencia con nombre `bar_inventory_v3_before_auto_recovery_*.db`.
+### Recuperación
 
-## Recuperación manual desde la aplicación
+Una vez exista al menos un `latest` válido en Supabase, si Streamlit pierde o reinicia la base local, V0.5.2 intenta recuperar ese `latest` validado antes de utilizar los mecanismos legacy de recuperación. Además, el Developer/Owner dispone de controles para verificar y restaurar manualmente `latest` desde Supabase.
 
-Solo el Developer/Owner dispone ahora de una sección **Administración → Configuración → Recuperación de base de datos**.
+## 2. Apertura: el conteo físico ya no se bloquea por diferencias de referencia
 
-Desde allí puede:
+El cierre anterior se mantiene como **guía visual**, no como una regla que impida guardar.
 
-- ver el estado de salud y los conteos de la base actual;
-- cargar un `.db`, `.sqlite` o `.sqlite3`;
-- validar integridad y tablas antes de restaurar;
-- visualizar usuarios activos, productos, sesiones, conteos, movimientos y POS del respaldo candidato;
-- confirmar la restauración escribiendo `RESTAURAR BASE`;
-- reemplazar la base sin volver a desplegar código.
+Ejemplo:
 
-Antes de una restauración manual se conserva una copia local de contingencia `bar_inventory_v3_before_manual_restore_*.db`.
+- Último cierre: 42 botellas.
+- Nueva apertura física: 30 botellas.
 
-## Autorización de usuarios restaurados
+La apertura de 30 se guarda. La app puede mostrar una advertencia y una observación opcional, pero no exige una explicación para aceptar el conteo.
 
-Los 12 usuarios incluidos en el respaldo están activos. Se conservan sus roles:
+La diferencia entre cierre anterior y nueva apertura **no se interpreta como venta del nuevo turno**. Las ventas y diferencias del día se calculan después con la lógica operativa:
 
-- ADMIN / Developer-Owner.
-- MANAGER.
-- GENERAL_MANAGER.
-- STAFF.
+`Salida física = Apertura + Entradas al bar − Cierre`
 
-La cuenta configurada en `bootstrap_admin_email` continúa teniendo la protección existente: al iniciar sesión se garantiza que permanezca activa como ADMIN y con acceso al Reporte Ejecutivo.
+`Venta por conteo = Salida física − Pruebas − Desperdicios − Cortesías − Roturas`
 
-## Importante sobre el alcance del respaldo
+`Diferencia = Venta por conteo − Ventas POS`
 
-V0.5.1 restaura únicamente lo que existe físicamente en el respaldo suministrado. No reconstruye registros que nunca llegaron a SQLite. En particular, el snapshot conserva la información existente hasta la apertura registrada del 03/09; no inventa un cierre posterior que no esté contenido en el archivo.
+La diferencia puede ser positiva o negativa; ambas direcciones generan revisión cuando superan la tolerancia configurada. Si el POS aún no está confirmado, la comparación queda pendiente y no genera una falsa alerta.
 
-## Persistencia
+## 3. Carga histórica para Developer/Owner
 
-El snapshot integrado funciona como un **piso de recuperación**, no como backup continuo. Los registros nuevos posteriores a ese snapshot siguen necesitando respaldo periódico. La opción **Descargar copia de la base SQLite** continúa disponible y más adelante debe complementarse con un almacenamiento persistente automático.
+En **Administración → Configuración → Carga histórica de Apertura / Cierre**, solo el Developer/Owner puede transcribir registros conservados en papel.
 
-## Compatibilidad
+Se puede seleccionar:
 
-No requiere cambios en:
+- Fecha operativa histórica.
+- Apertura o Cierre.
+- Ciclo Diario o Semanal.
+- Todo el inventario, solo cervezas o solo licores.
+- Responsable indicado en el papel (opcional).
+- Fuente/referencia y observación histórica.
 
-- `requirements.txt`;
-- Google OAuth;
-- Streamlit Secrets;
-- assets/logo.
+La fecha/hora real en la que el Developer hace la digitación se conserva para auditoría. Los datos históricos anteriores no se borran: una nueva captura queda como un registro adicional y puede convertirse en la referencia más reciente para los productos transcritos en esa fecha.
 
-Para desplegar la recuperación automática basta con reemplazar `app.py`. El paquete también incluye `bar_inventory_v3.db` y `bar_inventory_restore_2026_09_03.db` como copias verificables del respaldo fuente.
+Para registrar un **Cierre histórico**, primero debe existir una **Apertura del mismo día y ciclo**, de modo que las métricas del Dashboard y abastecimiento puedan reconciliar correctamente ambos conteos.
+
+## 4. Trazabilidad y cálculo
+
+Se conserva la lógica ya estabilizada de la aplicación:
+
+- Sesiones parciales por cerveza/licor sin perder capturas anteriores.
+- Apertura → Cierre → nueva Apertura en el flujo operativo en vivo.
+- Cierres después de medianoche vinculados a la fecha operativa de la apertura.
+- Conteos de licor en botellas equivalentes y oz cuando la presentación en ml está disponible.
+- POS de cervezas, cócteles, shots y botellas de licor.
+- Ajustes por pruebas, desperdicios, cortesías y roturas.
+- Dashboard con salida física, venta por conteo, POS, diferencia, alertas y auditoría.
+- Abastecimiento basado en días comparables, stock disponible y proyección a 7 días.
+
+## Actualización
+
+Para V0.5.2 solo es necesario reemplazar `app.py`. No es necesario modificar `requirements.txt`, ya que la integración con Supabase Storage usa la biblioteca estándar de Python.
+
+No subas archivos `.db` a GitHub.
