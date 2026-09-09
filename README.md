@@ -1,3 +1,9 @@
+# V0.5.6 — Safe Supabase manifest bootstrap
+
+This maintenance release fixes first-run synchronization after upgrading from the legacy Supabase backup layout. Supabase Storage can report a missing object as HTTP 400 with an embedded `statusCode: 404` / `NoSuchKey`; V0.5.5 treated that response as a connection failure and entered protected mode before it could create `latest/manifest.json`. V0.5.6 recognizes all supported missing-object responses as an expected bootstrap state, falls back to the validated legacy `latest/bar_inventory_v3.db`, compares it with the local SQLite database, and safely initializes the two-slot manifest architecture without overwriting a newer or divergent copy.
+
+The protected synchronization rules remain unchanged: stale local databases cannot overwrite newer remote data, divergent branches are blocked, SQLite writes remain transactional, and verified backups continue to publish through revision slots, rolling `latest`, daily and weekly files, with the manifest written last.
+
 # Inventario La Ramona — V0.5.5
 
 ## Objetivo de esta versión
