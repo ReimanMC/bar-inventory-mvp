@@ -1,158 +1,163 @@
-# Inventario La Ramona — V0.5.4
+# Inventario La Ramona — V0.5.5
 
 ## Objetivo de esta versión
 
-V0.5.4 conserva todos los cambios de V0.5.3 y simplifica la **Carga histórica de Apertura / Cierre** para los casos reales en los que el inventario se hizo físicamente en papel porque la aplicación presentó un inconveniente.
+V0.5.5 corrige el problema de persistencia/sincronización que permitía que una copia local antigua de SQLite volviera a sobrescribir el respaldo `latest` de Supabase. La versión conserva la lógica funcional de V0.5.4 y añade una capa de control de versiones para proteger la operación diaria.
 
-## 1. Transcripción histórica sin bloqueos por valores en cero
+## 1. Supabase pasa a ser la referencia durable de recuperación
 
-Ruta: **Administración → Configuración → Carga histórica de Apertura / Cierre**.
+En cada ejecución de Streamlit, antes de abrir SQLite, la aplicación valida la base local contra el último respaldo durable de Supabase.
 
-La transcripción histórica ya no exige confirmar individualmente que los productos con valor `0` estaban realmente en cero. Los valores digitados, incluidos los ceros, se guardan exactamente como aparecen en el registro físico en papel.
+- Si la base local está vacía/reiniciada y Supabase tiene una copia válida, se restaura Supabase automáticamente antes de mostrar la interfaz.
+- Si Supabase contiene una versión más reciente y la base local no tiene cambios propios pendientes, se actualiza la base local automáticamente.
+- Si local y Supabase contienen exactamente los mismos datos, la aplicación continúa normalmente.
+- Si ambos lados cambiaron de forma independiente, la aplicación declara **conflicto** y no permite que una rama sobrescriba silenciosamente a la otra.
 
-Solo se requiere una confirmación general:
+La recuperación integrada antigua y Google Drive quedan únicamente como contingencias posteriores; nunca pueden degradar un respaldo válido de Supabase.
 
-> Confirmo que este conteo fue realizado físicamente y quedó registrado en papel debido a un inconveniente del sistema, y que los valores digitados corresponden al registro físico.
+## 2. Manifest + dos slots seguros
 
-Esto evita que una captura legítima quede bloqueada porque uno o varios productos tengan cero o porque falte una sesión previa en la aplicación.
+V0.5.5 ya no confía únicamente en `latest/bar_inventory_v3.db`.
 
-## 2. Cierre histórico sin Apertura previa en el sistema
+Supabase mantiene:
 
-Si existe un Cierre en papel pero la Apertura correspondiente nunca pudo guardarse en la aplicación, el Developer/Owner puede transcribir el Cierre igualmente.
+- `latest/bar_inventory_v3.db`
+- `latest/manifest.json`
+- `revisions/slot_a.db`
+- `revisions/slot_b.db`
+- `daily/bar_inventory_YYYY-MM-DD.db`
+- `weekly/bar_inventory_YYYY-Www.db`
 
-- El Cierre se conserva como una captura histórica independiente.
-- No se inventa una Apertura ni se modifica otro día.
-- Las comparaciones Apertura→Cierre permanecen **pendientes** hasta que exista una Apertura compatible.
-- No se generan diferencias falsas, ventas por conteo falsas ni alertas por ausencia de la Apertura.
-- Si posteriormente se transcribe la Apertura faltante, el sistema puede utilizar ambas capturas dentro de la misma fecha/ciclo.
+Cada escritura confirmada usa el slot inactivo, verifica SHA-256 y solo después publica el `manifest.json`. El manifest es el punto de recuperación confirmado. Esto evita que una carga parcial o un `latest` viejo se convierta en la fuente de restauración.
 
-## 3. Auditoría y trazabilidad
+Los dos slots se alternan y se sobrescriben, por lo que no se crean cientos de archivos de revisión.
 
-Cada captura histórica conserva:
+## 3. Protección contra una base local antigua
 
-- fecha operativa histórica seleccionada;
-- tipo de registro: Apertura o Cierre;
-- ciclo Diario/Semanal;
-- responsable indicado en el documento de papel cuando se conoce;
-- usuario Developer/Owner que realiza la digitación;
-- fecha/hora real de transcripción;
-- fuente/referencia y observaciones;
-- estado de vinculación con la Apertura cuando se trata de un Cierre.
+Antes de publicar en Supabase la aplicación compara:
 
-Después de guardar, el backup automático de Supabase continúa actualizando `latest`, `daily` y `weekly`.
+- revisión remota;
+- huella lógica SHA-256 de los datos;
+- sesiones de inventario;
+- conteos;
+- movimientos;
+- POS;
+- productos, usuarios y recetas.
 
-## 4. Gestión segura de productos duplicados
+Una base local antigua no puede avanzar `latest` si partió de una revisión remota anterior.
 
-Se mantiene íntegramente la funcionalidad V0.5.3 en **Administración → Productos → Gestionar producto duplicado**:
+Si ocurre una divergencia, la copia local se intenta conservar también en:
 
-- eliminación definitiva cuando no existen referencias;
-- eliminación segura cuando todas las referencias históricas tienen cantidad cero y no existen recetas con el producto;
-- desactivación cuando debe conservarse el historial;
-- fusión protegida con el producto correcto;
-- auditoría de cambios de catálogo;
-- backup automático en Supabase después de cada acción.
+- `conflicts/latest_conflict.db`
+- `conflicts/conflict_YYYY-MM-DD.db`
 
-## 5. Funciones preservadas
+sin modificar el `latest` válido.
 
-V0.5.4 no modifica la lógica ya estabilizada de:
+## 4. Estado de sincronización visible para Developer/Owner
 
-- Apertura/Cierre operativo;
-- reconciliación física;
-- venta por conteo;
-- POS pendiente hasta confirmación manual;
-- pruebas, desperdicios, cortesías y roturas;
-- Dashboard y alertas;
-- abastecimiento;
-- recetas y licores en oz + botellas equivalentes;
-- usuarios, roles y permisos;
-- backup/restauración Supabase;
-- recuperación SQLite y auditoría histórica.
+Ruta: **Administración → Configuración → Estado de sincronización**.
 
+La pantalla muestra lado a lado:
 
----
+- Local: productos, sesiones, conteos, movimientos y POS.
+- Supabase: productos, sesiones, conteos, movimientos y POS.
+- revisión activa;
+- huella de datos;
+- estado del preflight de esa ejecución.
 
-# Referencia de cambios V0.5.3
+Cuando ambos contienen la misma información aparece **✅ Sincronizado**.
 
-## Objetivo de esta versión
+## 5. Modo protegido
 
-V0.5.3 mantiene intacta la lógica operativa de V0.5.2 y añade una herramienta segura, exclusiva para Developer/Owner, para gestionar productos creados por duplicado sin perder trazabilidad ni alterar inventarios, POS, movimientos o recetas.
+Si se detecta un conflicto real o no es posible validar Supabase durante una ejecución:
 
-## 1. Gestión segura de productos duplicados
+- los usuarios operativos no pueden continuar creando nuevas capturas en esa ejecución;
+- Developer/Owner puede entrar a Administración para revisar recuperación/sincronización;
+- no se permite que una base dudosa sobrescriba el respaldo durable.
 
-Ruta: **Administración → Productos → Gestionar producto duplicado**.
+La prioridad es conservar datos antes que aceptar una escritura que pueda quedar únicamente en almacenamiento temporal.
 
-Antes de permitir una acción, la app revisa todas las relaciones del producto en:
+## 6. SQLite más seguro en Streamlit
 
-- `inventory_counts` — conteos históricos de Apertura/Cierre.
-- `movements` — proveedor, traslados, pruebas, desperdicios, cortesías y roturas.
-- `pos_sales` — ventas POS manuales.
-- `recipes` — ingredientes de cócteles.
+La conexión SQLite se abre por ejecución con:
 
-La interfaz muestra cuántas filas existen en cada módulo y cuántas contienen una cantidad distinta de cero.
+- `PRAGMA foreign_keys=ON`
+- `PRAGMA busy_timeout=30000`
+- `PRAGMA journal_mode=WAL`
+- `PRAGMA synchronous=FULL`
 
-### Caso A — 0 registros relacionados
+También se eliminó la conexión SQLite persistente en `st.cache_resource`, evitando que una sesión mantenga abierto un handle hacia un archivo anterior después de una restauración.
 
-Si el producto nunca fue utilizado (`0` referencias totales), se habilita **Eliminar producto definitivamente**. La eliminación es segura porque no existe información operativa que dependa de ese producto.
+Las restauraciones eliminan sidecars WAL/SHM antiguos antes de reemplazar el archivo principal.
 
-### Caso B — solo referencias con cantidad 0
+## 7. Backup después de escrituras confirmadas
 
-Si el duplicado tiene filas históricas pero **todas las cantidades son 0**, no tiene movimientos/POS con valor y **no participa en recetas**, se habilita **Eliminar duplicado con referencias en cero**.
+Se conserva el flujo:
 
-La app elimina únicamente esas referencias cero y después retira el producto. Esto evita conservar un duplicado que nunca tuvo stock/venta real, sin borrar cantidades físicas ni ventas. La acción requiere escribir la frase de confirmación `ELIMINAR DUPLICADO CERO`.
+1. escritura/transacción SQLite;
+2. commit;
+3. snapshot consistente con SQLite Backup API;
+4. validación `PRAGMA quick_check`;
+5. digest lógico;
+6. carga al slot seguro;
+7. verificación SHA-256;
+8. actualización de `latest`, `daily` y `weekly`;
+9. publicación final de `manifest.json`.
 
-> Importante: un conteo actual de stock igual a 0 no basta para borrar un producto. La app comprueba también todo su historial.
+Las capturas de Apertura/Cierre mantienen `BEGIN IMMEDIATE` y protección contra reintentos/doble submit.
 
-### Caso C — el producto sí tiene información con valor
+## 8. Lógica operativa preservada
 
-No se permite el borrado directo. El Developer/Owner puede:
+V0.5.5 conserva lo ya validado en versiones anteriores:
 
-- **Desactivar producto**: deja de aparecer en nuevos inventarios/operaciones, pero conserva todo el historial.
-- **Fusionar con el producto correcto**: reasigna sus conteos, movimientos, POS y recetas al producto seleccionado y retira el duplicado.
-
-La fusión automática se bloquea si:
-
-- los productos pertenecen a categorías diferentes;
-- ambos tienen presentaciones `ml` conocidas y diferentes;
-- los tipos de envase son diferentes;
-- existen sesiones donde ambos productos tienen conteos no cero;
-- ambos aparecen con cantidades en la misma receta.
-
-Estas restricciones evitan sumar inventarios accidentalmente o reinterpretar botellas históricas con una presentación incorrecta.
-
-## 2. Auditoría de cambios de catálogo
-
-V0.5.3 crea la tabla `product_admin_audit`. Toda acción de eliminación, limpieza de referencias cero, fusión, desactivación o reactivación registra:
-
-- producto origen;
-- producto destino cuando aplica;
-- usuario Developer/Owner;
-- fecha/hora real;
-- tipo de acción;
-- resumen de referencias que existían antes del cambio.
-
-Después de cada acción confirmada se ejecuta inmediatamente el backup normal de la aplicación, por lo que `latest`, `daily` y `weekly` de Supabase quedan actualizados.
-
-## 3. Detección de posibles duplicados
-
-La sección muestra posibles duplicados utilizando una comparación normalizada por categoría y nombre (ignora mayúsculas, acentos y separadores). La selección para actuar se realiza por nombre, categoría y presentación; no es necesario memorizar IDs internos.
-
-## 4. Lo que no cambia
-
-Se conserva todo lo estabilizado en V0.5.2:
-
-- backup automático y restauración con Supabase Storage;
-- `latest`, `daily` y `weekly`;
-- carga histórica de Apertura/Cierre para Developer/Owner;
 - flujo Apertura → Cierre → nueva Apertura;
-- cierres después de medianoche asociados a la fecha operativa correcta;
-- conteos parciales y trazabilidad por usuario/hora;
-- licores en botellas equivalentes y oz cuando existe presentación en ml;
-- POS pendiente hasta que sea cargado o confirmado explícitamente;
-- salida física, venta por conteo, diferencias y alertas del Dashboard;
-- abastecimiento y reporte ejecutivo.
+- cierre después de medianoche asociado a la fecha operativa correcta;
+- capturas parciales por cerveza/licor con trazabilidad por usuario y hora;
+- inventario diario: todas las cervezas + licores principales;
+- inventario semanal: todas las cervezas + todos los licores activos;
+- licor en botellas equivalentes y oz cuando existe presentación en ml;
+- salida física y venta por conteo nunca negativas;
+- ajustes por pruebas, desperdicios, cortesías y roturas;
+- POS manual pendiente hasta que se cargue/confirme;
+- diferencia = venta por conteo − POS solo cuando POS está confirmado;
+- Dashboard, periodos históricos, alertas y abastecimiento;
+- carga histórica de Apertura/Cierre para Developer/Owner;
+- gestión segura de productos duplicados;
+- roles y permisos de Reporte Ejecutivo;
+- zona horaria `America/Toronto`.
 
-## Actualización
+## 9. Validación realizada antes de entrega
 
-Para V0.5.3 solo es necesario reemplazar `app.py` y, opcionalmente, actualizar este `README.md`. No cambia `requirements.txt`, Secrets ni la estructura existente de Supabase.
+Se verificó:
 
-No subas archivos `.db` a GitHub.
+- sintaxis completa de `app.py` con `py_compile` y AST;
+- integridad de los backups reales de referencia;
+- detección de una base antigua `14 sesiones / 309 conteos` frente a una base más completa `19 sesiones / 386 conteos`;
+- restauración automática de una base local antigua cuando el remoto domina;
+- bloqueo de ramas divergentes;
+- preservación de una copia de conflicto sin modificar el manifest válido;
+- creación inicial del manifest;
+- rotación segura `slot_b → slot_a`;
+- recuperación desde el slot confirmado aunque `latest/bar_inventory_v3.db` sea reemplazado por una copia vieja;
+- reconciliación física: apertura 42, cierre 30 = salida/venta por conteo 12; ajustes reducen venta por conteo; stock aumentado no se convierte en consumo negativo.
+
+## 10. Actualización
+
+Para V0.5.5 solo debes reemplazar:
+
+- `app.py`
+- `README.md` (documentación)
+
+No cambia `requirements.txt`, los Secrets ni el bucket existente de Supabase.
+
+**No subas archivos `.db`, `__pycache__`, `.pyc` ni Secrets a GitHub.**
+
+### Verificación recomendada después del deploy
+
+1. Evita que managers registren datos durante los 2–3 minutos del redeploy.
+2. Entra como Developer/Owner.
+3. Ve a **Administración → Configuración → Estado de sincronización**.
+4. Confirma que Local y Supabase muestran los mismos totales.
+5. Debe aparecer **✅ Sincronizado** y una revisión/huella.
+6. Verifica `latest/manifest.json`, `revisions/slot_a.db` o `slot_b.db`, `daily` y `weekly` en Supabase.
+7. Solo después reanuda Aperturas/Cierres/POS.
