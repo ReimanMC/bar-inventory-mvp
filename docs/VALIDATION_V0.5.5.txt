@@ -1,23 +1,21 @@
-Inventario La Ramona — V0.5.5 validation summary
+La Ramona Inventory MVP - V0.5.6 validation
 
-Checks completed before delivery:
-- app.py parsed successfully with Python AST.
-- app.py compiled successfully with py_compile.
-- Real backup comparison: stale 14 sessions / 309 counts vs newer 19 sessions / 386 counts.
-- Stale legacy local -> remote auto-restore: PASS.
-- Stale synchronized local -> newer remote auto-restore: PASS.
-- Divergent local/remote branches -> conflict, no overwrite: PASS.
-- Local unbacked change from current remote revision preserved: PASS.
-- First manifest bootstrap: PASS.
-- Two-slot safe rotation B -> A: PASS.
-- Recovery follows manifest safe slot rather than mutable rolling latest: PASS.
-- Stale writer cannot overwrite current manifest: PASS.
-- Conflict copy preserved separately: PASS.
-- Reconciliation 42 opening / 30 closing = 12 physical/count sale: PASS.
-- Negative physical consumption prevention: PASS.
-- Adjustment reduction of count sale: PASS.
-- Feature audit: historical load, duplicate product management, daily/weekly inventory, Pending POS,
-  Ontario timezone, manager/admin permissions, manual SQLite download, sync status UI: PASS.
+Scope
+- Supabase Storage first-manifest bootstrap after upgrading from legacy latest/daily/weekly backups.
+- Missing-object handling for Supabase responses.
+- Preservation of V0.5.5 anti-regression rules.
 
-Important: runtime integration with the user's real Supabase credentials must be verified after deploy from
-Administration > Configuration > Sync status. No credentials are embedded in these files.
+Verified
+1. Python syntax/AST compilation: PASS.
+2. Missing Storage object returned as HTTP 404: recognized as optional/missing, not connection failure.
+3. Missing Storage object returned as HTTP 400 with statusCode=404, error=not_found, message=Object not found, code=NoSuchKey: recognized as optional/missing, not connection failure.
+4. Authentication/server errors (401/500): remain real errors and are NOT suppressed.
+5. With no manifest, sync falls back to legacy latest/bar_inventory_v3.db for safe comparison.
+6. Equal local/legacy latest permits automatic creation of revision slot + manifest.
+7. More-complete remote legacy latest still wins during preflight.
+8. More-complete local legacy DB can bootstrap remote only through the guarded backup path.
+9. Divergent/incomparable local and remote branches remain blocked from overwriting each other.
+10. Manifest-based recovery and slot validation remain unchanged after bootstrap.
+
+Root cause fixed
+Supabase Storage may return HTTP 400 while the JSON body reports a missing object (statusCode 404 / NoSuchKey). V0.5.5 only treated literal HTTP 404 as a normal missing manifest, which caused first-run protected mode and prevented manifest creation.
