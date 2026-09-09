@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse
+import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse, uuid
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -200,7 +200,8 @@ try:
 except Exception:
     pass
 
-def page_header(title, subtitle="", badge="V0.5.1"):
+def page_header(title, subtitle="", badge=None):
+    badge = badge or f"V{APP_VERSION}"
     st.markdown(f"""
     <div class="ramona-page-header">
       <div>
@@ -263,7 +264,21 @@ def operation_confirmation(action, business_date=None, detail="", event_ts=None)
         parts.append(str(detail))
     return "  \n".join(parts)
 
-# ---------------------- Supabase Storage backup (primary) ----------------------
+# ---------------------- Supabase Storage backup + safe synchronization ----------------------
+# V0.5.5 persistence model:
+# - SQLite remains the transactional working database for the Streamlit process.
+# - Supabase Storage is the durable source of recovery and version coordination.
+# - Every committed business write creates a verified SQLite snapshot.
+# - A manifest is written LAST and points to an immutable revision object. This prevents a
+#   partially uploaded `latest` file from becoming the recovery source.
+# - A stale local database is never allowed to overwrite a newer remote revision.
+# - If both sides changed independently, the local snapshot is preserved under conflicts/
+#   and `latest` is left untouched for Developer/Owner review.
+SYNC_PREFLIGHT_STATUS={"status":"not_checked","message":"","remote_health":None,"local_health":None}
+SYNC_MANIFEST_PATH='latest/manifest.json'
+SYNC_LATEST_PATH='latest/bar_inventory_v3.db'
+
+
 def _supabase_cfg():
     try:
         sec=st.secrets.get("supabase_backup", {})
@@ -297,18 +312,190 @@ def _supabase_object_url(remote_path, authenticated=False):
     return f"{cfg['api_url']}/storage/v1/object/{mode}{bucket}/{path}"
 
 
-def _safe_sqlite_snapshot():
-    """Create a consistent SQLite snapshot without copying a file mid-write."""
-    if not os.path.exists(DB):
-        raise FileNotFoundError(DB)
+def _supabase_upload_bytes(payload,remote_path,content_type='application/octet-stream'):
+    req=urllib.request.Request(
+        _supabase_object_url(remote_path),data=payload,method='POST',
+        headers=_supabase_headers({
+            'Content-Type':content_type,
+            'x-upsert':'true',
+            'Cache-Control':'no-cache',
+        })
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=25) as resp:
+            return 200 <= int(getattr(resp,'status',200)) < 300
+    except urllib.error.HTTPError as e:
+        body=e.read().decode('utf-8','ignore')[:700]
+        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+
+
+def _supabase_download(remote_path):
+    req=urllib.request.Request(
+        _supabase_object_url(remote_path,authenticated=True),method='GET',
+        headers=_supabase_headers({'Cache-Control':'no-cache'})
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=25) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body=e.read().decode('utf-8','ignore')[:700]
+        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+
+
+def _supabase_download_optional(remote_path):
+    try:
+        return _supabase_download(remote_path)
+    except RuntimeError as e:
+        # A missing manifest is normal on the first V0.5.5 run.
+        if 'HTTP 404' in str(e):
+            return None
+        raise
+
+
+def _sqlite_health(path):
+    """Read-only integrity and business-row summary for recovery/sync decisions."""
+    info={"valid":False,"reason":"","users":0,"active_users":0,"products":0,
+          "inventory_sessions":0,"inventory_counts":0,"movements":0,"pos_sales":0,
+          "pos_batches":0,"cocktails":0,"recipes":0,"product_admin_audit":0,
+          "last_session_date":None,"last_event_at":None,"size_bytes":0}
+    if not path or not os.path.exists(path) or os.path.getsize(path)<=0:
+        info["reason"]="missing_or_empty"
+        return info
+    info['size_bytes']=int(os.path.getsize(path))
+    c=None
+    try:
+        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=15)
+        quick=c.execute("PRAGMA quick_check").fetchone()
+        if not quick or str(quick[0]).lower()!="ok":
+            info["reason"]="quick_check_failed"
+            return info
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        missing=RECOVERY_REQUIRED_TABLES-tables
+        if missing:
+            info["reason"]="missing_tables:"+",".join(sorted(missing))
+            return info
+        def count_table(name):
+            return int(c.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) if name in tables else 0
+        info["users"]=count_table('users')
+        info["active_users"]=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
+        for key,table in [('products','products'),('inventory_sessions','inventory_sessions'),('inventory_counts','inventory_counts'),
+                          ('movements','movements'),('pos_sales','pos_sales'),('pos_batches','pos_batches'),('cocktails','cocktails'),
+                          ('recipes','recipes'),('product_admin_audit','product_admin_audit')]:
+            info[key]=count_table(table)
+        r=c.execute("SELECT MAX(session_date) FROM inventory_sessions").fetchone()
+        info['last_session_date']=r[0] if r else None
+        event_values=[]
+        for table in ('inventory_sessions','movements','pos_sales','pos_batches','product_admin_audit'):
+            if table in tables:
+                cols={x[1] for x in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                if 'created_at' in cols:
+                    rr=c.execute(f"SELECT MAX(created_at) FROM {table}").fetchone()
+                    if rr and rr[0]: event_values.append(str(rr[0]))
+        info['last_event_at']=max(event_values) if event_values else None
+        info["valid"]=True; info["reason"]="ok"
+        return info
+    except Exception as e:
+        info["reason"]=f"sqlite_error:{e}"
+        return info
+    finally:
+        if c is not None:
+            try: c.close()
+            except Exception: pass
+
+
+_DIGEST_TABLES=(
+    'users','categories','products','locations','inventory_sessions','inventory_counts','movements',
+    'cocktails','recipes','pos_sales','pos_batches','settings','legacy_rows','product_admin_audit'
+)
+_DIGEST_EXCLUDE_COLUMNS={'users':{'last_login_at'}}
+
+
+def _db_data_digest(path):
+    """Canonical SHA-256 of durable application data, excluding sync metadata and login heartbeat.
+
+    The digest is intentionally independent from the SQLite file layout/WAL and therefore remains
+    stable after VACUUM, backup API copies and ordinary reads.
+    """
+    if not path or not os.path.exists(path): return None
+    c=None; h=hashlib.sha256()
+    try:
+        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=15)
+        c.row_factory=sqlite3.Row
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        for table in _DIGEST_TABLES:
+            if table not in tables: continue
+            cols=[r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+            cols=[x for x in cols if x not in _DIGEST_EXCLUDE_COLUMNS.get(table,set())]
+            if not cols: continue
+            order='id' if 'id' in cols else ('key' if 'key' in cols else cols[0])
+            sql=f"SELECT {','.join('"'+x+'"' for x in cols)} FROM \"{table}\" ORDER BY \"{order}\""
+            h.update((table+'\n').encode())
+            for row in c.execute(sql):
+                vals=[]
+                for col in cols:
+                    v=row[col]
+                    if isinstance(v,float):
+                        v=round(v,9)
+                    vals.append(v)
+                h.update(json.dumps(vals,ensure_ascii=False,sort_keys=False,separators=(',',':'),default=str).encode('utf-8'))
+                h.update(b'\n')
+        return h.hexdigest()
+    finally:
+        if c is not None:
+            try: c.close()
+            except Exception: pass
+
+
+def _file_sha256(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as fh:
+        for chunk in iter(lambda:fh.read(1024*1024),b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_sync_state_path(path):
+    if not path or not os.path.exists(path): return None
+    c=None
+    try:
+        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=10)
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if 'sync_state' not in tables: return None
+        c.row_factory=sqlite3.Row
+        r=c.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
+        return dict(r) if r else None
+    except Exception:
+        return None
+    finally:
+        if c is not None:
+            try:c.close()
+            except Exception:pass
+
+
+def _remote_manifest():
+    raw=_supabase_download_optional(SYNC_MANIFEST_PATH)
+    if not raw: return None
+    try:
+        data=json.loads(raw.decode('utf-8'))
+        if not isinstance(data,dict) or not data.get('revision') or not data.get('object_path') or not data.get('data_digest'):
+            raise ValueError('manifest incompleto')
+        return data
+    except Exception as e:
+        raise RuntimeError(f"Manifest de Supabase inválido: {e}")
+
+
+def _safe_sqlite_snapshot(source_path=None):
+    """Create a consistent SQLite snapshot using SQLite's online backup API."""
+    source_path=source_path or DB
+    if not os.path.exists(source_path): raise FileNotFoundError(source_path)
     fd,tmp=tempfile.mkstemp(prefix='ramona_snapshot_',suffix='.db'); os.close(fd)
     src=dst=None
     try:
-        src=sqlite3.connect(DB,timeout=15)
-        dst=sqlite3.connect(tmp)
+        src=sqlite3.connect(source_path,timeout=30)
+        src.execute('PRAGMA busy_timeout=30000')
+        dst=sqlite3.connect(tmp,timeout=30)
         src.backup(dst)
-        dst.commit()
-        dst.close(); dst=None
+        dst.commit(); dst.close(); dst=None
         src.close(); src=None
         check=_sqlite_health(tmp)
         if not check['valid']:
@@ -324,86 +511,165 @@ def _safe_sqlite_snapshot():
         raise
 
 
-def _supabase_upload_snapshot(snapshot_path,remote_path):
-    with open(snapshot_path,'rb') as fh:
-        payload=fh.read()
-    req=urllib.request.Request(
-        _supabase_object_url(remote_path),data=payload,method='POST',
-        headers=_supabase_headers({
-            'Content-Type':'application/octet-stream',
-            'x-upsert':'true',
-            'Cache-Control':'no-cache',
-        })
-    )
+def _write_sync_state_in_file(path,revision,base_digest,status='ok',message=''):
+    c=sqlite3.connect(path,timeout=30)
     try:
-        with urllib.request.urlopen(req,timeout=25) as resp:
-            return 200 <= int(getattr(resp,'status',200)) < 300
-    except urllib.error.HTTPError as e:
-        body=e.read().decode('utf-8','ignore')[:500]
-        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+        c.execute("""CREATE TABLE IF NOT EXISTS sync_state(
+          id INTEGER PRIMARY KEY CHECK(id=1), remote_revision TEXT, base_digest TEXT,
+          last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT)""")
+        c.execute("""INSERT INTO sync_state(id,remote_revision,base_digest,last_synced_at,last_backup_status,last_backup_message)
+                     VALUES(1,?,?,?,?,?)
+                     ON CONFLICT(id) DO UPDATE SET remote_revision=excluded.remote_revision,
+                       base_digest=excluded.base_digest,last_synced_at=excluded.last_synced_at,
+                       last_backup_status=excluded.last_backup_status,last_backup_message=excluded.last_backup_message""",
+                  (revision,base_digest,now_iso(),status,message[:1000]))
+        c.commit()
+    finally:
+        c.close()
 
 
-def _supabase_download(remote_path):
-    req=urllib.request.Request(
-        _supabase_object_url(remote_path,authenticated=True),method='GET',
-        headers=_supabase_headers({'Cache-Control':'no-cache'})
-    )
-    try:
-        with urllib.request.urlopen(req,timeout=25) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        body=e.read().decode('utf-8','ignore')[:500]
-        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+def _health_vector(h):
+    keys=('users','products','inventory_sessions','inventory_counts','movements','pos_sales','pos_batches','cocktails','recipes','product_admin_audit')
+    return tuple(int(h.get(k,0) or 0) for k in keys)
 
 
-def backup_db_to_supabase(force=False):
-    """Backup a verified snapshot to one rolling latest, one daily and one weekly file.
+def _dominance(a,b):
+    """Return 1 if a has every tracked row-count >= b and at least one greater; -1 reverse; 0 otherwise."""
+    va=_health_vector(a); vb=_health_vector(b)
+    if all(x>=y for x,y in zip(va,vb)) and any(x>y for x,y in zip(va,vb)): return 1
+    if all(x<=y for x,y in zip(va,vb)) and any(x<y for x,y in zip(va,vb)): return -1
+    return 0
 
-    `latest` is overwritten after each successful write. Daily and weekly filenames are
-    also upserted, so repeated operations do not create hundreds of files.
+
+def _atomic_replace_db(source_path,reason='sync'):
+    """Atomically replace the runtime DB after preserving the previous valid local file."""
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    if os.path.exists(DB) and os.path.getsize(DB)>0:
+        try: shutil.copy2(DB,f"bar_inventory_v3_before_{reason}_{stamp}.db")
+        except Exception: pass
+    # WAL sidecars belong to the previous database inode. They must not survive a
+    # file-level restore or SQLite may reject the replacement with disk I/O errors.
+    for sidecar in (DB+'-wal', DB+'-shm'):
+        try:
+            if os.path.exists(sidecar): os.remove(sidecar)
+        except Exception: pass
+    tmp_local=DB+'.incoming'
+    shutil.copy2(source_path,tmp_local)
+    os.replace(tmp_local,DB)
+    for sidecar in (DB+'-wal', DB+'-shm'):
+        try:
+            if os.path.exists(sidecar): os.remove(sidecar)
+        except Exception: pass
+
+
+def _remote_revision_to_temp():
+    """Return validated remote recovery DB, health, digest and manifest.
+
+    When V0.5.5 manifest exists, recovery uses its immutable revisions/<uuid>.db object.
+    Legacy deployments fall back to rolling latest/bar_inventory_v3.db.
     """
     if not _supabase_ready():
-        return False,"Supabase backup no configurado"
-    snap=None
+        return None,{"valid":False,"reason":"supabase_not_configured"},None,None
+    manifest=_remote_manifest()
+    remote_path=(manifest.get('object_path') if manifest else SYNC_LATEST_PATH)
+    raw=_supabase_download_optional(remote_path)
+    if raw is None:
+        return None,{"valid":False,"reason":"remote_missing"},None,manifest
+    fd,tmp=tempfile.mkstemp(prefix='ramona_remote_',suffix='.db'); os.close(fd)
     try:
-        snap,health=_safe_sqlite_snapshot()
-        today=local_today(); iso=today.isocalendar()
-        paths=[
-            'latest/bar_inventory_v3.db',
-            f"daily/bar_inventory_{today.isoformat()}.db",
-            f"weekly/bar_inventory_{iso.year}-W{iso.week:02d}.db",
-        ]
-        for remote in paths:
-            if not _supabase_upload_snapshot(snap,remote):
-                raise RuntimeError(f"No se confirmó la carga de {remote}")
-        stamp=local_now().isoformat(timespec='seconds')
-        st.session_state['_last_supabase_backup']=stamp
-        st.session_state['_last_supabase_backup_health']=health
-        st.session_state.pop('_supabase_backup_error',None)
-        return True,f"Backup Supabase OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos"
-    except Exception as e:
-        st.session_state['_supabase_backup_error']=str(e)
-        return False,f"No se pudo respaldar en Supabase: {e}"
-    finally:
-        if snap:
-            try: os.remove(snap)
-            except Exception: pass
-
-
-def restore_latest_from_supabase_to_temp():
-    """Download and validate latest backup. Does not replace the live DB."""
-    if not _supabase_ready():
-        return None,{"valid":False,"reason":"supabase_not_configured"}
-    raw=_supabase_download('latest/bar_inventory_v3.db')
-    fd,tmp=tempfile.mkstemp(prefix='ramona_supabase_restore_',suffix='.db'); os.close(fd)
-    with open(tmp,'wb') as fh:
-        fh.write(raw); fh.flush(); os.fsync(fh.fileno())
-    health=_sqlite_health(tmp)
-    if not health['valid']:
+        with open(tmp,'wb') as fh:
+            fh.write(raw); fh.flush()
+        health=_sqlite_health(tmp)
+        if not health['valid']:
+            raise RuntimeError(f"Backup remoto no válido: {health['reason']}")
+        digest=_db_data_digest(tmp)
+        if manifest:
+            if digest!=manifest.get('data_digest'):
+                raise RuntimeError('El digest del backup remoto no coincide con el manifest.')
+            expected_sha=manifest.get('file_sha256')
+            if expected_sha and _file_sha256(tmp)!=expected_sha:
+                raise RuntimeError('La huella SHA-256 del archivo remoto no coincide con el manifest.')
+        return tmp,health,digest,manifest
+    except Exception:
         try: os.remove(tmp)
         except Exception: pass
-        return None,health
-    return tmp,health
+        raise
+
+
+def _preflight_supabase_sync():
+    """Run before the app opens SQLite.
+
+    This is the central anti-regression rule: a local runtime copy that is older than the durable
+    remote copy is replaced BEFORE the UI or any write is allowed to use it. A divergent branch is
+    never auto-published over Supabase.
+    """
+    global SYNC_PREFLIGHT_STATUS, AUTO_RECOVERY_APPLIED
+    local_h=_sqlite_health(DB); SYNC_PREFLIGHT_STATUS['local_health']=local_h
+    if not _supabase_ready():
+        SYNC_PREFLIGHT_STATUS.update(status='offline',message='Supabase no configurado; se conserva la base local.')
+        return False
+    tmp=None
+    try:
+        tmp,remote_h,remote_digest,manifest=_remote_revision_to_temp()
+        SYNC_PREFLIGHT_STATUS['remote_health']=remote_h
+        if not tmp or not remote_h.get('valid'):
+            SYNC_PREFLIGHT_STATUS.update(status='remote_missing',message='Supabase no tiene todavía un backup válido.')
+            return False
+        local_reset=(not local_h.get('valid') or (local_h.get('inventory_sessions',0)==0 and local_h.get('inventory_counts',0)==0 and local_h.get('users',0)<=1))
+        if local_reset:
+            _atomic_replace_db(tmp,'supabase_recovery')
+            AUTO_RECOVERY_APPLIED=True
+            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Base local ausente/reiniciada; se recuperó Supabase antes de abrir la app.',local_health=remote_h)
+            return True
+        local_digest=_db_data_digest(DB)
+        if local_digest==remote_digest:
+            SYNC_PREFLIGHT_STATUS.update(status='synced',message='Base local y Supabase contienen los mismos datos.')
+            return False
+        sync_state=_read_sync_state_path(DB)
+        if manifest and sync_state:
+            local_base_rev=str(sync_state.get('remote_revision') or '')
+            local_base_digest=str(sync_state.get('base_digest') or '')
+            remote_rev=str(manifest.get('revision') or '')
+            if local_base_rev==remote_rev:
+                # Local data changed after the last synchronized remote revision. Preserve it; the
+                # next verified backup can safely advance remote from the same parent revision.
+                SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='Hay cambios locales pendientes de respaldar sobre la revisión remota actual.')
+                return False
+            if local_base_digest and local_digest==local_base_digest:
+                _atomic_replace_db(tmp,'supabase_newer')
+                AUTO_RECOVERY_APPLIED=True
+                SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase era más reciente; se actualizó la base local antes de continuar.',local_health=remote_h)
+                return True
+            # Both sides moved from different revisions. Never guess.
+            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            try: shutil.copy2(DB,f"bar_inventory_v3_sync_conflict_{stamp}.db")
+            except Exception: pass
+            SYNC_PREFLIGHT_STATUS.update(status='conflict',message='Conflicto de versiones: local y Supabase cambiaron independientemente. Se bloquea publicación automática.')
+            return False
+        # Legacy DB without V0.5.5 sync metadata: use conservative row-count dominance only.
+        dom=_dominance(remote_h,local_h)
+        if dom==1:
+            _atomic_replace_db(tmp,'supabase_legacy_newer')
+            AUTO_RECOVERY_APPLIED=True
+            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase contiene una base legacy más completa; se recuperó automáticamente.',local_health=remote_h)
+            return True
+        if dom==-1:
+            SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='La base local legacy contiene más datos que Supabase; se preserva para respaldo controlado.')
+            return False
+        # Same row counts but different durable data, or incomparable vectors => conflict.
+        stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        try: shutil.copy2(DB,f"bar_inventory_v3_sync_conflict_{stamp}.db")
+        except Exception: pass
+        SYNC_PREFLIGHT_STATUS.update(status='conflict',message='Local y Supabase difieren sin relación segura de antigüedad. No se sobrescribe ninguna copia.')
+        return False
+    except Exception as e:
+        SYNC_PREFLIGHT_STATUS.update(status='remote_error',message=f'No se pudo verificar Supabase: {e}')
+        return False
+    finally:
+        if tmp:
+            try: os.remove(tmp)
+            except Exception: pass
+
 
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
@@ -446,59 +712,157 @@ def backup_db_to_drive(force=False):
         st.session_state['_drive_backup_error']=str(e)
         return False,f"No se pudo respaldar en Drive: {e}"
 
-def backup_db(force=False):
-    """Primary backup dispatcher. Supabase wins when configured; Drive remains legacy fallback."""
-    if _supabase_ready():
-        return backup_db_to_supabase(force=force)
-    return backup_db_to_drive(force=force)
 
+def _save_conflict_snapshot(snapshot_path,local_digest,reason):
+    """Best-effort durable preservation of a divergent local branch without touching latest.
 
-def _sqlite_health(path):
-    """Read-only integrity/row-count check used before any recovery action."""
-    info={"valid":False,"reason":"","users":0,"active_users":0,"products":0,
-          "inventory_sessions":0,"inventory_counts":0,"movements":0,"pos_sales":0}
-    if not path or not os.path.exists(path) or os.path.getsize(path)<=0:
-        info["reason"]="missing_or_empty"
-        return info
-    c=None
+    Conflict storage is bounded: one rolling object plus one object per calendar day.
+    """
+    today=local_today().isoformat()
+    paths=['conflicts/latest_conflict.db',f'conflicts/conflict_{today}.db']
     try:
-        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True)
-        quick=c.execute("PRAGMA quick_check").fetchone()
-        if not quick or str(quick[0]).lower()!="ok":
-            info["reason"]="quick_check_failed"
-            return info
-        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        missing=RECOVERY_REQUIRED_TABLES-tables
-        if missing:
-            info["reason"]="missing_tables:"+",".join(sorted(missing))
-            return info
-        info["users"]=int(c.execute("SELECT COUNT(*) FROM users").fetchone()[0])
-        info["active_users"]=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
-        info["products"]=int(c.execute("SELECT COUNT(*) FROM products").fetchone()[0])
-        info["inventory_sessions"]=int(c.execute("SELECT COUNT(*) FROM inventory_sessions").fetchone()[0])
-        info["inventory_counts"]=int(c.execute("SELECT COUNT(*) FROM inventory_counts").fetchone()[0])
-        info["movements"]=int(c.execute("SELECT COUNT(*) FROM movements").fetchone()[0])
-        info["pos_sales"]=int(c.execute("SELECT COUNT(*) FROM pos_sales").fetchone()[0])
-        info["valid"]=True
-        info["reason"]="ok"
-        return info
+        with open(snapshot_path,'rb') as fh: payload=fh.read()
+        for remote in paths:
+            _supabase_upload_bytes(payload,remote)
+        return paths[0]
+    except Exception:
+        return None
+
+
+def backup_db_to_supabase(force=False,allow_bootstrap=True):
+    """Publish a verified DB revision without allowing stale-local regression.
+
+    Upload order is inactive safe slot -> rolling files -> manifest LAST. Recovery always trusts
+    the manifest's verified slot, not a possibly half-updated rolling file.
+    """
+    if not _supabase_ready(): return False,"Supabase backup no configurado"
+    snap=None
+    try:
+        snap,health=_safe_sqlite_snapshot()
+        local_digest=_db_data_digest(snap)
+        local_state=_read_sync_state_path(DB) or {}
+        manifest=_remote_manifest()
+        remote_digest=None
+        remote_rev=None
+        if manifest:
+            remote_digest=str(manifest.get('data_digest') or '')
+            remote_rev=str(manifest.get('revision') or '')
+            base_rev=str(local_state.get('remote_revision') or '')
+            base_digest=str(local_state.get('base_digest') or '')
+            if local_digest==remote_digest:
+                # Already durable. Just align local sync metadata; do not generate redundant revision.
+                _write_sync_state_in_file(DB,remote_rev,local_digest,'ok','Datos ya sincronizados con Supabase')
+                st.session_state['_last_supabase_backup']=str(manifest.get('created_at') or local_now().isoformat(timespec='seconds'))
+                st.session_state['_last_supabase_backup_health']=health
+                st.session_state.pop('_supabase_backup_error',None)
+                return True,f"Supabase ya sincronizado · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos"
+            if base_rev and base_rev!=remote_rev:
+                conflict_path=_save_conflict_snapshot(snap,local_digest,'remote revision advanced')
+                msg="Supabase tiene una revisión más reciente que la base desde la que partió esta instancia. latest NO fue sobrescrito."
+                if conflict_path: msg+=f" La copia local quedó preservada en {conflict_path}."
+                _write_sync_state_in_file(DB,base_rev,base_digest or local_digest,'conflict',msg)
+                st.session_state['_supabase_backup_error']=msg
+                return False,msg
+            if not base_rev:
+                # Upgrading a legacy DB. Never overwrite a remote legacy/latest with an incomparable branch.
+                tmp_r=None
+                try:
+                    tmp_r,rh,rd,_=_remote_revision_to_temp()
+                    if rd and rd!=local_digest:
+                        dom=_dominance(health,rh)
+                        if dom!=1:
+                            conflict_path=_save_conflict_snapshot(snap,local_digest,'legacy divergence')
+                            msg="Conflicto legacy detectado; latest se conservó intacto."
+                            if conflict_path: msg+=f" Copia local preservada en {conflict_path}."
+                            st.session_state['_supabase_backup_error']=msg
+                            return False,msg
+                finally:
+                    if tmp_r:
+                        try:os.remove(tmp_r)
+                        except Exception:pass
+        else:
+            # First manifest: compare against legacy rolling latest if it exists.
+            raw_latest=_supabase_download_optional(SYNC_LATEST_PATH)
+            if raw_latest:
+                fd,rtmp=tempfile.mkstemp(prefix='ramona_legacy_remote_',suffix='.db'); os.close(fd)
+                try:
+                    with open(rtmp,'wb') as fh: fh.write(raw_latest)
+                    rh=_sqlite_health(rtmp); rd=_db_data_digest(rtmp) if rh.get('valid') else None
+                    if rd and rd!=local_digest:
+                        dom=_dominance(health,rh)
+                        if dom!=1:
+                            conflict_path=_save_conflict_snapshot(snap,local_digest,'bootstrap divergence')
+                            msg="No se creó el manifest porque el latest legacy y la base local divergen. latest quedó protegido."
+                            if conflict_path: msg+=f" Copia local preservada en {conflict_path}."
+                            st.session_state['_supabase_backup_error']=msg
+                            return False,msg
+                finally:
+                    try:os.remove(rtmp)
+                    except Exception:pass
+        parent_revision=remote_rev
+        revision=uuid.uuid4().hex
+        created=local_now().isoformat(timespec='seconds')
+        # Two-slot crash-safe protocol. We always write the INACTIVE slot first. The manifest
+        # continues pointing to the previous slot until the new file has been fully verified.
+        current_slot=(str(manifest.get('slot') or 'a').lower() if manifest else 'a')
+        next_slot='b' if current_slot=='a' else 'a'
+        revision_path=f"revisions/slot_{next_slot}.db"
+        _write_sync_state_in_file(snap,revision,local_digest,'ok','Backup confirmado en Supabase')
+        file_sha=_file_sha256(snap)
+        with open(snap,'rb') as fh: payload=fh.read()
+        if not _supabase_upload_bytes(payload,revision_path): raise RuntimeError('No se confirmó la revisión segura')
+        # Verify inactive slot before it can become the manifest target.
+        verify_raw=_supabase_download(revision_path)
+        if hashlib.sha256(verify_raw).hexdigest()!=file_sha:
+            raise RuntimeError('La revisión subida no superó verificación SHA-256')
+        today=local_today(); iso=today.isocalendar()
+        rolling=[SYNC_LATEST_PATH,f"daily/bar_inventory_{today.isoformat()}.db",f"weekly/bar_inventory_{iso.year}-W{iso.week:02d}.db"]
+        for remote in rolling:
+            if not _supabase_upload_bytes(payload,remote): raise RuntimeError(f"No se confirmó la carga de {remote}")
+        manifest_new={
+            'schema':1,'revision':revision,'parent_revision':parent_revision,'created_at':created,'slot':next_slot,
+            'object_path':revision_path,'file_sha256':file_sha,'data_digest':local_digest,
+            'app_version':APP_VERSION,'health':health,
+        }
+        mbytes=json.dumps(manifest_new,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
+        if not _supabase_upload_bytes(mbytes,SYNC_MANIFEST_PATH,'application/json'):
+            raise RuntimeError('No se confirmó la publicación del manifest')
+        # Only after remote commit marker succeeds do we advance the live DB's base revision.
+        _write_sync_state_in_file(DB,revision,local_digest,'ok','Backup confirmado en Supabase')
+        st.session_state['_last_supabase_backup']=created
+        st.session_state['_last_supabase_backup_health']=health
+        st.session_state.pop('_supabase_backup_error',None)
+        return True,f"Backup Supabase OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos · rev {revision[:8]}"
     except Exception as e:
-        info["reason"]=f"sqlite_error:{e}"
-        return info
+        st.session_state['_supabase_backup_error']=str(e)
+        return False,f"No se pudo respaldar en Supabase sin riesgo de pérdida: {e}"
     finally:
-        if c is not None:
-            try: c.close()
+        if snap:
+            try: os.remove(snap)
             except Exception: pass
 
 
+def restore_latest_from_supabase_to_temp():
+    tmp,h,d,m=_remote_revision_to_temp()
+    if h.get('valid'):
+        h=dict(h); h['data_digest']=d; h['revision']=(m.get('revision') if m else None); h['manifest']=bool(m)
+    return tmp,h
+
+
+def backup_db(force=False):
+    """Primary backup dispatcher. Supabase is authoritative when configured."""
+    if _supabase_ready(): return backup_db_to_supabase(force=force)
+    return backup_db_to_drive(force=force)
+
+
+# ---------------------- embedded/legacy recovery fallbacks ----------------------
 def _write_embedded_recovery_snapshot(dest):
     payload=gzip.decompress(base64.b64decode("".join(RECOVERY_SNAPSHOT_GZIP_B64.split())))
     if hashlib.sha256(payload).hexdigest()!=RECOVERY_SNAPSHOT_SHA256:
         raise RuntimeError("La huella del respaldo de recuperación no coincide.")
     tmp=dest+".recovery_tmp"
     with open(tmp,"wb") as fh:
-        fh.write(payload)
-        fh.flush(); os.fsync(fh.fileno())
+        fh.write(payload); fh.flush(); os.fsync(fh.fileno())
     check=_sqlite_health(tmp)
     if not check["valid"]:
         try: os.remove(tmp)
@@ -509,87 +873,64 @@ def _write_embedded_recovery_snapshot(dest):
 
 
 def restore_db_from_embedded_snapshot_if_reset():
-    """Fallback recovery. Preserve any suspicious current DB before restoring.
-
-    A normal empty-operation state still retains the authorized user roster. Therefore
-    auto-recovery is limited to a missing DB or the specific reset symptom observed in
-    Community Cloud: no sessions/counts plus <=1 user. Healthy/non-empty DBs are untouched.
-    """
+    """LAST RESORT only when Supabase could not provide a valid recovery DB."""
     global AUTO_RECOVERY_APPLIED
     health=_sqlite_health(DB)
-    should_restore=(not health["valid"] or
-                    (health["inventory_sessions"]==0 and health["inventory_counts"]==0 and health["users"]<=1))
-    if not should_restore:
+    should_restore=(not health["valid"] or (health["inventory_sessions"]==0 and health["inventory_counts"]==0 and health["users"]<=1))
+    if not should_restore: return False
+    if _supabase_ready() and SYNC_PREFLIGHT_STATUS.get('remote_health',{}).get('valid'):
+        # Never downgrade from an embedded historical snapshot when durable Supabase exists.
         return False
     if os.path.exists(DB) and os.path.getsize(DB)>0:
         stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         try: shutil.copy2(DB,f"bar_inventory_v3_before_auto_recovery_{stamp}.db")
         except Exception: pass
-    _write_embedded_recovery_snapshot(DB)
-    AUTO_RECOVERY_APPLIED=True
+    _write_embedded_recovery_snapshot(DB); AUTO_RECOVERY_APPLIED=True
     return True
-
-def restore_db_from_supabase_if_reset():
-    """Prefer a validated Supabase `latest` when the local runtime DB disappears/resets.
-
-    This only becomes active after at least one successful Supabase backup exists. If
-    `latest` is unavailable, the existing legacy/embedded recovery path remains intact.
-    """
-    global AUTO_RECOVERY_APPLIED
-    if not _supabase_ready():
-        return False
-    health=_sqlite_health(DB)
-    should_restore=(not health['valid'] or
-                    (health['inventory_sessions']==0 and health['inventory_counts']==0 and health['users']<=1))
-    if not should_restore:
-        return False
-    tmp=None
-    try:
-        tmp,h=restore_latest_from_supabase_to_temp()
-        if not tmp or not h.get('valid'):
-            return False
-        if os.path.exists(DB) and os.path.getsize(DB)>0:
-            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-            try: shutil.copy2(DB,f"bar_inventory_v3_before_supabase_auto_restore_{stamp}.db")
-            except Exception: pass
-        os.replace(tmp,DB); tmp=None
-        AUTO_RECOVERY_APPLIED=True
-        return True
-    except Exception as e:
-        try: st.session_state['_supabase_auto_restore_error']=str(e)
-        except Exception: pass
-        return False
-    finally:
-        if tmp:
-            try: os.remove(tmp)
-            except Exception: pass
 
 
 def restore_db_from_drive_if_missing():
-    if os.path.exists(DB) and os.path.getsize(DB)>0: return
+    # Drive is contingency only and must never override a valid Supabase recovery source.
+    if os.path.exists(DB) and os.path.getsize(DB)>0: return False
+    if _supabase_ready() and SYNC_PREFLIGHT_STATUS.get('remote_health',{}).get('valid'): return False
     service=_drive_service(); cfg=_gdrive_cfg()
-    if not service: return
+    if not service: return False
     try:
         from googleapiclient.http import MediaIoBaseDownload
         found=_find_drive_file(service,'bar_inventory_v3_latest.db',cfg['folder_id'])
-        if not found: return
+        if not found: return False
+        fd,tmp=tempfile.mkstemp(prefix='ramona_drive_restore_',suffix='.db'); os.close(fd)
         request=service.files().get_media(fileId=found['id'])
-        fh=io.FileIO(DB,'wb'); dl=MediaIoBaseDownload(fh,request); done=False
+        fh=io.FileIO(tmp,'wb'); dl=MediaIoBaseDownload(fh,request); done=False
         while not done: _,done=dl.next_chunk()
         fh.close()
+        if not _sqlite_health(tmp).get('valid'):
+            os.remove(tmp); return False
+        _atomic_replace_db(tmp,'drive_recovery'); os.remove(tmp)
+        return True
     except Exception:
-        pass
+        return False
 
-restore_db_from_supabase_if_reset()
-restore_db_from_drive_if_missing()
-restore_db_from_embedded_snapshot_if_reset()
+
+# Every Streamlit script run reaches this point before opening SQLite. Therefore a newly
+# started/stale runtime is reconciled with durable storage before any page reads or writes.
+_preflight_supabase_sync()
+if not os.path.exists(DB) or not _sqlite_health(DB).get('valid'):
+    restore_db_from_drive_if_missing()
+if not os.path.exists(DB) or not _sqlite_health(DB).get('valid'):
+    restore_db_from_embedded_snapshot_if_reset()
 
 # --------------------------- DB ---------------------------
-@st.cache_resource
 def db():
-    c = sqlite3.connect(DB, check_same_thread=False)
+    # One connection per Streamlit script run avoids keeping a handle to an obsolete SQLite
+    # inode after an automatic/manual recovery. WAL + busy_timeout improve safe concurrent use.
+    c = sqlite3.connect(DB, check_same_thread=False, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA busy_timeout=30000")
+    try: c.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError: pass
+    c.execute("PRAGMA synchronous=FULL")
     return c
 con = db()
 
@@ -750,6 +1091,37 @@ def ensure_v053_schema():
     con.commit()
 ensure_v053_schema()
 
+# V0.5.5 migration: durable synchronization lineage with Supabase.
+def ensure_v055_schema():
+    con.execute("""CREATE TABLE IF NOT EXISTS sync_state(
+      id INTEGER PRIMARY KEY CHECK(id=1), remote_revision TEXT, base_digest TEXT,
+      last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT)""")
+    con.commit()
+ensure_v055_schema()
+
+def _align_or_bootstrap_sync_state():
+    """Align this runtime with the remote manifest, or safely create the first manifest.
+
+    Called after schema migrations. It never overwrites a divergent remote branch.
+    """
+    if not _supabase_ready(): return
+    try:
+        digest=_db_data_digest(DB)
+        manifest=_remote_manifest()
+        if manifest and digest==manifest.get('data_digest'):
+            _write_sync_state_in_file(DB,str(manifest.get('revision')),digest,'ok','Sincronización verificada al iniciar')
+            return
+        status=SYNC_PREFLIGHT_STATUS.get('status')
+        if manifest is None and status not in ('conflict','remote_error'):
+            backup_db_to_supabase(force=True,allow_bootstrap=True)
+        elif manifest and status=='local_ahead':
+            # A prior local commit may have completed before its remote backup. The publish
+            # function performs optimistic revision validation before advancing latest.
+            backup_db_to_supabase(force=True)
+    except Exception as e:
+        try: st.session_state['_supabase_backup_error']=str(e)
+        except Exception: pass
+
 # ---------------------- catalog seed from current sheet ----------------------
 BEERS = ["Corona","Corona Sunbrew","XX","Negra","Especial","Sol","Coors","Molson"]
 LIQUORS = [
@@ -849,6 +1221,9 @@ def seed_sheet_history():
 seed_sheet_history()
 # Backfill pairing metadata for any rows seeded on a brand-new database.
 ensure_v048_schema()
+# Only after all one-time seeds/migrations have completed do we establish or advance the
+# Supabase synchronization baseline. This prevents publishing a half-initialized database.
+_align_or_bootstrap_sync_state()
 
 # --------------------------- helpers ---------------------------
 def setting(k, default):
@@ -1111,6 +1486,8 @@ def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAI
     closing are committed atomically. An identical submission by the same user
     within two minutes is treated as a retry and is not inserted again.
     """
+    if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
+        return {'ok':False,'saved':False,'duplicate':False,'error':'Sincronización en conflicto. La captura fue bloqueada para evitar pérdida de datos. Contacta al Developer/Owner.'}
     business_date=(session_date or local_today())
     d=business_date.isoformat() if hasattr(business_date,'isoformat') else str(business_date)
     pending_movements=pending_movements or []
@@ -1160,6 +1537,8 @@ def save_historical_session(kind, counts, session_date, notes="", inventory_cycl
     This intentionally bypasses the live Opening→Closing workflow because it edits an
     earlier business date. The real entry timestamp and Developer user are preserved.
     """
+    if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
+        return {'ok':False,'saved':False,'duplicate':False,'error':'Sincronización en conflicto. La carga histórica fue bloqueada para proteger los datos.'}
     d=session_date.isoformat() if hasattr(session_date,'isoformat') else str(session_date)
     duplicate=_recent_identical_inventory_session(kind,counts,session_date,inventory_cycle,paired_opening_session_id)
     if duplicate:
@@ -1249,6 +1628,8 @@ def movement_qty_input(p,key,label="Cantidad"):
     return {'base':base,'bottles':bottles}
 
 def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None,do_backup=True):
+    if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
+        raise RuntimeError('Sincronización en conflicto. Movimiento bloqueado para evitar pérdida de datos.')
     con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or local_today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
     con.commit()
@@ -1404,7 +1785,7 @@ def _session_trace_label(session):
     return f"{kind} {cyc} · {session['employee'] or 'Usuario'} · {format_local_time(session['created_at'])} · ID {session['id']}"
 
 
-# ---------------------- V0.5.1 reliable opening/closing + recovery workflow ----------------------
+# ---------------------- Reliable opening/closing + recovery workflow ----------------------
 def _cycle_for_date(ds):
     """Latest inventory cycle started for a business date."""
     r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle
@@ -1566,6 +1947,8 @@ def expected_sales(d,pid,p):
 
 
 def record_pos_batch(d,sale_group,note=""):
+    if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
+        raise RuntimeError('Sincronización en conflicto. POS bloqueado para evitar pérdida de datos.')
     ds=d.isoformat() if hasattr(d,'isoformat') else str(d)
     con.execute("INSERT INTO pos_batches(sale_date,sale_group,user_id,note,created_at) VALUES(?,?,?,?,?)",
                 (ds,sale_group,user['id'],note,now_iso()))
@@ -2477,7 +2860,7 @@ def login_screen():
     st.markdown('<div class="ramona-login-wrap">', unsafe_allow_html=True)
     st.image(LOGO_PATH, width=320)
     st.markdown("## Inventario La Ramona")
-    st.caption("Control de inventario · V0.5.1 · Acceso seguro con Google")
+    st.caption(f"Control de inventario · V{APP_VERSION} · Acceso seguro con Google")
     st.write("Inicia sesión con la cuenta de Google autorizada por el administrador.")
     st.button("Continuar con Google",type="primary",width="stretch",on_click=st.login)
     st.caption("Tener el enlace de la aplicación no concede acceso. El correo debe estar autorizado y activo.")
@@ -2500,6 +2883,21 @@ if not user_row or not user_row['active']:
 user=dict(user_row)
 ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']),do_backup=False)
 
+# Visible safety signal for every authenticated user. A stale runtime should normally have been
+# auto-restored during preflight; true divergence is intentionally surfaced instead of hidden.
+sync_blocked=SYNC_PREFLIGHT_STATUS.get('status') in ('conflict','remote_error')
+is_owner_session=normalized_email(user.get('email'))==normalized_email(secret_value('app','bootstrap_admin_email'))
+if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
+    st.error("⚠️ Protección de datos activa: esta instancia detectó una divergencia con Supabase. Las operaciones de escritura quedan restringidas hasta que Developer/Owner revise la sincronización.")
+elif SYNC_PREFLIGHT_STATUS.get('status')=='remote_error':
+    st.error("⚠️ No fue posible validar Supabase en esta ejecución. Para evitar una captura que quede únicamente en almacenamiento temporal, las operaciones quedan restringidas hasta recuperar la conexión. Actualiza la página para reintentar.")
+elif SYNC_PREFLIGHT_STATUS.get('status')=='restored_remote':
+    st.toast("Base actualizada automáticamente desde el último respaldo válido de Supabase.",icon="✅")
+
+if sync_blocked and not is_owner_session:
+    st.info("El sistema está temporalmente en modo protegido. Tus datos existentes están conservados; intenta nuevamente en unos momentos o contacta al Developer/Owner.")
+    st.stop()
+
 workflow=inventory_workflow_state()
 allowed_inventory_page='Cierre' if workflow['stage']=='CLOSING' else 'Apertura'
 
@@ -2509,13 +2907,16 @@ with st.sidebar:
     st.markdown(f"**{user['name']}**")
     st.caption(f"{ROLE_LABELS.get(user['role'],user['role'])} · {user['email']}")
     st.caption("**Flujo de inventario:** " + _workflow_status_text(workflow))
-    if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
+    if sync_blocked and is_owner_session:
+        pages=['Administración']
+        st.warning("Modo protegido de sincronización: solo Administración está disponible hasta resolver la inconsistencia o recuperar la conexión con Supabase.")
+    elif user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages=['Dashboard',allowed_inventory_page,'Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
     else:
         pages=[allowed_inventory_page,'Recibir pedido','Trasladar productos']
     # MANAGER y MANAGER GENERAL pueden entrar a Administración; las acciones críticas
     # continúan protegidas dentro de la página para ADMIN/Developer Owner.
-    if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
+    if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN') and 'Administración' not in pages:
         pages += ['Administración']
     icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
     display=[f"{icons.get(p,'•')}  {p}" for p in pages]
@@ -3632,12 +4033,41 @@ elif page=='Administración':
                     con.commit(); backup_db(); st.success(f"Importación terminada. Registros procesados: {imported}"); st.rerun()
             except Exception as e: st.error(f"No se pudo leer el archivo: {e}")
     with t5:
+        st.subheader("Estado de sincronización")
+        local_sync_h=_sqlite_health(DB)
+        local_sync_digest=_db_data_digest(DB)
+        remote_sync_h=None; remote_sync_digest=None; remote_sync_rev=None
+        if _supabase_ready():
+            _tmp_sync=None
+            try:
+                _tmp_sync,remote_sync_h,remote_sync_digest,_m_sync=_remote_revision_to_temp()
+                remote_sync_rev=(_m_sync.get('revision') if _m_sync else None)
+            except Exception as _e:
+                st.warning(f"No se pudo leer el estado remoto en este momento: {_e}")
+            finally:
+                if _tmp_sync:
+                    try: os.remove(_tmp_sync)
+                    except Exception: pass
+        if remote_sync_h and remote_sync_h.get('valid'):
+            same=(local_sync_digest==remote_sync_digest)
+            c1,c2=st.columns(2)
+            c1.info(f"Local · {local_sync_h['products']} productos · {local_sync_h['inventory_sessions']} sesiones · {local_sync_h['inventory_counts']} conteos · {local_sync_h['movements']} movimientos · {local_sync_h['pos_sales']} POS")
+            c2.info(f"Supabase · {remote_sync_h['products']} productos · {remote_sync_h['inventory_sessions']} sesiones · {remote_sync_h['inventory_counts']} conteos · {remote_sync_h['movements']} movimientos · {remote_sync_h['pos_sales']} POS")
+            if same:
+                st.success(f"✅ Sincronizado · revisión {(remote_sync_rev or 'legacy')[:8]} · huella {local_sync_digest[:12]}")
+            else:
+                st.error("⚠️ Local y Supabase NO contienen los mismos datos. No realices nuevas capturas hasta revisar Recuperación de base de datos. La protección V0.5.5 impide sobrescribir automáticamente una rama divergente.")
+        elif _supabase_ready():
+            st.warning("Supabase está configurado, pero todavía no se pudo validar una revisión remota.")
+        st.caption(f"Preflight de esta ejecución: {SYNC_PREFLIGHT_STATUS.get('status')} · {SYNC_PREFLIGHT_STATUS.get('message','')}")
+        st.divider()
+
         st.subheader("Respaldo automático")
         scfg=_supabase_cfg()
         if _supabase_ready():
             last=st.session_state.get('_last_supabase_backup','Aún no realizado en esta sesión')
             st.success(f"Supabase Storage configurado · último backup en esta sesión: {last}")
-            st.caption("Cada escritura confirmada actualiza `latest/bar_inventory_v3.db`, el archivo diario de la fecha y el archivo semanal vigente. Los nombres se sobrescriben para evitar cientos de copias por día.")
+            st.caption("Cada escritura confirmada se valida y publica mediante dos slots seguros alternados; después actualiza `latest/bar_inventory_v3.db`, el archivo diario y el semanal. Los nombres se sobrescriben para evitar cientos de copias y el manifest se publica al final como punto de recuperación confirmado.")
             if st.button("Crear / verificar backup ahora en Supabase",width="stretch",key='supabase_backup_now'):
                 ok,msg=backup_db_to_supabase(force=True); (st.success if ok else st.error)(msg)
             if st.session_state.get('_supabase_backup_error'):
@@ -3674,7 +4104,7 @@ elif page=='Administración':
                     try:
                         tmp_latest,h=restore_latest_from_supabase_to_temp()
                         st.session_state['_supabase_latest_health']=h
-                        st.success(f"Latest válido: {h['active_users']}/{h['users']} usuarios activos · {h['products']} productos · {h['inventory_sessions']} sesiones · {h['inventory_counts']} conteos · {h['movements']} movimientos · {h['pos_sales']} filas POS.")
+                        st.success(f"Latest válido: {h['active_users']}/{h['users']} usuarios activos · {h['products']} productos · {h['inventory_sessions']} sesiones · {h['inventory_counts']} conteos · {h['movements']} movimientos · {h['pos_sales']} filas POS · rev {(h.get('revision') or 'legacy')[:8]} · huella {(h.get('data_digest') or '')[:12]}.")
                     except Exception as e:
                         st.error(f"No se pudo verificar latest: {e}")
                     finally:
@@ -3695,7 +4125,7 @@ elif page=='Administración':
                             pre=f"bar_inventory_v3_before_supabase_restore_{stamp}.db"
                             con.commit()
                             if os.path.exists(DB): shutil.copy2(DB,pre)
-                            con.close(); shutil.copy2(tmp_latest,DB); db.clear()
+                            con.close(); _atomic_replace_db(tmp_latest,'manual_supabase_restore')
                             st.success("Último backup de Supabase restaurado y validado. La aplicación se recargará.")
                             st.rerun()
                         except Exception as e:
@@ -3728,8 +4158,7 @@ elif page=='Administración':
                                 con.commit()
                                 if os.path.exists(DB): shutil.copy2(DB,pre)
                                 con.close()
-                                shutil.copy2(tmp_restore,DB)
-                                db.clear()
+                                _atomic_replace_db(tmp_restore,'manual_restore')
                                 st.success("Base restaurada. La aplicación se recargará con usuarios, productos e historial del respaldo.")
                                 st.rerun()
                             except Exception as e:
