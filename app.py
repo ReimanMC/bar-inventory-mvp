@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.5"
+APP_VERSION = "0.5.6"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -265,7 +265,7 @@ def operation_confirmation(action, business_date=None, detail="", event_ts=None)
     return "  \n".join(parts)
 
 # ---------------------- Supabase Storage backup + safe synchronization ----------------------
-# V0.5.5 persistence model:
+# V0.5.6 persistence model:
 # - SQLite remains the transactional working database for the Streamlit process.
 # - Supabase Storage is the durable source of recovery and version coordination.
 # - Every committed business write creates a verified SQLite snapshot.
@@ -342,12 +342,34 @@ def _supabase_download(remote_path):
         raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
 
 
+def _is_supabase_missing_object_error(exc):
+    """Return True when Supabase Storage reports that an object does not exist.
+
+    Supabase may expose a missing Storage object either as HTTP 404 or, depending on
+    the gateway/path, as HTTP 400 with a JSON body containing statusCode=404,
+    error=not_found, message=Object not found or code=NoSuchKey. Treat all of those
+    as the same safe "object absent" condition instead of a connectivity failure.
+    """
+    text=str(exc or '').lower()
+    markers=(
+        'http 404',
+        '"statuscode":"404"',
+        '"statuscode":404',
+        '"code":"nosuchkey"',
+        '"error":"not_found"',
+        'object not found',
+        'no such key',
+    )
+    return any(m in text for m in markers)
+
+
 def _supabase_download_optional(remote_path):
     try:
         return _supabase_download(remote_path)
     except RuntimeError as e:
-        # A missing manifest is normal on the first V0.5.5 run.
-        if 'HTTP 404' in str(e):
+        # Missing objects are expected during the first manifest bootstrap and for
+        # optional rolling files. They must NOT force protected/offline mode.
+        if _is_supabase_missing_object_error(e):
             return None
         raise
 
@@ -613,7 +635,7 @@ def _preflight_supabase_sync():
         tmp,remote_h,remote_digest,manifest=_remote_revision_to_temp()
         SYNC_PREFLIGHT_STATUS['remote_health']=remote_h
         if not tmp or not remote_h.get('valid'):
-            SYNC_PREFLIGHT_STATUS.update(status='remote_missing',message='Supabase no tiene todavía un backup válido.')
+            SYNC_PREFLIGHT_STATUS.update(status='remote_missing',message='Supabase no tiene todavía un backup válido; se permitirá inicializar la sincronización desde una base local validada.')
             return False
         local_reset=(not local_h.get('valid') or (local_h.get('inventory_sessions',0)==0 and local_h.get('inventory_counts',0)==0 and local_h.get('users',0)<=1))
         if local_reset:
@@ -1091,7 +1113,7 @@ def ensure_v053_schema():
     con.commit()
 ensure_v053_schema()
 
-# V0.5.5 migration: durable synchronization lineage with Supabase.
+# V0.5.5+ migration: durable synchronization lineage with Supabase.
 def ensure_v055_schema():
     con.execute("""CREATE TABLE IF NOT EXISTS sync_state(
       id INTEGER PRIMARY KEY CHECK(id=1), remote_revision TEXT, base_digest TEXT,
