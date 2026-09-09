@@ -1,0 +1,23 @@
+Inventario La Ramona — V0.5.5 validation summary
+
+Checks completed before delivery:
+- app.py parsed successfully with Python AST.
+- app.py compiled successfully with py_compile.
+- Real backup comparison: stale 14 sessions / 309 counts vs newer 19 sessions / 386 counts.
+- Stale legacy local -> remote auto-restore: PASS.
+- Stale synchronized local -> newer remote auto-restore: PASS.
+- Divergent local/remote branches -> conflict, no overwrite: PASS.
+- Local unbacked change from current remote revision preserved: PASS.
+- First manifest bootstrap: PASS.
+- Two-slot safe rotation B -> A: PASS.
+- Recovery follows manifest safe slot rather than mutable rolling latest: PASS.
+- Stale writer cannot overwrite current manifest: PASS.
+- Conflict copy preserved separately: PASS.
+- Reconciliation 42 opening / 30 closing = 12 physical/count sale: PASS.
+- Negative physical consumption prevention: PASS.
+- Adjustment reduction of count sale: PASS.
+- Feature audit: historical load, duplicate product management, daily/weekly inventory, Pending POS,
+  Ontario timezone, manager/admin permissions, manual SQLite download, sync status UI: PASS.
+
+Important: runtime integration with the user's real Supabase credentials must be verified after deploy from
+Administration > Configuration > Sync status. No credentials are embedded in these files.
