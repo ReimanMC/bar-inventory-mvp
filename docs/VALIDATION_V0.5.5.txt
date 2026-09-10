@@ -1,21 +1,43 @@
-La Ramona Inventory MVP - V0.5.6 validation
+LA RAMONA INVENTORY — V0.5.7 VALIDATION
+========================================
 
 Scope
-- Supabase Storage first-manifest bootstrap after upgrading from legacy latest/daily/weekly backups.
-- Missing-object handling for Supabase responses.
-- Preservation of V0.5.5 anti-regression rules.
+-----
+Persistence / Supabase synchronization only. Business calculation functions were not changed.
 
-Verified
-1. Python syntax/AST compilation: PASS.
-2. Missing Storage object returned as HTTP 404: recognized as optional/missing, not connection failure.
-3. Missing Storage object returned as HTTP 400 with statusCode=404, error=not_found, message=Object not found, code=NoSuchKey: recognized as optional/missing, not connection failure.
-4. Authentication/server errors (401/500): remain real errors and are NOT suppressed.
-5. With no manifest, sync falls back to legacy latest/bar_inventory_v3.db for safe comparison.
-6. Equal local/legacy latest permits automatic creation of revision slot + manifest.
-7. More-complete remote legacy latest still wins during preflight.
-8. More-complete local legacy DB can bootstrap remote only through the guarded backup path.
-9. Divergent/incomparable local and remote branches remain blocked from overwriting each other.
-10. Manifest-based recovery and slot validation remain unchanged after bootstrap.
+Static validation
+-----------------
+PASS - app.py compiles with Python py_compile.
+PASS - AST comparison against V0.5.6 shows business functions unchanged; modified functions are limited to synchronization/persistence helpers plus protected-mode navigation.
+PASS - requirements.txt does not require a new dependency.
 
-Root cause fixed
-Supabase Storage may return HTTP 400 while the JSON body reports a missing object (statusCode 404 / NoSuchKey). V0.5.5 only treated literal HTTP 404 as a normal missing manifest, which caused first-run protected mode and prevented manifest creation.
+Synchronization regression tests (in-memory Supabase Storage emulator + real SQLite backups)
+------------------------------------------------------------------------------------------
+PASS - Remote legacy DB 19 sessions / 386 counts safely replaces stale local DB 14 / 309.
+PASS - Equivalent legacy remote/local is migrated to immutable V2 generation 1.
+PASS - A legitimate local write based on current remote head is classified local_ahead.
+PASS - Local descendant publishes immutable V2 generation 2 and verifies SHA-256.
+PASS - Stale runtime based on generation 1 automatically restores generation 2.
+PASS - Legacy manifest pointing to a missing slot falls back to valid legacy latest DB.
+PASS - HTTP 400 body with statusCode=404 / NoSuchKey / Object not found is recognized as a missing optional object.
+PASS - Two different remote revisions at the same generation are detected as a conflict; neither is selected or overwritten.
+
+Architecture checks
+-------------------
+PASS - Authoritative V2 revision paths are unique and immutable (upsert=false).
+PASS - Recovery discovers V2 head using Storage list metadata rather than mutable manifest/latest paths.
+PASS - Mutable latest/daily/weekly copies are best-effort convenience copies and are not authoritative.
+PASS - Business snapshot uses SQLite online backup API followed by PRAGMA quick_check.
+PASS - Data digest excludes login heartbeat and sync metadata.
+PASS - Stale-local regression is blocked by revision/base-digest lineage checks.
+PASS - Divergent local branches are preserved best-effort under conflicts/ and cannot overwrite remote head.
+PASS - Storage requests include bounded retry/backoff for transient network/5xx/rate-limit errors.
+
+Reference databases
+-------------------
+bar_inventory_2026-09-07.db: PRAGMA quick_check OK; 69 products; 19 sessions; 386 counts.
+bar_inventory_2026-09-09.db: PRAGMA quick_check OK; 67 products; 14 sessions; 309 counts.
+
+Important operational note
+--------------------------
+V0.5.7 is an MVP hardening release. SQLite still runs on Streamlit's local filesystem, while Supabase Storage is the durable recovery layer. For a future production deployment with stronger multi-instance transactional guarantees, migrate the live database to Supabase PostgreSQL rather than coordinating the live database through object storage.
