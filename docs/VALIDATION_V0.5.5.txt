@@ -1,43 +1,104 @@
-LA RAMONA INVENTORY — V0.5.7 VALIDATION
-========================================
+LA RAMONA INVENTORY MVP — V0.5.8 VALIDATION
+Date: 2026-09-09
+Scope: data capture reliability, SQLite transaction integrity, Supabase durable backup/synchronization.
 
-Scope
------
-Persistence / Supabase synchronization only. Business calculation functions were not changed.
+STATUS: PASS for the checks listed below.
 
-Static validation
------------------
-PASS - app.py compiles with Python py_compile.
-PASS - AST comparison against V0.5.6 shows business functions unchanged; modified functions are limited to synchronization/persistence helpers plus protected-mode navigation.
-PASS - requirements.txt does not require a new dependency.
+1) Python syntax
+- app.py compiled with python -m py_compile.
+- Result: PASS.
 
-Synchronization regression tests (in-memory Supabase Storage emulator + real SQLite backups)
-------------------------------------------------------------------------------------------
-PASS - Remote legacy DB 19 sessions / 386 counts safely replaces stale local DB 14 / 309.
-PASS - Equivalent legacy remote/local is migrated to immutable V2 generation 1.
-PASS - A legitimate local write based on current remote head is classified local_ahead.
-PASS - Local descendant publishes immutable V2 generation 2 and verifies SHA-256.
-PASS - Stale runtime based on generation 1 automatically restores generation 2.
-PASS - Legacy manifest pointing to a missing slot falls back to valid legacy latest DB.
-PASS - HTTP 400 body with statusCode=404 / NoSuchKey / Object not found is recognized as a missing optional object.
-PASS - Two different remote revisions at the same generation are detected as a conflict; neither is selected or overwritten.
+2) Root-cause regression: equivalent legacy backups
+Problem reproduced conceptually from V0.5.7:
+- latest, daily, weekly and legacy slots can contain several byte/logically equivalent copies of the same newest SQLite database.
+- V0.5.7 treated each equivalent copy as a separate winning candidate and could raise a false conflict / remote validation error.
+Fix:
+- legacy candidates are grouped by canonical business-data digest first.
+- equivalent copies count as one logical version.
+- dominance is decided between logical digest groups, not individual files.
+Real backup scenario tested:
+- newest branch: 19 sessions / 386 counts (bar_inventory_2026-09-07.db)
+- older branch: 16 sessions / 339 counts (bar_inventory_2026-09-08.db)
+- multiple equivalent copies of the newest branch simulated as latest + slots + daily + weekly.
+- selected result: 19 sessions / 386 counts.
+- Result: PASS.
 
-Architecture checks
--------------------
-PASS - Authoritative V2 revision paths are unique and immutable (upsert=false).
-PASS - Recovery discovers V2 head using Storage list metadata rather than mutable manifest/latest paths.
-PASS - Mutable latest/daily/weekly copies are best-effort convenience copies and are not authoritative.
-PASS - Business snapshot uses SQLite online backup API followed by PRAGMA quick_check.
-PASS - Data digest excludes login heartbeat and sync metadata.
-PASS - Stale-local regression is blocked by revision/base-digest lineage checks.
-PASS - Divergent local branches are preserved best-effort under conflicts/ and cannot overwrite remote head.
-PASS - Storage requests include bounded retry/backoff for transient network/5xx/rate-limit errors.
+3) V2 immutable head discovery
+Fix:
+- revision filenames encode zero-padded generation.
+- Storage LIST is used to identify the maximum generation before downloading metadata.
+- only metadata belonging to the current maximum generation is downloaded (normally one request instead of up to 20).
+Test:
+- generations 7 and 6 returned by LIST.
+- only generation-7 metadata downloaded.
+- Result: PASS.
 
-Reference databases
--------------------
-bar_inventory_2026-09-07.db: PRAGMA quick_check OK; 69 products; 19 sessions; 386 counts.
-bar_inventory_2026-09-09.db: PRAGMA quick_check OK; 67 products; 14 sessions; 309 counts.
+4) Fresh write-time synchronization guard
+Operational writes now perform a fresh Supabase validation immediately before accepting the write.
+Scenarios tested:
+- local digest == remote digest -> ALLOW.
+- local is a legitimate unsynced descendant of current remote -> backup pending local first, re-verify, then ALLOW.
+- remote is newer while local still equals its previous base -> REJECT write and request refresh/recovery.
+- Result: PASS.
 
-Important operational note
---------------------------
-V0.5.7 is an MVP hardening release. SQLite still runs on Streamlit's local filesystem, while Supabase Storage is the durable recovery layer. For a future production deployment with stronger multi-instance transactional guarantees, migrate the live database to Supabase PostgreSQL rather than coordinating the live database through object storage.
+5) Transient Supabase read failure behavior
+- A transient read-time Supabase failure no longer removes operational pages from users.
+- Dashboard/forms remain available for consultation and data entry preparation.
+- actual Save action still requires the fresh write-time guard to succeed.
+- Result: PASS by static control-flow verification.
+
+6) Concurrent Streamlit session protection
+- write/backup workflows use a process-shared st.cache_resource RLock.
+- critical helpers serialized:
+  save_session
+  save_historical_session
+  save_movements_batch
+  save_pos_group
+  create_movement
+  record_pos_batch
+- SQLite continues using BEGIN IMMEDIATE / busy_timeout / WAL / synchronous=FULL.
+- Result: PASS by source/AST verification.
+
+7) Opening / Closing inventory transaction
+- inventory session + all counts + closing pending movements remain in one SQLite transaction.
+- duplicate-submission protection remains active.
+- fresh Supabase write guard runs before the transaction.
+- durable backup is attempted twice before reporting backup pending.
+- Result: PASS by source/AST verification.
+
+8) Supplier receipt / transfer transaction
+V0.5.7 risk:
+- each movement row could commit separately, creating a partial receipt/transfer if an intermediate operation failed.
+V0.5.8:
+- all rows are inserted inside one BEGIN IMMEDIATE transaction.
+- one durable backup follows the batch.
+- Result: PASS by source inspection/static test.
+
+9) POS transaction
+V0.5.7 risk:
+- POS detail rows committed first and pos_batches committed separately.
+V0.5.8:
+- detail rows + POS batch confirmation are inserted in the same transaction.
+- zero-sales confirmation also uses the same durable helper.
+- no remaining UI pattern 'con.commit(); record_pos_batch'.
+- Result: PASS by source inspection/static test.
+
+10) Backup result messaging
+- successful inventory messages distinguish confirmed durable Supabase backup.
+- if a post-commit backup remains pending after retries, the user receives a warning instead of a misleading fully-successful backup message.
+- subsequent writes are revalidated and pending local descendants are backed up before another write is accepted.
+- Result: PASS by source inspection.
+
+11) Business logic preserved
+No intended changes to:
+- Opening -> Closing -> next Opening workflow.
+- after-midnight operational date handling.
+- daily beers + principal liquors / weekly inventory.
+- liquor bottle equivalents + oz conversion.
+- physical output / count-based sales reconciliation.
+- authorized adjustments (test, waste, comps, breakage).
+- Pending POS semantics until POS is explicitly entered/confirmed.
+- Dashboard calculations and replenishment formulas.
+
+IMPORTANT OPERATIONAL LIMIT
+SQLite remains local working storage on Streamlit Community Cloud. Supabase Storage is the durable recovery layer. No software design can guarantee availability when the external backup service itself is unreachable. V0.5.8 therefore prioritizes data integrity: a new operational write is not accepted when a fresh durable-remote validation cannot be completed.
