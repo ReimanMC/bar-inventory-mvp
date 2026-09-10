@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse, uuid, time
+import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse, uuid, time, threading, functools
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.7"
+APP_VERSION = "0.5.8"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -281,7 +281,23 @@ SYNC_PREFLIGHT_STATUS={"status":"not_checked","message":"","remote_health":None,
 SYNC_LEGACY_MANIFEST_PATH='latest/manifest.json'
 SYNC_LATEST_PATH='latest/bar_inventory_v3.db'
 SYNC_V2_PREFIX='revisions_v2'
-SYNC_HTTP_RETRIES=4
+SYNC_HTTP_RETRIES=5
+
+@st.cache_resource(show_spinner=False)
+def _shared_write_lock():
+    # One lock shared by all Streamlit sessions in this Python process.
+    return threading.RLock()
+
+WRITE_SYNC_LOCK=_shared_write_lock()
+
+
+def _serialized_durable_write(fn):
+    """Serialize write+backup workflows across Streamlit session threads in this process."""
+    @functools.wraps(fn)
+    def wrapped(*args,**kwargs):
+        with WRITE_SYNC_LOCK:
+            return fn(*args,**kwargs)
+    return wrapped
 
 
 def _supabase_cfg():
@@ -329,7 +345,9 @@ def _is_supabase_missing_object_error(exc):
 def _is_supabase_retryable_error(exc):
     text=str(exc or '').lower()
     return any(x in text for x in ('http 408','http 425','http 429','http 500','http 502','http 503','http 504',
-                                           'timed out','timeout','temporarily unavailable','connection reset','urlopen error'))
+                                           'timed out','timeout','temporarily unavailable','connection reset','urlopen error',
+                                           'connection aborted','connection refused','remote end closed','unexpected eof',
+                                           'temporary failure','network is unreachable','name or service not known'))
 
 
 def _supabase_upload_bytes(payload,remote_path,content_type='application/octet-stream',upsert=True):
@@ -626,16 +644,28 @@ def _parse_v2_meta(raw,path=''):
 
 
 def _remote_v2_head_meta():
-    """Return one authoritative V2 head meta. Multiple different heads at same generation = conflict."""
+    """Return one authoritative V2 head meta with the fewest possible Storage requests.
+
+    Revision filenames start with a zero-padded generation. We therefore identify the highest
+    generation from LIST metadata first and download only metadata files in that generation
+    (normally one file). This avoids downloading 20 metadata objects on every Streamlit rerun.
+    """
     items=_supabase_list_files(SYNC_V2_PREFIX,limit=100,order='desc')
-    names=[]
+    parsed=[];fallback=[]
     for item in items:
         name=str(item.get('name') or '')
-        if name.endswith('.meta.json'): names.append(name)
+        if not name.endswith('.meta.json'):continue
+        m=re.match(r'^g(\d{10})_.*\.meta\.json$',name)
+        if m:parsed.append((int(m.group(1)),name))
+        else:fallback.append(name)
+    if parsed:
+        maxgen=max(g for g,_ in parsed)
+        names=[name for g,name in parsed if g==maxgen]
+    else:
+        names=fallback[:20]
     if not names:return None
     metas=[]
-    # Names begin with zero-padded generation, so the first handful contain every plausible head.
-    for name in names[:20]:
+    for name in names:
         path=f"{SYNC_V2_PREFIX}/{name}" if '/' not in name else name
         raw=_supabase_download_optional(path,retry_missing=True)
         if raw is None:continue
@@ -678,20 +708,27 @@ def _remote_legacy_best_to_temp():
             # Broken legacy objects are ignored when another valid durable candidate exists.
             continue
     if not candidates:return None,{"valid":False,"reason":"remote_missing"},None,None
-    # Same digest -> any copy is equivalent; prefer the first priority path.
-    unique={c[2] for c in candidates}
-    if len(unique)==1:
-        chosen=candidates[0]
+    # Group equivalent copies by digest first. Several rolling files can legitimately contain
+    # the exact same newest database (latest + daily + weekly + slot). They must count as one
+    # logical candidate, not as several competing winners.
+    groups={}
+    for c in candidates:
+        groups.setdefault(c[2],[]).append(c)
+    if len(groups)==1:
+        chosen=next(iter(groups.values()))[0]
     else:
-        winners=[]
-        for c in candidates:
-            if all((o is c) or c[2]==o[2] or _dominance(c[1],o[1])==1 for o in candidates):winners.append(c)
-        if len(winners)!=1:
+        reps={digest:items[0] for digest,items in groups.items()}
+        winning_digests=[]
+        for digest,c in reps.items():
+            if all(other_digest==digest or _dominance(c[1],other[1])==1
+                   for other_digest,other in reps.items()):
+                winning_digests.append(digest)
+        if len(winning_digests)!=1:
             for c in candidates:
                 try:os.remove(c[0])
                 except Exception:pass
-            raise RuntimeError('Conflicto entre respaldos legacy de Supabase; no existe una copia que domine de forma segura a todas las demás.')
-        chosen=winners[0]
+            raise RuntimeError('Conflicto entre respaldos legacy de Supabase; existen ramas distintas y ninguna domina de forma segura a las demás.')
+        chosen=groups[winning_digests[0]][0]
     for c in candidates:
         if c is not chosen:
             try:os.remove(c[0])
@@ -758,6 +795,58 @@ def _preflight_supabase_sync():
         if tmp:
             try:os.remove(tmp)
             except Exception:pass
+
+
+def _write_sync_guard():
+    """Fresh remote validation immediately before any operational write.
+
+    Page rendering is allowed even when a transient Supabase check fails, but an inventory/POS/
+    movement write is accepted only after the current local database is proven to descend from the
+    current durable remote revision. If local changes are pending, they are backed up first.
+    """
+    if not _supabase_ready():
+        return False,'Supabase no está configurado; la captura no se realizará para evitar datos sin respaldo durable.'
+    remote_tmp=None
+    with WRITE_SYNC_LOCK:
+        try:
+            local_h=_sqlite_health(DB)
+            if not local_h.get('valid'):
+                return False,f"La base local no superó la validación SQLite: {local_h.get('reason')}"
+            remote_tmp,remote_h,remote_digest,remote_meta=_remote_revision_to_temp()
+            if not remote_tmp or not remote_h.get('valid'):
+                ok,msg=backup_db_to_supabase(force=True,allow_bootstrap=True)
+                if not ok:return False,'No fue posible inicializar el respaldo durable antes de guardar: '+msg
+                return True,'Supabase inicializado y validado.'
+            local_digest=_db_data_digest(DB)
+            if local_digest==remote_digest:
+                return True,'Local y Supabase sincronizados.'
+            state=_read_sync_state_path(DB) or {}
+            base_rev=str(state.get('remote_revision') or '')
+            base_digest=str(state.get('base_digest') or '')
+            remote_rev=str((remote_meta or {}).get('revision') or '')
+            # Local is a legitimate unsynced descendant of the current remote head. Publish it
+            # before accepting another write so we never stack multiple unprotected operations.
+            if (base_rev and base_rev==remote_rev) or (base_digest and base_digest==remote_digest):
+                ok,msg=backup_db_to_supabase(force=True)
+                if not ok:return False,'Hay cambios locales pendientes y no pudieron respaldarse antes de continuar: '+msg
+                # Confirm the durable head really matches the current local data.
+                try:
+                    if remote_tmp:
+                        os.remove(remote_tmp); remote_tmp=None
+                except Exception:pass
+                remote_tmp,remote_h2,remote_digest2,remote_meta2=_remote_revision_to_temp()
+                if remote_tmp and remote_h2.get('valid') and remote_digest2==local_digest:
+                    return True,'Cambios locales pendientes respaldados y sincronización confirmada.'
+                return False,'Supabase respondió, pero no confirmó la misma versión local. Actualiza la página antes de guardar.'
+            if base_digest and local_digest==base_digest:
+                return False,'Supabase contiene una revisión más reciente que esta instancia. Actualiza la página para recuperar los datos antes de guardar.'
+            return False,'Se detectó una posible divergencia entre esta instancia y Supabase. No se guardó nada; Developer/Owner debe revisar la sincronización.'
+        except Exception as e:
+            return False,f'No fue posible validar el respaldo durable en Supabase: {e}'
+        finally:
+            if remote_tmp:
+                try:os.remove(remote_tmp)
+                except Exception:pass
 
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
@@ -837,6 +926,7 @@ def backup_db_to_supabase(force=False,allow_bootstrap=True):
                 _write_sync_state_in_file(DB,rev,local_digest,'ok','Datos ya sincronizados con Supabase',generation=gen)
                 st.session_state['_last_supabase_backup']=str((remote_meta or {}).get('created_at') or local_now().isoformat(timespec='seconds'))
                 st.session_state['_last_supabase_backup_health']=health;st.session_state.pop('_supabase_backup_error',None)
+                SYNC_PREFLIGHT_STATUS.update(status='synced',message='Base local y Supabase contienen los mismos datos.',local_health=health,remote_health=remote_h)
                 return True,f"Supabase ya sincronizado · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos"
             # Same durable data but only legacy objects exist: publish one immutable V2 revision
             # so future recovery no longer depends on mutable latest/manifest/slot paths.
@@ -901,10 +991,13 @@ def backup_db_to_supabase(force=False,allow_bootstrap=True):
         _write_sync_state_in_file(DB,revision,local_digest,'ok','Backup V2 confirmado en Supabase',generation=generation)
         rolling_warnings=_publish_rolling_copies_best_effort(payload)
         st.session_state['_last_supabase_backup']=created;st.session_state['_last_supabase_backup_health']=health;st.session_state.pop('_supabase_backup_error',None)
+        SYNC_PREFLIGHT_STATUS.update(status='synced',message='Escritura respaldada y sincronizada con Supabase.',local_health=health,remote_health=health)
         suffix=(' · copias rolling pendientes' if rolling_warnings else '')
         return True,f"Backup Supabase V2 OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos · gen {generation}{suffix}"
     except Exception as e:
         st.session_state['_supabase_backup_error']=str(e)
+        if SYNC_PREFLIGHT_STATUS.get('status')!='conflict':
+            SYNC_PREFLIGHT_STATUS.update(status='remote_error',message=f'Backup durable pendiente: {e}')
         return False,f"No se pudo confirmar el respaldo durable en Supabase: {e}"
     finally:
         for p in (snap,remote_tmp):
@@ -1174,8 +1267,11 @@ ensure_v057_schema()
 
 
 def _align_or_bootstrap_sync_state():
-    """After migrations, align local lineage or publish a pending legitimate local descendant."""
+    """After migrations, align lineage or publish a pending legitimate local descendant."""
     if not _supabase_ready():return
+    # Do not immediately repeat a failed read-time network check on the same Streamlit rerun.
+    # A real write will use _write_sync_guard(), which performs its own fresh retry sequence.
+    if SYNC_PREFLIGHT_STATUS.get('status')=='remote_error':return
     tmp=None
     try:
         digest=_db_data_digest(DB);tmp,rh,rd,meta=_remote_revision_to_temp()
@@ -1552,6 +1648,19 @@ def _recent_identical_inventory_session(kind, counts, session_date, inventory_cy
     return None
 
 
+def _confirmed_backup_after_write():
+    """Require a confirmed durable backup after a committed business write.
+
+    A second full attempt is made because the local transaction is already committed; subsequent
+    writes will be blocked by _write_sync_guard until this local descendant is published.
+    """
+    ok,msg=backup_db()
+    if ok:return ok,msg
+    time.sleep(0.8)
+    return backup_db(force=True)
+
+
+@_serialized_durable_write
 def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAILY", paired_opening_session_id=None, pending_movements=None):
     """Save one immutable inventory capture with transaction + duplicate protection.
 
@@ -1559,6 +1668,9 @@ def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAI
     closing are committed atomically. An identical submission by the same user
     within two minutes is treated as a retry and is not inserted again.
     """
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:
+        return {'ok':False,'saved':False,'duplicate':False,'error':guard_msg}
     if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
         return {'ok':False,'saved':False,'duplicate':False,'error':'Sincronización en conflicto. La captura fue bloqueada para evitar pérdida de datos. Contacta al Developer/Owner.'}
     business_date=(session_date or local_today())
@@ -1601,15 +1713,19 @@ def save_session(kind, counts, session_date=None, notes="", inventory_cycle="DAI
     except Exception:
         con.rollback()
         raise
-    backup_ok,backup_msg=backup_db()
+    backup_ok,backup_msg=_confirmed_backup_after_write()
     return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at,'backup_ok':backup_ok,'backup_message':backup_msg}
 
+@_serialized_durable_write
 def save_historical_session(kind, counts, session_date, notes="", inventory_cycle="DAILY", paired_opening_session_id=None):
     """Developer/Owner historical capture from paper records.
 
     This intentionally bypasses the live Opening→Closing workflow because it edits an
     earlier business date. The real entry timestamp and Developer user are preserved.
     """
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:
+        return {'ok':False,'saved':False,'duplicate':False,'error':guard_msg}
     if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
         return {'ok':False,'saved':False,'duplicate':False,'error':'Sincronización en conflicto. La carga histórica fue bloqueada para proteger los datos.'}
     d=session_date.isoformat() if hasattr(session_date,'isoformat') else str(session_date)
@@ -1634,7 +1750,7 @@ def save_historical_session(kind, counts, session_date, notes="", inventory_cycl
         con.commit()
     except Exception:
         con.rollback(); raise
-    backup_ok,backup_msg=backup_db()
+    backup_ok,backup_msg=_confirmed_backup_after_write()
     return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at,'backup_ok':backup_ok,'backup_message':backup_msg}
 
 
@@ -1700,13 +1816,38 @@ def movement_qty_input(p,key,label="Cantidad"):
         if bottles>0: st.caption(f"Movimiento: {bottles:.2f} botellas · ml pendiente; se convertirán a oz cuando se complete la presentación.")
     return {'base':base,'bottles':bottles}
 
+@_serialized_durable_write
 def create_movement(typ,pid,qty,from_id=None,to_id=None,supplier=None,reference=None,obs="",d=None,bottle_equiv=None,do_backup=True):
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:
+        raise RuntimeError(guard_msg)
     if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
         raise RuntimeError('Sincronización en conflicto. Movimiento bloqueado para evitar pérdida de datos.')
     con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",((d or local_today()).isoformat(),typ,pid,qty,from_id,to_id,user['id'],supplier,reference,obs,now_iso(),bottle_equiv))
     con.commit()
-    if do_backup: backup_db()
+    if do_backup:
+        ok,msg=_confirmed_backup_after_write()
+        if not ok: raise RuntimeError('Movimiento guardado localmente, pero el respaldo durable quedó pendiente: '+msg)
+
+
+@_serialized_durable_write
+def save_movements_batch(entries):
+    """Atomically save a group of supplier/transfer movements, then confirm one durable backup."""
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:return {'ok':False,'error':guard_msg}
+    created=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        for e in entries:
+            con.execute("""INSERT INTO movements(movement_date,movement_type,product_id,qty_base,from_location_id,to_location_id,user_id,supplier,reference,observation,created_at,qty_bottle_equiv)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (e['date'],e['type'],e['pid'],e['qty'],e.get('from_id'),e.get('to_id'),user['id'],e.get('supplier'),e.get('reference'),e.get('obs',''),created,e.get('bottle_equiv')))
+        con.commit()
+    except Exception as exc:
+        con.rollback();return {'ok':False,'error':str(exc)}
+    bok,bmsg=_confirmed_backup_after_write()
+    return {'ok':True,'backup_ok':bok,'backup_message':bmsg,'created_at':created}
 
 def session_qty(d, pid, kind, lid):
     r=one("""SELECT ic.qty_base FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
@@ -2019,13 +2160,38 @@ def expected_sales(d,pid,p):
     return total
 
 
+@_serialized_durable_write
 def record_pos_batch(d,sale_group,note=""):
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:raise RuntimeError(guard_msg)
     if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
         raise RuntimeError('Sincronización en conflicto. POS bloqueado para evitar pérdida de datos.')
     ds=d.isoformat() if hasattr(d,'isoformat') else str(d)
     con.execute("INSERT INTO pos_batches(sale_date,sale_group,user_id,note,created_at) VALUES(?,?,?,?,?)",
                 (ds,sale_group,user['id'],note,now_iso()))
-    con.commit(); backup_db()
+    con.commit()
+    ok,msg=_confirmed_backup_after_write()
+    if not ok:raise RuntimeError('POS guardado localmente, pero el respaldo durable quedó pendiente: '+msg)
+
+
+@_serialized_durable_write
+def save_pos_group(d,sale_group,rows,note=""):
+    """Save POS detail rows and the confirmation batch in one SQLite transaction and one durable backup."""
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:return {'ok':False,'error':guard_msg}
+    ds=d.isoformat() if hasattr(d,'isoformat') else str(d);created=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        for r in rows:
+            con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (ds,r.get('cocktail_id'),r.get('product_id'),r['sale_type'],r['quantity'],r.get('oz_per_unit'),user['id'],note,created))
+        con.execute("INSERT INTO pos_batches(sale_date,sale_group,user_id,note,created_at) VALUES(?,?,?,?,?)",
+                    (ds,sale_group,user['id'],note,created))
+        con.commit()
+    except Exception as exc:
+        con.rollback();return {'ok':False,'error':str(exc)}
+    bok,bmsg=_confirmed_backup_after_write()
+    return {'ok':True,'backup_ok':bok,'backup_message':bmsg,'created_at':created}
 
 
 def pos_group_submitted(ds,sale_group):
@@ -2958,17 +3124,15 @@ ex("UPDATE users SET last_login_at=? WHERE id=?",(now_iso(),user['id']),do_backu
 
 # Visible safety signal for every authenticated user. A stale runtime should normally have been
 # auto-restored during preflight; true divergence is intentionally surfaced instead of hidden.
-sync_blocked=SYNC_PREFLIGHT_STATUS.get('status') in ('conflict','remote_error')
+sync_blocked=SYNC_PREFLIGHT_STATUS.get('status')=='conflict'
+sync_degraded=SYNC_PREFLIGHT_STATUS.get('status')=='remote_error'
 is_owner_session=normalized_email(user.get('email'))==normalized_email(secret_value('app','bootstrap_admin_email'))
 if SYNC_PREFLIGHT_STATUS.get('status')=='conflict':
-    st.error("⚠️ Protección de datos activa: esta instancia detectó una divergencia con Supabase. Las operaciones de escritura quedan restringidas hasta que Developer/Owner revise la sincronización.")
-elif SYNC_PREFLIGHT_STATUS.get('status')=='remote_error':
-    st.error("⚠️ No fue posible validar Supabase en esta ejecución. Para evitar una captura que quede únicamente en almacenamiento temporal, las operaciones quedan restringidas hasta recuperar la conexión. Actualiza la página para reintentar.")
+    st.error("⚠️ Protección de datos activa: esta instancia detectó una divergencia real con Supabase. Las escrituras quedan bloqueadas hasta que Developer/Owner revise la sincronización.")
+elif sync_degraded:
+    st.warning("⚠️ Supabase no respondió durante la comprobación inicial. Puedes consultar y preparar la captura normalmente; al pulsar Guardar, la aplicación volverá a validar Supabase en tiempo real y solo aceptará la escritura si el respaldo durable está disponible.")
 elif SYNC_PREFLIGHT_STATUS.get('status')=='restored_remote':
     st.toast("Base actualizada automáticamente desde el último respaldo válido de Supabase.",icon="✅")
-
-if sync_blocked and not is_owner_session:
-    st.info("El sistema está temporalmente en modo protegido. Los datos existentes siguen disponibles en modo consulta; las acciones que escriben inventario/POS/movimientos están bloqueadas hasta validar Supabase.")
 
 workflow=inventory_workflow_state()
 allowed_inventory_page='Cierre' if workflow['stage']=='CLOSING' else 'Apertura'
@@ -2981,17 +3145,19 @@ with st.sidebar:
     st.caption("**Flujo de inventario:** " + _workflow_status_text(workflow))
     if sync_blocked and is_owner_session:
         pages=['Dashboard','Administración']
-        st.warning("Modo protegido de sincronización: Dashboard queda en consulta y Administración permite diagnóstico; las escrituras están bloqueadas.")
+        st.warning("Modo protegido por conflicto real: Dashboard queda en consulta y Administración permite diagnóstico.")
     elif sync_blocked and user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages=['Dashboard','Reporte PDF']
-        st.warning("Modo consulta: Supabase no está validado; no se permiten escrituras hasta recuperar la sincronización.")
+        st.warning("Modo consulta por conflicto real: no se permiten escrituras hasta revisión del Developer/Owner.")
     elif sync_blocked:
         pages=[]
-        st.warning("Modo protegido: no se permiten capturas hasta recuperar la sincronización. Contacta al Manager/Developer.")
+        st.warning("Modo protegido por conflicto de datos. Contacta al Manager/Developer.")
     elif user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages=['Dashboard',allowed_inventory_page,'Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
+        if sync_degraded: st.warning("Conexión Supabase por revalidar. Puedes diligenciar datos; Guardar hará una validación remota obligatoria antes de aceptar la operación.")
     else:
         pages=[allowed_inventory_page,'Recibir pedido','Trasladar productos']
+        if sync_degraded: st.warning("Conexión Supabase por revalidar. Puedes diligenciar datos; Guardar validará el respaldo antes de aceptar la operación.")
     # MANAGER y MANAGER GENERAL pueden entrar a Administración; las acciones críticas
     # continúan protegidas dentro de la página para ADMIN/Developer Owner.
     if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN') and 'Administración' not in pages:
@@ -3008,7 +3174,11 @@ with st.sidebar:
 
 inventory_flash=st.session_state.pop('_inventory_flash',None)
 if inventory_flash:
-    st.success(inventory_flash)
+    if isinstance(inventory_flash,dict):
+        level=inventory_flash.get('level','success');msg=inventory_flash.get('message','')
+        (st.warning if level=='warning' else st.error if level=='error' else st.success)(msg)
+    else:
+        st.success(inventory_flash)
 if page is None:
     page_header("Sistema en modo protegido","No se aceptan nuevas capturas hasta confirmar la conexión durable con Supabase.")
     st.info("Tus datos existentes no se borraron. Actualiza la página en unos momentos o contacta al Manager/Developer.")
@@ -3098,7 +3268,8 @@ if page=='Apertura':
                     detail=f"Apertura {cycle_label.lower()} **parcial** · {new_prog['opening_count']}/{new_prog['required_count']} productos. Puedes continuar la apertura sin perder las capturas anteriores."
                 if result.get('saved'):
                     detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ El inventario quedó guardado en SQLite, pero el backup automático reportó: {result.get('backup_message','pendiente')}")
-                st.session_state['_inventory_flash']=operation_confirmation('Su apertura fue exitosa',d,detail,result.get('created_at'))
+                flash_msg=operation_confirmation(('Su apertura fue exitosa y respaldada' if result.get('backup_ok',True) else 'Apertura registrada; respaldo remoto pendiente'),d,detail,result.get('created_at'))
+                st.session_state['_inventory_flash']={'level':('success' if result.get('backup_ok',True) else 'warning'),'message':flash_msg}
                 st.rerun()
 
 elif page=='Cierre':
@@ -3202,7 +3373,8 @@ elif page=='Cierre':
                     detail=f"Cierre {cycle_label.lower()} **parcial** · {new_prog['closing_count']}/{new_prog['required_count']} productos. Cierre seguirá siendo la única acción habilitada hasta completarlo."
                 if result.get('saved'):
                     detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ El inventario quedó guardado en SQLite, pero el backup automático reportó: {result.get('backup_message','pendiente')}")
-                st.session_state['_inventory_flash']=operation_confirmation('Su cierre fue exitoso',d,detail,result.get('created_at'))
+                flash_msg=operation_confirmation(('Su cierre fue exitoso y respaldado' if result.get('backup_ok',True) else 'Cierre registrado; respaldo remoto pendiente'),d,detail,result.get('created_at'))
+                st.session_state['_inventory_flash']={'level':('success' if result.get('backup_ok',True) else 'warning'),'message':flash_msg}
                 st.rerun()
 
 elif page=='Recibir pedido':
@@ -3220,10 +3392,13 @@ elif page=='Recibir pedido':
     if st.button("Confirmar recepción",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty,beq,obs in rows: create_movement('SUPPLIER',pid,qty,None,dest,supplier,ref,obs,d,bottle_equiv=beq,do_backup=False)
-            bok,bmsg=backup_db()
-            detail=f"{len(rows)} producto(s) · Destino: **{dest_name}**" + (" · Backup ✅" if bok else f" · Backup pendiente: {bmsg}")
-            st.success(operation_confirmation('Su recepción de productos fue registrada correctamente',d,detail))
+            entries=[{'date':d.isoformat(),'type':'SUPPLIER','pid':pid,'qty':qty,'from_id':None,'to_id':dest,'supplier':supplier,'reference':ref,'obs':obs,'bottle_equiv':beq} for pid,qty,beq,obs in rows]
+            result=save_movements_batch(entries)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible registrar la recepción.'))
+            else:
+                detail=f"{len(rows)} producto(s) · Destino: **{dest_name}**" + (" · Backup durable ✅" if result.get('backup_ok') else f" · ⚠️ Backup pendiente: {result.get('backup_message')}")
+                st.success(operation_confirmation('Su recepción de productos fue registrada correctamente',d,detail,result.get('created_at')))
 
 elif page=='Trasladar productos':
     page_header("Trasladar productos", "Registra movimientos de inventario entre bodega y bar.")
@@ -3236,10 +3411,13 @@ elif page=='Trasladar productos':
     if st.button("Confirmar traslado Bodega → Bar",type="primary",width="stretch"):
         if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
         else:
-            for pid,qty,beq in rows: create_movement('TRANSFER',pid,qty,wh,bar,d=d,bottle_equiv=beq,do_backup=False)
-            bok,bmsg=backup_db()
-            detail=f"{len(rows)} producto(s) trasladado(s)" + (" · Backup ✅" if bok else f" · Backup pendiente: {bmsg}")
-            st.success(operation_confirmation('Su traslado Bodega → Bar fue registrado correctamente',d,detail))
+            entries=[{'date':d.isoformat(),'type':'TRANSFER','pid':pid,'qty':qty,'from_id':wh,'to_id':bar,'supplier':None,'reference':None,'obs':'','bottle_equiv':beq} for pid,qty,beq in rows]
+            result=save_movements_batch(entries)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible registrar el traslado.'))
+            else:
+                detail=f"{len(rows)} producto(s) trasladado(s)" + (" · Backup durable ✅" if result.get('backup_ok') else f" · ⚠️ Backup pendiente: {result.get('backup_message')}")
+                st.success(operation_confirmation('Su traslado Bodega → Bar fue registrado correctamente',d,detail,result.get('created_at')))
 
 elif page=='POS / Ventas':
     page_header("POS / Ventas", "Registra ventas de cócteles, shots, cervezas y botellas para calcular el consumo teórico.")
@@ -3264,13 +3442,15 @@ elif page=='POS / Ventas':
             if st.button("Guardar ventas de cócteles",type='primary',width='stretch',key='save_pos_cocktails'):
                 if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
                 else:
-                    for cid,qty in rows:
-                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                                    (d.isoformat(),cid,None,'Cóctel',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'COCKTAIL',obs); st.success(operation_confirmation('Sus ventas POS de cócteles fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de cócteles confirmado"))
+                    payload=[{'cocktail_id':cid,'product_id':None,'sale_type':'Cóctel','quantity':qty,'oz_per_unit':None} for cid,qty in rows]
+                    result=save_pos_group(d,'COCKTAIL',payload,obs)
+                    if not result.get('ok'): st.error(result.get('error','No fue posible guardar POS de cócteles.'))
+                    else: st.success(operation_confirmation('Sus ventas POS de cócteles fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de cócteles confirmado · " + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
         if st.button('Confirmar 0 ventas de cócteles',key='pos_c_zero',width='stretch'):
-            record_pos_batch(d,'COCKTAIL','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de cócteles fue confirmado correctamente',d,'Ventas registradas: **0**'))
+            result=save_pos_group(d,'COCKTAIL',[],'Confirmado sin ventas')
+            if not result.get('ok'): st.error(result.get('error','No fue posible confirmar POS.'))
+            else: st.success(operation_confirmation('Su POS de cócteles fue confirmado correctamente',d,'Ventas registradas: **0** · ' + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
     with tab_shot:
         liquors=products('Licor')
@@ -3290,13 +3470,15 @@ elif page=='POS / Ventas':
             if st.button("Guardar ventas de shots",type='primary',width='stretch',key='save_pos_shots'):
                 if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
                 else:
-                    for pid,qty,oz in rows:
-                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                                    (d.isoformat(),None,pid,'Shot',qty,oz,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'SHOT',obs); st.success(operation_confirmation('Sus ventas POS de shots fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de shots confirmado"))
+                    payload=[{'cocktail_id':None,'product_id':pid,'sale_type':'Shot','quantity':qty,'oz_per_unit':oz} for pid,qty,oz in rows]
+                    result=save_pos_group(d,'SHOT',payload,obs)
+                    if not result.get('ok'): st.error(result.get('error','No fue posible guardar POS de shots.'))
+                    else: st.success(operation_confirmation('Sus ventas POS de shots fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de shots confirmado · " + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
         if st.button('Confirmar 0 ventas de shots',key='pos_s_zero',width='stretch'):
-            record_pos_batch(d,'SHOT','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de shots fue confirmado correctamente',d,'Ventas registradas: **0**'))
+            result=save_pos_group(d,'SHOT',[],'Confirmado sin ventas')
+            if not result.get('ok'): st.error(result.get('error','No fue posible confirmar POS.'))
+            else: st.success(operation_confirmation('Su POS de shots fue confirmado correctamente',d,'Ventas registradas: **0** · ' + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
     with tab_beer:
         beers=products('Cerveza')
@@ -3314,13 +3496,15 @@ elif page=='POS / Ventas':
             if st.button("Guardar ventas de cervezas",type='primary',width='stretch',key='save_pos_beers'):
                 if not beer_rows: st.error("Ingresa al menos una cantidad mayor que cero.")
                 else:
-                    for pid,qty in beer_rows:
-                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                                    (d.isoformat(),None,pid,'Cerveza',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'BEER',obs); st.success(operation_confirmation('Sus ventas POS de cervezas fueron guardadas correctamente',d,f"{len(beer_rows)} producto(s) · POS de cervezas confirmado"))
+                    payload=[{'cocktail_id':None,'product_id':pid,'sale_type':'Cerveza','quantity':qty,'oz_per_unit':None} for pid,qty in beer_rows]
+                    result=save_pos_group(d,'BEER',payload,obs)
+                    if not result.get('ok'): st.error(result.get('error','No fue posible guardar POS de cervezas.'))
+                    else: st.success(operation_confirmation('Sus ventas POS de cervezas fueron guardadas correctamente',d,f"{len(beer_rows)} producto(s) · POS de cervezas confirmado · " + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
         if st.button('Confirmar 0 ventas de cervezas',key='pos_b_zero',width='stretch'):
-            record_pos_batch(d,'BEER','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de cervezas fue confirmado correctamente',d,'Ventas registradas: **0**'))
+            result=save_pos_group(d,'BEER',[],'Confirmado sin ventas')
+            if not result.get('ok'): st.error(result.get('error','No fue posible confirmar POS.'))
+            else: st.success(operation_confirmation('Su POS de cervezas fue confirmado correctamente',d,'Ventas registradas: **0** · ' + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
     with tab_bottle:
         liquors=products('Licor')
@@ -3339,13 +3523,15 @@ elif page=='POS / Ventas':
             if st.button("Guardar ventas por botella",type='primary',width='stretch',key='save_pos_bottles'):
                 if not rows: st.error("Ingresa al menos una cantidad mayor que cero.")
                 else:
-                    for pid,qty in rows:
-                        con.execute("INSERT INTO pos_sales(sale_date,cocktail_id,product_id,sale_type,quantity,oz_per_unit,user_id,observation,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                                    (d.isoformat(),None,pid,'Botella de licor',qty,None,user['id'],obs,now_iso()))
-                    con.commit(); record_pos_batch(d,'LIQUOR_BOTTLE',obs); st.success(operation_confirmation('Sus ventas POS de botellas de licor fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de botellas confirmado"))
+                    payload=[{'cocktail_id':None,'product_id':pid,'sale_type':'Botella de licor','quantity':qty,'oz_per_unit':None} for pid,qty in rows]
+                    result=save_pos_group(d,'LIQUOR_BOTTLE',payload,obs)
+                    if not result.get('ok'): st.error(result.get('error','No fue posible guardar POS de botellas.'))
+                    else: st.success(operation_confirmation('Sus ventas POS de botellas de licor fueron guardadas correctamente',d,f"{len(rows)} registro(s) · POS de botellas confirmado · " + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
         if st.button('Confirmar 0 ventas de botellas de licor',key='pos_l_zero',width='stretch'):
-            record_pos_batch(d,'LIQUOR_BOTTLE','Confirmado sin ventas'); st.success(operation_confirmation('Su POS de botellas de licor fue confirmado correctamente',d,'Ventas registradas: **0**'))
+            result=save_pos_group(d,'LIQUOR_BOTTLE',[],'Confirmado sin ventas')
+            if not result.get('ok'): st.error(result.get('error','No fue posible confirmar POS.'))
+            else: st.success(operation_confirmation('Su POS de botellas de licor fue confirmado correctamente',d,'Ventas registradas: **0** · ' + ('Backup durable ✅' if result.get('backup_ok') else '⚠️ Backup pendiente'),result.get('created_at')))
 
 elif page=='Dashboard':
     page_header("Dashboard Operacional", "Inventario, ventas, diferencias, alertas y actividad en una sola vista.")
@@ -4320,7 +4506,8 @@ elif page=='Administración':
                             detail += "  \nEste cierre quedó guardado sin apertura vinculada. Las comparaciones Apertura→Cierre permanecerán pendientes hasta que se transcriba una apertura compatible; no se generan diferencias falsas."
                         if result.get('saved'):
                             detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ Registro histórico guardado en SQLite; backup: {result.get('backup_message','pendiente')}")
-                        st.session_state['_inventory_flash']=operation_confirmation(f"Registro histórico de {'apertura' if hist_kind=='OPENING' else 'cierre'} guardado",hist_date,detail,result.get('created_at'))
+                        title=(f"Registro histórico de {'apertura' if hist_kind=='OPENING' else 'cierre'} guardado y respaldado" if result.get('backup_ok',True) else f"Registro histórico de {'apertura' if hist_kind=='OPENING' else 'cierre'} guardado; respaldo pendiente")
+                        st.session_state['_inventory_flash']={'level':('success' if result.get('backup_ok',True) else 'warning'),'message':operation_confirmation(title,hist_date,detail,result.get('created_at'))}
                         st.rerun()
             st.divider()
 
