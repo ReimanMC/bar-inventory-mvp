@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse, uuid
+import sqlite3, hashlib, io, math, re, unicodedata, json, os, base64, gzip, shutil, tempfile, urllib.request, urllib.error, urllib.parse, uuid, time
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.6"
+APP_VERSION = "0.5.7"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -265,18 +265,23 @@ def operation_confirmation(action, business_date=None, detail="", event_ts=None)
     return "  \n".join(parts)
 
 # ---------------------- Supabase Storage backup + safe synchronization ----------------------
-# V0.5.6 persistence model:
-# - SQLite remains the transactional working database for the Streamlit process.
-# - Supabase Storage is the durable source of recovery and version coordination.
-# - Every committed business write creates a verified SQLite snapshot.
-# - A manifest is written LAST and points to an immutable revision object. This prevents a
-#   partially uploaded `latest` file from becoming the recovery source.
-# - A stale local database is never allowed to overwrite a newer remote revision.
-# - If both sides changed independently, the local snapshot is preserved under conflicts/
-#   and `latest` is left untouched for Developer/Owner review.
+# V0.5.7 persistence model (MVP-safe):
+# - SQLite remains the transactional working database of the running Streamlit process.
+# - Supabase Storage is the durable recovery layer.
+# - Authoritative backups are IMMUTABLE unique revision objects under revisions_v2/.
+# - Recovery discovers the newest safe revision by Storage LIST metadata; it does not depend on a
+#   mutable manifest, latest file, or alternating slot. Supabase explicitly recommends new object
+#   paths instead of overwriting when freshness matters because CDN propagation can serve stale data.
+# - Legacy latest/manifest.json, slot_a/slot_b, daily and weekly objects remain readable only as a
+#   migration/recovery fallback. Once a V2 revision exists, they are never authoritative again.
+# - Every business write is committed locally, snapshotted with SQLite's backup API, uploaded to a
+#   unique remote path, downloaded again for SHA-256 verification, and only then marked synchronized.
+# - If remote and local changed independently, neither side is overwritten automatically.
 SYNC_PREFLIGHT_STATUS={"status":"not_checked","message":"","remote_health":None,"local_health":None}
-SYNC_MANIFEST_PATH='latest/manifest.json'
+SYNC_LEGACY_MANIFEST_PATH='latest/manifest.json'
 SYNC_LATEST_PATH='latest/bar_inventory_v3.db'
+SYNC_V2_PREFIX='revisions_v2'
+SYNC_HTTP_RETRIES=4
 
 
 def _supabase_cfg():
@@ -312,66 +317,108 @@ def _supabase_object_url(remote_path, authenticated=False):
     return f"{cfg['api_url']}/storage/v1/object/{mode}{bucket}/{path}"
 
 
-def _supabase_upload_bytes(payload,remote_path,content_type='application/octet-stream'):
-    req=urllib.request.Request(
-        _supabase_object_url(remote_path),data=payload,method='POST',
-        headers=_supabase_headers({
-            'Content-Type':content_type,
-            'x-upsert':'true',
-            'Cache-Control':'no-cache',
-        })
-    )
-    try:
-        with urllib.request.urlopen(req,timeout=25) as resp:
-            return 200 <= int(getattr(resp,'status',200)) < 300
-    except urllib.error.HTTPError as e:
-        body=e.read().decode('utf-8','ignore')[:700]
-        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
-
-
-def _supabase_download(remote_path):
-    req=urllib.request.Request(
-        _supabase_object_url(remote_path,authenticated=True),method='GET',
-        headers=_supabase_headers({'Cache-Control':'no-cache'})
-    )
-    try:
-        with urllib.request.urlopen(req,timeout=25) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        body=e.read().decode('utf-8','ignore')[:700]
-        raise RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
-
-
 def _is_supabase_missing_object_error(exc):
-    """Return True when Supabase Storage reports that an object does not exist.
-
-    Supabase may expose a missing Storage object either as HTTP 404 or, depending on
-    the gateway/path, as HTTP 400 with a JSON body containing statusCode=404,
-    error=not_found, message=Object not found or code=NoSuchKey. Treat all of those
-    as the same safe "object absent" condition instead of a connectivity failure.
-    """
-    text=str(exc or '').lower()
+    text=str(exc or '').lower().replace(' ', '')
     markers=(
-        'http 404',
-        '"statuscode":"404"',
-        '"statuscode":404',
-        '"code":"nosuchkey"',
-        '"error":"not_found"',
-        'object not found',
-        'no such key',
+        'http404', '"statuscode":"404"', '"statuscode":404', '"code":"nosuchkey"',
+        '"error":"not_found"', 'objectnotfound', 'nosuchkey', 'notfound'
     )
     return any(m in text for m in markers)
 
 
-def _supabase_download_optional(remote_path):
+def _is_supabase_retryable_error(exc):
+    text=str(exc or '').lower()
+    return any(x in text for x in ('http 408','http 425','http 429','http 500','http 502','http 503','http 504',
+                                           'timed out','timeout','temporarily unavailable','connection reset','urlopen error'))
+
+
+def _supabase_upload_bytes(payload,remote_path,content_type='application/octet-stream',upsert=True):
+    """Upload bytes. Immutable revision objects use upsert=False; rolling convenience copies use True."""
+    headers=_supabase_headers({'Content-Type':content_type,'Cache-Control':'no-store'})
+    headers['x-upsert']='true' if upsert else 'false'
+    last=None
+    for attempt in range(SYNC_HTTP_RETRIES):
+        req=urllib.request.Request(_supabase_object_url(remote_path),data=payload,method='POST',headers=headers)
+        try:
+            with urllib.request.urlopen(req,timeout=25) as resp:
+                return 200 <= int(getattr(resp,'status',200)) < 300
+        except urllib.error.HTTPError as e:
+            body=e.read().decode('utf-8','ignore')[:1200]
+            last=RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+            if attempt+1<SYNC_HTTP_RETRIES and _is_supabase_retryable_error(last):
+                time.sleep(0.6*(2**attempt)); continue
+            raise last
+        except (urllib.error.URLError,TimeoutError,OSError) as e:
+            last=RuntimeError(f"Supabase network error: {e}")
+            if attempt+1<SYNC_HTTP_RETRIES:
+                time.sleep(0.6*(2**attempt)); continue
+            raise last
+    raise last or RuntimeError('Supabase upload failed')
+
+
+def _supabase_download(remote_path,retry_missing=False):
+    """Authenticated private download with bounded retry for transient/just-created objects."""
+    last=None
+    attempts=SYNC_HTTP_RETRIES if retry_missing else max(2,SYNC_HTTP_RETRIES-1)
+    for attempt in range(attempts):
+        req=urllib.request.Request(
+            _supabase_object_url(remote_path,authenticated=True),method='GET',
+            headers=_supabase_headers({'Cache-Control':'no-store','Pragma':'no-cache'})
+        )
+        try:
+            with urllib.request.urlopen(req,timeout=25) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            body=e.read().decode('utf-8','ignore')[:1200]
+            last=RuntimeError(f"Supabase HTTP {e.code}: {body or e.reason}")
+            missing=_is_supabase_missing_object_error(last)
+            if attempt+1<attempts and ((retry_missing and missing) or _is_supabase_retryable_error(last)):
+                time.sleep(0.5*(2**attempt)); continue
+            raise last
+        except (urllib.error.URLError,TimeoutError,OSError) as e:
+            last=RuntimeError(f"Supabase network error: {e}")
+            if attempt+1<attempts:
+                time.sleep(0.5*(2**attempt)); continue
+            raise last
+    raise last or RuntimeError('Supabase download failed')
+
+
+def _supabase_download_optional(remote_path,retry_missing=False):
     try:
-        return _supabase_download(remote_path)
+        return _supabase_download(remote_path,retry_missing=retry_missing)
     except RuntimeError as e:
-        # Missing objects are expected during the first manifest bootstrap and for
-        # optional rolling files. They must NOT force protected/offline mode.
-        if _is_supabase_missing_object_error(e):
-            return None
+        if _is_supabase_missing_object_error(e): return None
         raise
+
+
+def _supabase_list_files(prefix='',limit=100,offset=0,order='desc'):
+    """List object metadata through Storage API (metadata plane; not CDN object cache)."""
+    cfg=_supabase_cfg(); bucket=urllib.parse.quote(cfg['bucket'],safe='')
+    url=f"{cfg['api_url']}/storage/v1/object/list/{bucket}"
+    body=json.dumps({
+        'prefix':str(prefix or '').strip('/'),'limit':int(limit),'offset':int(offset),
+        'sortBy':{'column':'name','order':'desc' if str(order).lower()=='desc' else 'asc'}
+    },separators=(',',':')).encode('utf-8')
+    last=None
+    for attempt in range(SYNC_HTTP_RETRIES):
+        req=urllib.request.Request(url,data=body,method='POST',headers=_supabase_headers({'Content-Type':'application/json','Cache-Control':'no-store'}))
+        try:
+            with urllib.request.urlopen(req,timeout=25) as resp:
+                data=json.loads(resp.read().decode('utf-8') or '[]')
+                if not isinstance(data,list): raise RuntimeError('Supabase list response is not a list')
+                return data
+        except urllib.error.HTTPError as e:
+            txt=e.read().decode('utf-8','ignore')[:1200]
+            last=RuntimeError(f"Supabase HTTP {e.code}: {txt or e.reason}")
+            if attempt+1<SYNC_HTTP_RETRIES and _is_supabase_retryable_error(last):
+                time.sleep(0.6*(2**attempt)); continue
+            raise last
+        except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError) as e:
+            last=RuntimeError(f"Supabase list error: {e}")
+            if attempt+1<SYNC_HTTP_RETRIES:
+                time.sleep(0.6*(2**attempt)); continue
+            raise last
+    raise last or RuntimeError('Supabase list failed')
 
 
 def _sqlite_health(path):
@@ -381,48 +428,37 @@ def _sqlite_health(path):
           "pos_batches":0,"cocktails":0,"recipes":0,"product_admin_audit":0,
           "last_session_date":None,"last_event_at":None,"size_bytes":0}
     if not path or not os.path.exists(path) or os.path.getsize(path)<=0:
-        info["reason"]="missing_or_empty"
-        return info
-    info['size_bytes']=int(os.path.getsize(path))
-    c=None
+        info["reason"]="missing_or_empty"; return info
+    info['size_bytes']=int(os.path.getsize(path)); c=None
     try:
         c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=15)
         quick=c.execute("PRAGMA quick_check").fetchone()
-        if not quick or str(quick[0]).lower()!="ok":
-            info["reason"]="quick_check_failed"
-            return info
+        if not quick or str(quick[0]).lower()!="ok": info["reason"]="quick_check_failed"; return info
         tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         missing=RECOVERY_REQUIRED_TABLES-tables
-        if missing:
-            info["reason"]="missing_tables:"+",".join(sorted(missing))
-            return info
-        def count_table(name):
-            return int(c.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) if name in tables else 0
-        info["users"]=count_table('users')
-        info["active_users"]=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
+        if missing: info["reason"]="missing_tables:"+",".join(sorted(missing)); return info
+        def count_table(name): return int(c.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) if name in tables else 0
+        info['users']=count_table('users')
+        info['active_users']=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
         for key,table in [('products','products'),('inventory_sessions','inventory_sessions'),('inventory_counts','inventory_counts'),
                           ('movements','movements'),('pos_sales','pos_sales'),('pos_batches','pos_batches'),('cocktails','cocktails'),
-                          ('recipes','recipes'),('product_admin_audit','product_admin_audit')]:
-            info[key]=count_table(table)
-        r=c.execute("SELECT MAX(session_date) FROM inventory_sessions").fetchone()
-        info['last_session_date']=r[0] if r else None
-        event_values=[]
+                          ('recipes','recipes'),('product_admin_audit','product_admin_audit')]: info[key]=count_table(table)
+        r=c.execute("SELECT MAX(session_date) FROM inventory_sessions").fetchone(); info['last_session_date']=r[0] if r else None
+        ev=[]
         for table in ('inventory_sessions','movements','pos_sales','pos_batches','product_admin_audit'):
             if table in tables:
                 cols={x[1] for x in c.execute(f"PRAGMA table_info({table})").fetchall()}
                 if 'created_at' in cols:
                     rr=c.execute(f"SELECT MAX(created_at) FROM {table}").fetchone()
-                    if rr and rr[0]: event_values.append(str(rr[0]))
-        info['last_event_at']=max(event_values) if event_values else None
-        info["valid"]=True; info["reason"]="ok"
-        return info
+                    if rr and rr[0]: ev.append(str(rr[0]))
+        info['last_event_at']=max(ev) if ev else None
+        info['valid']=True; info['reason']='ok'; return info
     except Exception as e:
-        info["reason"]=f"sqlite_error:{e}"
-        return info
+        info['reason']=f"sqlite_error:{e}"; return info
     finally:
         if c is not None:
-            try: c.close()
-            except Exception: pass
+            try:c.close()
+            except Exception:pass
 
 
 _DIGEST_TABLES=(
@@ -433,16 +469,11 @@ _DIGEST_EXCLUDE_COLUMNS={'users':{'last_login_at'}}
 
 
 def _db_data_digest(path):
-    """Canonical SHA-256 of durable application data, excluding sync metadata and login heartbeat.
-
-    The digest is intentionally independent from the SQLite file layout/WAL and therefore remains
-    stable after VACUUM, backup API copies and ordinary reads.
-    """
+    """Canonical SHA-256 of durable application data; independent from SQLite file layout/WAL."""
     if not path or not os.path.exists(path): return None
     c=None; h=hashlib.sha256()
     try:
-        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=15)
-        c.row_factory=sqlite3.Row
+        c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=15); c.row_factory=sqlite3.Row
         tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         for table in _DIGEST_TABLES:
             if table not in tables: continue
@@ -450,29 +481,26 @@ def _db_data_digest(path):
             cols=[x for x in cols if x not in _DIGEST_EXCLUDE_COLUMNS.get(table,set())]
             if not cols: continue
             order='id' if 'id' in cols else ('key' if 'key' in cols else cols[0])
-            sql=f"SELECT {','.join('"'+x+'"' for x in cols)} FROM \"{table}\" ORDER BY \"{order}\""
+            sql=f"SELECT {','.join(chr(34)+x+chr(34) for x in cols)} FROM {chr(34)+table+chr(34)} ORDER BY {chr(34)+order+chr(34)}"
             h.update((table+'\n').encode())
             for row in c.execute(sql):
                 vals=[]
                 for col in cols:
                     v=row[col]
-                    if isinstance(v,float):
-                        v=round(v,9)
+                    if isinstance(v,float): v=round(v,9)
                     vals.append(v)
-                h.update(json.dumps(vals,ensure_ascii=False,sort_keys=False,separators=(',',':'),default=str).encode('utf-8'))
-                h.update(b'\n')
+                h.update(json.dumps(vals,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8')); h.update(b'\n')
         return h.hexdigest()
     finally:
         if c is not None:
-            try: c.close()
-            except Exception: pass
+            try:c.close()
+            except Exception:pass
 
 
 def _file_sha256(path):
     h=hashlib.sha256()
     with open(path,'rb') as fh:
-        for chunk in iter(lambda:fh.read(1024*1024),b''):
-            h.update(chunk)
+        for chunk in iter(lambda:fh.read(1024*1024),b''): h.update(chunk)
     return h.hexdigest()
 
 
@@ -483,71 +511,34 @@ def _read_sync_state_path(path):
         c=sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro",uri=True,timeout=10)
         tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if 'sync_state' not in tables: return None
-        c.row_factory=sqlite3.Row
-        r=c.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
-        return dict(r) if r else None
-    except Exception:
-        return None
+        c.row_factory=sqlite3.Row; r=c.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
+        d=dict(r) if r else None
+        if d is not None: d['generation']=int(d.get('generation') or 0)
+        return d
+    except Exception:return None
     finally:
         if c is not None:
             try:c.close()
             except Exception:pass
 
 
-def _remote_manifest():
-    raw=_supabase_download_optional(SYNC_MANIFEST_PATH)
-    if not raw: return None
-    try:
-        data=json.loads(raw.decode('utf-8'))
-        if not isinstance(data,dict) or not data.get('revision') or not data.get('object_path') or not data.get('data_digest'):
-            raise ValueError('manifest incompleto')
-        return data
-    except Exception as e:
-        raise RuntimeError(f"Manifest de Supabase inválido: {e}")
-
-
-def _safe_sqlite_snapshot(source_path=None):
-    """Create a consistent SQLite snapshot using SQLite's online backup API."""
-    source_path=source_path or DB
-    if not os.path.exists(source_path): raise FileNotFoundError(source_path)
-    fd,tmp=tempfile.mkstemp(prefix='ramona_snapshot_',suffix='.db'); os.close(fd)
-    src=dst=None
-    try:
-        src=sqlite3.connect(source_path,timeout=30)
-        src.execute('PRAGMA busy_timeout=30000')
-        dst=sqlite3.connect(tmp,timeout=30)
-        src.backup(dst)
-        dst.commit(); dst.close(); dst=None
-        src.close(); src=None
-        check=_sqlite_health(tmp)
-        if not check['valid']:
-            raise RuntimeError(f"Snapshot SQLite no válido: {check['reason']}")
-        return tmp,check
-    except Exception:
-        for c in (dst,src):
-            try:
-                if c: c.close()
-            except Exception: pass
-        try: os.remove(tmp)
-        except Exception: pass
-        raise
-
-
-def _write_sync_state_in_file(path,revision,base_digest,status='ok',message=''):
+def _write_sync_state_in_file(path,revision,base_digest,status='ok',message='',generation=0):
     c=sqlite3.connect(path,timeout=30)
     try:
         c.execute("""CREATE TABLE IF NOT EXISTS sync_state(
           id INTEGER PRIMARY KEY CHECK(id=1), remote_revision TEXT, base_digest TEXT,
-          last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT)""")
-        c.execute("""INSERT INTO sync_state(id,remote_revision,base_digest,last_synced_at,last_backup_status,last_backup_message)
-                     VALUES(1,?,?,?,?,?)
+          last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT, generation INTEGER DEFAULT 0)""")
+        cols={r[1] for r in c.execute("PRAGMA table_info(sync_state)").fetchall()}
+        if 'generation' not in cols: c.execute("ALTER TABLE sync_state ADD COLUMN generation INTEGER DEFAULT 0")
+        c.execute("""INSERT INTO sync_state(id,remote_revision,base_digest,last_synced_at,last_backup_status,last_backup_message,generation)
+                     VALUES(1,?,?,?,?,?,?)
                      ON CONFLICT(id) DO UPDATE SET remote_revision=excluded.remote_revision,
                        base_digest=excluded.base_digest,last_synced_at=excluded.last_synced_at,
-                       last_backup_status=excluded.last_backup_status,last_backup_message=excluded.last_backup_message""",
-                  (revision,base_digest,now_iso(),status,message[:1000]))
+                       last_backup_status=excluded.last_backup_status,last_backup_message=excluded.last_backup_message,
+                       generation=excluded.generation""",
+                  (revision,base_digest,now_iso(),status,message[:1000],int(generation or 0)))
         c.commit()
-    finally:
-        c.close()
+    finally:c.close()
 
 
 def _health_vector(h):
@@ -556,7 +547,6 @@ def _health_vector(h):
 
 
 def _dominance(a,b):
-    """Return 1 if a has every tracked row-count >= b and at least one greater; -1 reverse; 0 otherwise."""
     va=_health_vector(a); vb=_health_vector(b)
     if all(x>=y for x,y in zip(va,vb)) and any(x>y for x,y in zip(va,vb)): return 1
     if all(x<=y for x,y in zip(va,vb)) and any(x<y for x,y in zip(va,vb)): return -1
@@ -564,134 +554,210 @@ def _dominance(a,b):
 
 
 def _atomic_replace_db(source_path,reason='sync'):
-    """Atomically replace the runtime DB after preserving the previous valid local file."""
     stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     if os.path.exists(DB) and os.path.getsize(DB)>0:
-        try: shutil.copy2(DB,f"bar_inventory_v3_before_{reason}_{stamp}.db")
-        except Exception: pass
-    # WAL sidecars belong to the previous database inode. They must not survive a
-    # file-level restore or SQLite may reject the replacement with disk I/O errors.
-    for sidecar in (DB+'-wal', DB+'-shm'):
+        try:shutil.copy2(DB,f"bar_inventory_v3_before_{reason}_{stamp}.db")
+        except Exception:pass
+    for sidecar in (DB+'-wal',DB+'-shm'):
         try:
-            if os.path.exists(sidecar): os.remove(sidecar)
-        except Exception: pass
-    tmp_local=DB+'.incoming'
-    shutil.copy2(source_path,tmp_local)
-    os.replace(tmp_local,DB)
-    for sidecar in (DB+'-wal', DB+'-shm'):
+            if os.path.exists(sidecar):os.remove(sidecar)
+        except Exception:pass
+    tmp_local=DB+'.incoming'; shutil.copy2(source_path,tmp_local); os.replace(tmp_local,DB)
+    for sidecar in (DB+'-wal',DB+'-shm'):
         try:
-            if os.path.exists(sidecar): os.remove(sidecar)
-        except Exception: pass
+            if os.path.exists(sidecar):os.remove(sidecar)
+        except Exception:pass
 
 
-def _remote_revision_to_temp():
-    """Return validated remote recovery DB, health, digest and manifest.
-
-    When V0.5.5 manifest exists, recovery uses its immutable revisions/<uuid>.db object.
-    Legacy deployments fall back to rolling latest/bar_inventory_v3.db.
-    """
-    if not _supabase_ready():
-        return None,{"valid":False,"reason":"supabase_not_configured"},None,None
-    manifest=_remote_manifest()
-    remote_path=(manifest.get('object_path') if manifest else SYNC_LATEST_PATH)
-    raw=_supabase_download_optional(remote_path)
-    if raw is None:
-        return None,{"valid":False,"reason":"remote_missing"},None,manifest
-    fd,tmp=tempfile.mkstemp(prefix='ramona_remote_',suffix='.db'); os.close(fd)
+def _safe_sqlite_snapshot(source_path=None):
+    source_path=source_path or DB
+    if not os.path.exists(source_path): raise FileNotFoundError(source_path)
+    fd,tmp=tempfile.mkstemp(prefix='ramona_snapshot_',suffix='.db'); os.close(fd); src=dst=None
     try:
-        with open(tmp,'wb') as fh:
-            fh.write(raw); fh.flush()
-        health=_sqlite_health(tmp)
-        if not health['valid']:
-            raise RuntimeError(f"Backup remoto no válido: {health['reason']}")
-        digest=_db_data_digest(tmp)
-        if manifest:
-            if digest!=manifest.get('data_digest'):
-                raise RuntimeError('El digest del backup remoto no coincide con el manifest.')
-            expected_sha=manifest.get('file_sha256')
-            if expected_sha and _file_sha256(tmp)!=expected_sha:
-                raise RuntimeError('La huella SHA-256 del archivo remoto no coincide con el manifest.')
-        return tmp,health,digest,manifest
+        src=sqlite3.connect(source_path,timeout=30); src.execute('PRAGMA busy_timeout=30000')
+        dst=sqlite3.connect(tmp,timeout=30); src.backup(dst); dst.commit(); dst.close(); dst=None; src.close(); src=None
+        check=_sqlite_health(tmp)
+        if not check['valid']: raise RuntimeError(f"Snapshot SQLite no válido: {check['reason']}")
+        return tmp,check
     except Exception:
-        try: os.remove(tmp)
-        except Exception: pass
+        for c in (dst,src):
+            try:
+                if c:c.close()
+            except Exception:pass
+        try:os.remove(tmp)
+        except Exception:pass
         raise
 
 
-def _preflight_supabase_sync():
-    """Run before the app opens SQLite.
+def _legacy_manifest_optional():
+    raw=_supabase_download_optional(SYNC_LEGACY_MANIFEST_PATH)
+    if not raw:return None
+    try:
+        data=json.loads(raw.decode('utf-8'))
+        return data if isinstance(data,dict) else None
+    except Exception:return None
 
-    This is the central anti-regression rule: a local runtime copy that is older than the durable
-    remote copy is replaced BEFORE the UI or any write is allowed to use it. A divergent branch is
-    never auto-published over Supabase.
+
+def _download_valid_db(remote_path,expected_digest=None,expected_sha=None,retry_missing=False):
+    raw=_supabase_download_optional(remote_path,retry_missing=retry_missing)
+    if raw is None:return None
+    fd,tmp=tempfile.mkstemp(prefix='ramona_remote_',suffix='.db');os.close(fd)
+    try:
+        with open(tmp,'wb') as fh:fh.write(raw);fh.flush();os.fsync(fh.fileno())
+        h=_sqlite_health(tmp)
+        if not h.get('valid'):raise RuntimeError(f"Backup remoto no válido ({remote_path}): {h.get('reason')}")
+        d=_db_data_digest(tmp)
+        if expected_digest and d!=expected_digest:raise RuntimeError(f"Digest no coincide para {remote_path}")
+        if expected_sha and _file_sha256(tmp)!=expected_sha:raise RuntimeError(f"SHA-256 no coincide para {remote_path}")
+        return tmp,h,d
+    except Exception:
+        try:os.remove(tmp)
+        except Exception:pass
+        raise
+
+
+def _parse_v2_meta(raw,path=''):
+    try:
+        m=json.loads(raw.decode('utf-8'))
+        required=('revision','object_path','data_digest','generation','created_at')
+        if not isinstance(m,dict) or any(m.get(k) in (None,'') for k in required):raise ValueError('metadata incompleta')
+        m['generation']=int(m['generation']); m['_meta_path']=path; return m
+    except Exception as e:raise RuntimeError(f"Metadata V2 inválida {path}: {e}")
+
+
+def _remote_v2_head_meta():
+    """Return one authoritative V2 head meta. Multiple different heads at same generation = conflict."""
+    items=_supabase_list_files(SYNC_V2_PREFIX,limit=100,order='desc')
+    names=[]
+    for item in items:
+        name=str(item.get('name') or '')
+        if name.endswith('.meta.json'): names.append(name)
+    if not names:return None
+    metas=[]
+    # Names begin with zero-padded generation, so the first handful contain every plausible head.
+    for name in names[:20]:
+        path=f"{SYNC_V2_PREFIX}/{name}" if '/' not in name else name
+        raw=_supabase_download_optional(path,retry_missing=True)
+        if raw is None:continue
+        try:metas.append(_parse_v2_meta(raw,path))
+        except Exception:continue
+    if not metas:return None
+    maxgen=max(int(m['generation']) for m in metas)
+    heads=[m for m in metas if int(m['generation'])==maxgen]
+    digests={m['data_digest'] for m in heads}
+    if len(digests)>1:
+        raise RuntimeError(f"Conflicto remoto: existen {len(heads)} revisiones diferentes en generación {maxgen}. Ninguna será sobrescrita.")
+    heads.sort(key=lambda m:(str(m.get('created_at') or ''),str(m.get('revision') or '')),reverse=True)
+    return heads[0]
+
+
+def _remote_legacy_best_to_temp():
+    """Migration fallback: inspect manifest target + rolling latest/daily/weekly + legacy slots.
+    Choose only a candidate that safely dominates the others; never guess between equal-size branches.
     """
-    global SYNC_PREFLIGHT_STATUS, AUTO_RECOVERY_APPLIED
-    local_h=_sqlite_health(DB); SYNC_PREFLIGHT_STATUS['local_health']=local_h
+    paths=[]; manifest=_legacy_manifest_optional()
+    if manifest and manifest.get('object_path'):paths.append(str(manifest['object_path']))
+    paths += [SYNC_LATEST_PATH,'revisions/slot_a.db','revisions/slot_b.db']
+    for folder in ('daily','weekly'):
+        try:
+            for item in _supabase_list_files(folder,limit=8,order='desc')[:4]:
+                name=str(item.get('name') or '')
+                if name.endswith('.db'):paths.append(f"{folder}/{name}" if '/' not in name else name)
+        except Exception:pass
+    # de-duplicate while preserving priority
+    seen=set(); paths=[p for p in paths if p and not (p in seen or seen.add(p))]
+    candidates=[]
+    for path in paths:
+        try:
+            expected_d=manifest.get('data_digest') if (manifest and path==manifest.get('object_path')) else None
+            expected_s=manifest.get('file_sha256') if (manifest and path==manifest.get('object_path')) else None
+            got=_download_valid_db(path,expected_d,expected_s,retry_missing=True)
+            if got:
+                tmp,h,d=got;candidates.append((tmp,h,d,path))
+        except Exception:
+            # Broken legacy objects are ignored when another valid durable candidate exists.
+            continue
+    if not candidates:return None,{"valid":False,"reason":"remote_missing"},None,None
+    # Same digest -> any copy is equivalent; prefer the first priority path.
+    unique={c[2] for c in candidates}
+    if len(unique)==1:
+        chosen=candidates[0]
+    else:
+        winners=[]
+        for c in candidates:
+            if all((o is c) or c[2]==o[2] or _dominance(c[1],o[1])==1 for o in candidates):winners.append(c)
+        if len(winners)!=1:
+            for c in candidates:
+                try:os.remove(c[0])
+                except Exception:pass
+            raise RuntimeError('Conflicto entre respaldos legacy de Supabase; no existe una copia que domine de forma segura a todas las demás.')
+        chosen=winners[0]
+    for c in candidates:
+        if c is not chosen:
+            try:os.remove(c[0])
+            except Exception:pass
+    tmp,h,d,path=chosen
+    rev=(str(manifest.get('revision')) if manifest and path==manifest.get('object_path') and manifest.get('revision') else f"legacy-{d[:16]}")
+    meta={'schema':1,'revision':rev,'generation':0,'data_digest':d,'object_path':path,
+          'created_at':str((manifest or {}).get('created_at') or h.get('last_event_at') or ''),'legacy':True,'health':h}
+    return tmp,h,d,meta
+
+
+def _remote_revision_to_temp():
+    """Return the durable remote head. V2 immutable revisions are preferred permanently."""
+    if not _supabase_ready():return None,{"valid":False,"reason":"supabase_not_configured"},None,None
+    meta=_remote_v2_head_meta()
+    if meta:
+        got=_download_valid_db(meta['object_path'],meta.get('data_digest'),meta.get('file_sha256'),retry_missing=True)
+        if not got:raise RuntimeError('La revisión V2 anunciada por Storage no pudo descargarse.')
+        tmp,h,d=got;return tmp,h,d,meta
+    return _remote_legacy_best_to_temp()
+
+
+def _preflight_supabase_sync():
+    """Reconcile before SQLite opens. Genuine remote errors fail closed for WRITES, not by guessing."""
+    global SYNC_PREFLIGHT_STATUS,AUTO_RECOVERY_APPLIED
+    local_h=_sqlite_health(DB);SYNC_PREFLIGHT_STATUS['local_health']=local_h
     if not _supabase_ready():
-        SYNC_PREFLIGHT_STATUS.update(status='offline',message='Supabase no configurado; se conserva la base local.')
-        return False
+        SYNC_PREFLIGHT_STATUS.update(status='offline',message='Supabase no configurado; se conserva la base local.');return False
     tmp=None
     try:
-        tmp,remote_h,remote_digest,manifest=_remote_revision_to_temp()
-        SYNC_PREFLIGHT_STATUS['remote_health']=remote_h
+        tmp,remote_h,remote_digest,meta=_remote_revision_to_temp();SYNC_PREFLIGHT_STATUS['remote_health']=remote_h
         if not tmp or not remote_h.get('valid'):
-            SYNC_PREFLIGHT_STATUS.update(status='remote_missing',message='Supabase no tiene todavía un backup válido; se permitirá inicializar la sincronización desde una base local validada.')
-            return False
+            SYNC_PREFLIGHT_STATUS.update(status='remote_missing',message='Supabase no tiene todavía un backup válido; se permitirá inicializar desde una base local validada.');return False
         local_reset=(not local_h.get('valid') or (local_h.get('inventory_sessions',0)==0 and local_h.get('inventory_counts',0)==0 and local_h.get('users',0)<=1))
         if local_reset:
-            _atomic_replace_db(tmp,'supabase_recovery')
-            AUTO_RECOVERY_APPLIED=True
-            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Base local ausente/reiniciada; se recuperó Supabase antes de abrir la app.',local_health=remote_h)
-            return True
+            _atomic_replace_db(tmp,'supabase_recovery');AUTO_RECOVERY_APPLIED=True
+            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Base local ausente/reiniciada; se recuperó Supabase antes de abrir la app.',local_health=remote_h);return True
         local_digest=_db_data_digest(DB)
         if local_digest==remote_digest:
-            SYNC_PREFLIGHT_STATUS.update(status='synced',message='Base local y Supabase contienen los mismos datos.')
-            return False
-        sync_state=_read_sync_state_path(DB)
-        if manifest and sync_state:
-            local_base_rev=str(sync_state.get('remote_revision') or '')
-            local_base_digest=str(sync_state.get('base_digest') or '')
-            remote_rev=str(manifest.get('revision') or '')
-            if local_base_rev==remote_rev:
-                # Local data changed after the last synchronized remote revision. Preserve it; the
-                # next verified backup can safely advance remote from the same parent revision.
-                SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='Hay cambios locales pendientes de respaldar sobre la revisión remota actual.')
-                return False
-            if local_base_digest and local_digest==local_base_digest:
-                _atomic_replace_db(tmp,'supabase_newer')
-                AUTO_RECOVERY_APPLIED=True
-                SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase era más reciente; se actualizó la base local antes de continuar.',local_health=remote_h)
-                return True
-            # Both sides moved from different revisions. Never guess.
-            stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-            try: shutil.copy2(DB,f"bar_inventory_v3_sync_conflict_{stamp}.db")
-            except Exception: pass
-            SYNC_PREFLIGHT_STATUS.update(status='conflict',message='Conflicto de versiones: local y Supabase cambiaron independientemente. Se bloquea publicación automática.')
-            return False
-        # Legacy DB without V0.5.5 sync metadata: use conservative row-count dominance only.
-        dom=_dominance(remote_h,local_h)
-        if dom==1:
-            _atomic_replace_db(tmp,'supabase_legacy_newer')
-            AUTO_RECOVERY_APPLIED=True
-            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase contiene una base legacy más completa; se recuperó automáticamente.',local_health=remote_h)
-            return True
-        if dom==-1:
-            SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='La base local legacy contiene más datos que Supabase; se preserva para respaldo controlado.')
-            return False
-        # Same row counts but different durable data, or incomparable vectors => conflict.
+            SYNC_PREFLIGHT_STATUS.update(status='synced',message='Base local y Supabase contienen los mismos datos.');return False
+        state=_read_sync_state_path(DB) or {};base_rev=str(state.get('remote_revision') or '');base_digest=str(state.get('base_digest') or '')
+        remote_rev=str((meta or {}).get('revision') or '')
+        # Same parent by revision OR digest means the local DB is a legitimate unsynced descendant.
+        if (base_rev and base_rev==remote_rev) or (base_digest and base_digest==remote_digest):
+            SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='Hay cambios locales pendientes de publicar sobre la revisión remota conocida.');return False
+        if base_digest and local_digest==base_digest:
+            _atomic_replace_db(tmp,'supabase_newer');AUTO_RECOVERY_APPLIED=True
+            SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase era más reciente; se actualizó la base local antes de continuar.',local_health=remote_h);return True
+        # Legacy DB without lineage: only strict row-count dominance is safe.
+        if not base_rev and not base_digest:
+            dom=_dominance(remote_h,local_h)
+            if dom==1:
+                _atomic_replace_db(tmp,'supabase_legacy_newer');AUTO_RECOVERY_APPLIED=True
+                SYNC_PREFLIGHT_STATUS.update(status='restored_remote',message='Supabase contiene una base más completa; se recuperó automáticamente.',local_health=remote_h);return True
+            if dom==-1:
+                SYNC_PREFLIGHT_STATUS.update(status='local_ahead',message='La base local contiene más datos y será publicada de forma controlada.');return False
         stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-        try: shutil.copy2(DB,f"bar_inventory_v3_sync_conflict_{stamp}.db")
-        except Exception: pass
-        SYNC_PREFLIGHT_STATUS.update(status='conflict',message='Local y Supabase difieren sin relación segura de antigüedad. No se sobrescribe ninguna copia.')
-        return False
+        try:shutil.copy2(DB,f"bar_inventory_v3_sync_conflict_{stamp}.db")
+        except Exception:pass
+        SYNC_PREFLIGHT_STATUS.update(status='conflict',message='Local y Supabase cambiaron independientemente. Se conserva todo y se bloquean escrituras hasta revisión.');return False
     except Exception as e:
-        SYNC_PREFLIGHT_STATUS.update(status='remote_error',message=f'No se pudo verificar Supabase: {e}')
-        return False
+        SYNC_PREFLIGHT_STATUS.update(status='remote_error',message=f'No se pudo verificar Supabase tras varios reintentos: {e}');return False
     finally:
         if tmp:
-            try: os.remove(tmp)
-            except Exception: pass
-
+            try:os.remove(tmp)
+            except Exception:pass
 
 # ---------------------- optional Google Drive backup ----------------------
 def _gdrive_cfg():
@@ -736,144 +802,127 @@ def backup_db_to_drive(force=False):
 
 
 def _save_conflict_snapshot(snapshot_path,local_digest,reason):
-    """Best-effort durable preservation of a divergent local branch without touching latest.
-
-    Conflict storage is bounded: one rolling object plus one object per calendar day.
-    """
-    today=local_today().isoformat()
-    paths=['conflicts/latest_conflict.db',f'conflicts/conflict_{today}.db']
+    """Best-effort durable preservation of a divergent local branch without touching authoritative revisions."""
+    today=local_today().isoformat(); token=uuid.uuid4().hex[:10]
+    paths=[f'conflicts/{today}_{token}_{local_digest[:12]}.db']
     try:
-        with open(snapshot_path,'rb') as fh: payload=fh.read()
-        for remote in paths:
-            _supabase_upload_bytes(payload,remote)
+        with open(snapshot_path,'rb') as fh:payload=fh.read()
+        for remote in paths:_supabase_upload_bytes(payload,remote,upsert=False)
         return paths[0]
-    except Exception:
-        return None
+    except Exception:return None
+
+
+def _publish_rolling_copies_best_effort(payload):
+    """Human-friendly copies only. Recovery never trusts these mutable paths in V0.5.7+."""
+    warnings=[];today=local_today();iso=today.isocalendar()
+    rolling=[SYNC_LATEST_PATH,f"daily/bar_inventory_{today.isoformat()}.db",f"weekly/bar_inventory_{iso.year}-W{iso.week:02d}.db"]
+    for remote in rolling:
+        try:_supabase_upload_bytes(payload,remote,upsert=True)
+        except Exception as e:warnings.append(f"{remote}: {e}")
+    return warnings
 
 
 def backup_db_to_supabase(force=False,allow_bootstrap=True):
-    """Publish a verified DB revision without allowing stale-local regression.
-
-    Upload order is inactive safe slot -> rolling files -> manifest LAST. Recovery always trusts
-    the manifest's verified slot, not a possibly half-updated rolling file.
-    """
-    if not _supabase_ready(): return False,"Supabase backup no configurado"
-    snap=None
+    """Publish one immutable verified V2 revision; mutable rolling files are convenience copies only."""
+    if not _supabase_ready():return False,'Supabase backup no configurado'
+    snap=None;remote_tmp=None
     try:
-        snap,health=_safe_sqlite_snapshot()
-        local_digest=_db_data_digest(snap)
-        local_state=_read_sync_state_path(DB) or {}
-        manifest=_remote_manifest()
-        remote_digest=None
-        remote_rev=None
-        if manifest:
-            remote_digest=str(manifest.get('data_digest') or '')
-            remote_rev=str(manifest.get('revision') or '')
-            base_rev=str(local_state.get('remote_revision') or '')
-            base_digest=str(local_state.get('base_digest') or '')
-            if local_digest==remote_digest:
-                # Already durable. Just align local sync metadata; do not generate redundant revision.
-                _write_sync_state_in_file(DB,remote_rev,local_digest,'ok','Datos ya sincronizados con Supabase')
-                st.session_state['_last_supabase_backup']=str(manifest.get('created_at') or local_now().isoformat(timespec='seconds'))
-                st.session_state['_last_supabase_backup_health']=health
-                st.session_state.pop('_supabase_backup_error',None)
+        snap,health=_safe_sqlite_snapshot();local_digest=_db_data_digest(snap);state=_read_sync_state_path(DB) or {}
+        remote_tmp,remote_h,remote_digest,remote_meta=_remote_revision_to_temp()
+        remote_valid=bool(remote_tmp and remote_h.get('valid'))
+        legacy_equivalent=False
+        if remote_valid and local_digest==remote_digest:
+            if int((remote_meta or {}).get('schema') or 1)>=2:
+                gen=int((remote_meta or {}).get('generation') or 0);rev=str((remote_meta or {}).get('revision') or '')
+                _write_sync_state_in_file(DB,rev,local_digest,'ok','Datos ya sincronizados con Supabase',generation=gen)
+                st.session_state['_last_supabase_backup']=str((remote_meta or {}).get('created_at') or local_now().isoformat(timespec='seconds'))
+                st.session_state['_last_supabase_backup_health']=health;st.session_state.pop('_supabase_backup_error',None)
                 return True,f"Supabase ya sincronizado · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos"
-            if base_rev and base_rev!=remote_rev:
-                conflict_path=_save_conflict_snapshot(snap,local_digest,'remote revision advanced')
-                msg="Supabase tiene una revisión más reciente que la base desde la que partió esta instancia. latest NO fue sobrescrito."
-                if conflict_path: msg+=f" La copia local quedó preservada en {conflict_path}."
-                _write_sync_state_in_file(DB,base_rev,base_digest or local_digest,'conflict',msg)
-                st.session_state['_supabase_backup_error']=msg
-                return False,msg
-            if not base_rev:
-                # Upgrading a legacy DB. Never overwrite a remote legacy/latest with an incomparable branch.
-                tmp_r=None
-                try:
-                    tmp_r,rh,rd,_=_remote_revision_to_temp()
-                    if rd and rd!=local_digest:
-                        dom=_dominance(health,rh)
-                        if dom!=1:
-                            conflict_path=_save_conflict_snapshot(snap,local_digest,'legacy divergence')
-                            msg="Conflicto legacy detectado; latest se conservó intacto."
-                            if conflict_path: msg+=f" Copia local preservada en {conflict_path}."
-                            st.session_state['_supabase_backup_error']=msg
-                            return False,msg
-                finally:
-                    if tmp_r:
-                        try:os.remove(tmp_r)
-                        except Exception:pass
-        else:
-            # First manifest: compare against legacy rolling latest if it exists.
-            raw_latest=_supabase_download_optional(SYNC_LATEST_PATH)
-            if raw_latest:
-                fd,rtmp=tempfile.mkstemp(prefix='ramona_legacy_remote_',suffix='.db'); os.close(fd)
-                try:
-                    with open(rtmp,'wb') as fh: fh.write(raw_latest)
-                    rh=_sqlite_health(rtmp); rd=_db_data_digest(rtmp) if rh.get('valid') else None
-                    if rd and rd!=local_digest:
-                        dom=_dominance(health,rh)
-                        if dom!=1:
-                            conflict_path=_save_conflict_snapshot(snap,local_digest,'bootstrap divergence')
-                            msg="No se creó el manifest porque el latest legacy y la base local divergen. latest quedó protegido."
-                            if conflict_path: msg+=f" Copia local preservada en {conflict_path}."
-                            st.session_state['_supabase_backup_error']=msg
-                            return False,msg
-                finally:
-                    try:os.remove(rtmp)
-                    except Exception:pass
-        parent_revision=remote_rev
-        revision=uuid.uuid4().hex
-        created=local_now().isoformat(timespec='seconds')
-        # Two-slot crash-safe protocol. We always write the INACTIVE slot first. The manifest
-        # continues pointing to the previous slot until the new file has been fully verified.
-        current_slot=(str(manifest.get('slot') or 'a').lower() if manifest else 'a')
-        next_slot='b' if current_slot=='a' else 'a'
-        revision_path=f"revisions/slot_{next_slot}.db"
-        _write_sync_state_in_file(snap,revision,local_digest,'ok','Backup confirmado en Supabase')
+            # Same durable data but only legacy objects exist: publish one immutable V2 revision
+            # so future recovery no longer depends on mutable latest/manifest/slot paths.
+            legacy_equivalent=True
+        base_rev=str(state.get('remote_revision') or '');base_digest=str(state.get('base_digest') or '')
+        if remote_valid:
+            remote_rev=str((remote_meta or {}).get('revision') or '')
+            if base_rev or base_digest:
+                if not ((base_rev and base_rev==remote_rev) or (base_digest and base_digest==remote_digest)):
+                    conflict_path=_save_conflict_snapshot(snap,local_digest,'remote advanced')
+                    msg='Supabase avanzó desde otra base; la copia local NO sobrescribió la revisión remota.'
+                    if conflict_path:msg+=f' Copia local preservada en {conflict_path}.'
+                    _write_sync_state_in_file(DB,base_rev,base_digest or local_digest,'conflict',msg,generation=int(state.get('generation') or 0))
+                    st.session_state['_supabase_backup_error']=msg;return False,msg
+            else:
+                dom=_dominance(health,remote_h)
+                if not legacy_equivalent and dom!=1:
+                    conflict_path=_save_conflict_snapshot(snap,local_digest,'legacy divergence')
+                    msg='Conflicto legacy detectado; no se publicó sobre Supabase.'
+                    if conflict_path:msg+=f' Copia local preservada en {conflict_path}.'
+                    st.session_state['_supabase_backup_error']=msg;return False,msg
+        remote_gen=int((remote_meta or {}).get('generation') or 0) if remote_valid else 0
+        generation=remote_gen+1;revision=uuid.uuid4().hex;created=local_now().isoformat(timespec='seconds')
+        compact=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        stem=f"g{generation:010d}_{compact}_{revision}"
+        revision_path=f"{SYNC_V2_PREFIX}/{stem}.db";meta_path=f"{SYNC_V2_PREFIX}/{stem}.meta.json"
+        _write_sync_state_in_file(snap,revision,local_digest,'ok','Backup V2 confirmado en Supabase',generation=generation)
         file_sha=_file_sha256(snap)
-        with open(snap,'rb') as fh: payload=fh.read()
-        if not _supabase_upload_bytes(payload,revision_path): raise RuntimeError('No se confirmó la revisión segura')
-        # Verify inactive slot before it can become the manifest target.
-        verify_raw=_supabase_download(revision_path)
-        if hashlib.sha256(verify_raw).hexdigest()!=file_sha:
-            raise RuntimeError('La revisión subida no superó verificación SHA-256')
-        today=local_today(); iso=today.isocalendar()
-        rolling=[SYNC_LATEST_PATH,f"daily/bar_inventory_{today.isoformat()}.db",f"weekly/bar_inventory_{iso.year}-W{iso.week:02d}.db"]
-        for remote in rolling:
-            if not _supabase_upload_bytes(payload,remote): raise RuntimeError(f"No se confirmó la carga de {remote}")
-        manifest_new={
-            'schema':1,'revision':revision,'parent_revision':parent_revision,'created_at':created,'slot':next_slot,
-            'object_path':revision_path,'file_sha256':file_sha,'data_digest':local_digest,
-            'app_version':APP_VERSION,'health':health,
+        with open(snap,'rb') as fh:payload=fh.read()
+        # Immutable create: no upsert, therefore no CDN overwrite window.
+        _supabase_upload_bytes(payload,revision_path,upsert=False)
+        verify=_supabase_download(revision_path,retry_missing=True)
+        if hashlib.sha256(verify).hexdigest()!=file_sha:raise RuntimeError('La revisión V2 subida no superó verificación SHA-256')
+        meta={
+            'schema':2,'revision':revision,'generation':generation,
+            'parent_revision':str((remote_meta or {}).get('revision') or '') if remote_valid else None,
+            'created_at':created,'object_path':revision_path,'file_sha256':file_sha,
+            'data_digest':local_digest,'app_version':APP_VERSION,'health':health,
         }
-        mbytes=json.dumps(manifest_new,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
-        if not _supabase_upload_bytes(mbytes,SYNC_MANIFEST_PATH,'application/json'):
-            raise RuntimeError('No se confirmó la publicación del manifest')
-        # Only after remote commit marker succeeds do we advance the live DB's base revision.
-        _write_sync_state_in_file(DB,revision,local_digest,'ok','Backup confirmado en Supabase')
-        st.session_state['_last_supabase_backup']=created
-        st.session_state['_last_supabase_backup_health']=health
-        st.session_state.pop('_supabase_backup_error',None)
-        return True,f"Backup Supabase OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos · rev {revision[:8]}"
+        _supabase_upload_bytes(json.dumps(meta,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8'),meta_path,'application/json',upsert=False)
+        # Verify metadata directly, then confirm Storage LIST sees an unambiguous head.
+        mraw=_supabase_download(meta_path,retry_missing=True);_parse_v2_meta(mraw,meta_path)
+        head=None
+        for attempt in range(SYNC_HTTP_RETRIES):
+            try:head=_remote_v2_head_meta()
+            except RuntimeError:
+                raise
+            if head and int(head.get('generation') or -1)>=generation:break
+            time.sleep(0.5*(2**attempt))
+        if not head:raise RuntimeError('La revisión se cargó, pero Storage aún no confirmó el head V2.')
+        if int(head.get('generation') or 0)>generation:
+            if head.get('data_digest')!=local_digest:
+                conflict_path=_save_conflict_snapshot(snap,local_digest,'concurrent newer head')
+                msg='Otra escritura válida avanzó Supabase durante el respaldo; se preservó esta rama sin sobrescribirla.'
+                if conflict_path:msg+=f' Copia preservada en {conflict_path}.'
+                st.session_state['_supabase_backup_error']=msg;return False,msg
+            revision=str(head['revision']);generation=int(head['generation'])
+        elif str(head.get('revision'))!=revision:
+            if head.get('data_digest')!=local_digest:
+                raise RuntimeError(f"Conflicto remoto detectado en generación {generation}; ambas revisiones quedan preservadas.")
+            revision=str(head['revision'])
+        _write_sync_state_in_file(DB,revision,local_digest,'ok','Backup V2 confirmado en Supabase',generation=generation)
+        rolling_warnings=_publish_rolling_copies_best_effort(payload)
+        st.session_state['_last_supabase_backup']=created;st.session_state['_last_supabase_backup_health']=health;st.session_state.pop('_supabase_backup_error',None)
+        suffix=(' · copias rolling pendientes' if rolling_warnings else '')
+        return True,f"Backup Supabase V2 OK · {health['inventory_sessions']} sesiones · {health['inventory_counts']} conteos · gen {generation}{suffix}"
     except Exception as e:
         st.session_state['_supabase_backup_error']=str(e)
-        return False,f"No se pudo respaldar en Supabase sin riesgo de pérdida: {e}"
+        return False,f"No se pudo confirmar el respaldo durable en Supabase: {e}"
     finally:
-        if snap:
-            try: os.remove(snap)
-            except Exception: pass
+        for p in (snap,remote_tmp):
+            if p:
+                try:os.remove(p)
+                except Exception:pass
 
 
 def restore_latest_from_supabase_to_temp():
     tmp,h,d,m=_remote_revision_to_temp()
     if h.get('valid'):
-        h=dict(h); h['data_digest']=d; h['revision']=(m.get('revision') if m else None); h['manifest']=bool(m)
+        h=dict(h);h['data_digest']=d;h['revision']=(m.get('revision') if m else None);h['generation']=int((m or {}).get('generation') or 0);h['v2']=bool((m or {}).get('schema')==2)
     return tmp,h
 
 
 def backup_db(force=False):
     """Primary backup dispatcher. Supabase is authoritative when configured."""
-    if _supabase_ready(): return backup_db_to_supabase(force=force)
+    if _supabase_ready():return backup_db_to_supabase(force=force)
     return backup_db_to_drive(force=force)
 
 
@@ -1113,36 +1162,38 @@ def ensure_v053_schema():
     con.commit()
 ensure_v053_schema()
 
-# V0.5.5+ migration: durable synchronization lineage with Supabase.
-def ensure_v055_schema():
+# V0.5.7 migration: durable synchronization lineage with immutable Supabase revisions.
+def ensure_v057_schema():
     con.execute("""CREATE TABLE IF NOT EXISTS sync_state(
       id INTEGER PRIMARY KEY CHECK(id=1), remote_revision TEXT, base_digest TEXT,
-      last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT)""")
+      last_synced_at TEXT, last_backup_status TEXT, last_backup_message TEXT, generation INTEGER DEFAULT 0)""")
+    cols={r[1] for r in con.execute("PRAGMA table_info(sync_state)").fetchall()}
+    if 'generation' not in cols:con.execute("ALTER TABLE sync_state ADD COLUMN generation INTEGER DEFAULT 0")
     con.commit()
-ensure_v055_schema()
+ensure_v057_schema()
+
 
 def _align_or_bootstrap_sync_state():
-    """Align this runtime with the remote manifest, or safely create the first manifest.
-
-    Called after schema migrations. It never overwrites a divergent remote branch.
-    """
-    if not _supabase_ready(): return
+    """After migrations, align local lineage or publish a pending legitimate local descendant."""
+    if not _supabase_ready():return
+    tmp=None
     try:
-        digest=_db_data_digest(DB)
-        manifest=_remote_manifest()
-        if manifest and digest==manifest.get('data_digest'):
-            _write_sync_state_in_file(DB,str(manifest.get('revision')),digest,'ok','Sincronización verificada al iniciar')
-            return
+        digest=_db_data_digest(DB);tmp,rh,rd,meta=_remote_revision_to_temp()
+        if tmp and rh.get('valid') and digest==rd:
+            if int((meta or {}).get('schema') or 1)>=2:
+                _write_sync_state_in_file(DB,str((meta or {}).get('revision') or ''),digest,'ok','Sincronización verificada al iniciar',generation=int((meta or {}).get('generation') or 0));return
+            # Migrate an equivalent legacy backup to one immutable V2 revision.
+            backup_db_to_supabase(force=True,allow_bootstrap=True);return
         status=SYNC_PREFLIGHT_STATUS.get('status')
-        if manifest is None and status not in ('conflict','remote_error'):
+        if status in ('remote_missing','local_ahead'):
             backup_db_to_supabase(force=True,allow_bootstrap=True)
-        elif manifest and status=='local_ahead':
-            # A prior local commit may have completed before its remote backup. The publish
-            # function performs optimistic revision validation before advancing latest.
-            backup_db_to_supabase(force=True)
     except Exception as e:
-        try: st.session_state['_supabase_backup_error']=str(e)
-        except Exception: pass
+        try:st.session_state['_supabase_backup_error']=str(e)
+        except Exception:pass
+    finally:
+        if tmp:
+            try:os.remove(tmp)
+            except Exception:pass
 
 # ---------------------- catalog seed from current sheet ----------------------
 BEERS = ["Corona","Corona Sunbrew","XX","Negra","Especial","Sol","Coors","Molson"]
@@ -2917,8 +2968,7 @@ elif SYNC_PREFLIGHT_STATUS.get('status')=='restored_remote':
     st.toast("Base actualizada automáticamente desde el último respaldo válido de Supabase.",icon="✅")
 
 if sync_blocked and not is_owner_session:
-    st.info("El sistema está temporalmente en modo protegido. Tus datos existentes están conservados; intenta nuevamente en unos momentos o contacta al Developer/Owner.")
-    st.stop()
+    st.info("El sistema está temporalmente en modo protegido. Los datos existentes siguen disponibles en modo consulta; las acciones que escriben inventario/POS/movimientos están bloqueadas hasta validar Supabase.")
 
 workflow=inventory_workflow_state()
 allowed_inventory_page='Cierre' if workflow['stage']=='CLOSING' else 'Apertura'
@@ -2930,8 +2980,14 @@ with st.sidebar:
     st.caption(f"{ROLE_LABELS.get(user['role'],user['role'])} · {user['email']}")
     st.caption("**Flujo de inventario:** " + _workflow_status_text(workflow))
     if sync_blocked and is_owner_session:
-        pages=['Administración']
-        st.warning("Modo protegido de sincronización: solo Administración está disponible hasta resolver la inconsistencia o recuperar la conexión con Supabase.")
+        pages=['Dashboard','Administración']
+        st.warning("Modo protegido de sincronización: Dashboard queda en consulta y Administración permite diagnóstico; las escrituras están bloqueadas.")
+    elif sync_blocked and user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
+        pages=['Dashboard','Reporte PDF']
+        st.warning("Modo consulta: Supabase no está validado; no se permiten escrituras hasta recuperar la sincronización.")
+    elif sync_blocked:
+        pages=[]
+        st.warning("Modo protegido: no se permiten capturas hasta recuperar la sincronización. Contacta al Manager/Developer.")
     elif user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
         pages=['Dashboard',allowed_inventory_page,'Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
     else:
@@ -2942,14 +2998,21 @@ with st.sidebar:
         pages += ['Administración']
     icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
     display=[f"{icons.get(p,'•')}  {p}" for p in pages]
-    selected=st.radio("Navegación",display,label_visibility="collapsed")
-    page=pages[display.index(selected)]
+    if display:
+        selected=st.radio("Navegación",display,label_visibility="collapsed")
+        page=pages[display.index(selected)]
+    else:
+        page=None
     st.markdown("---")
     if st.button("Cerrar sesión",width="stretch"): st.logout()
 
 inventory_flash=st.session_state.pop('_inventory_flash',None)
 if inventory_flash:
     st.success(inventory_flash)
+if page is None:
+    page_header("Sistema en modo protegido","No se aceptan nuevas capturas hasta confirmar la conexión durable con Supabase.")
+    st.info("Tus datos existentes no se borraron. Actualiza la página en unos momentos o contacta al Manager/Developer.")
+    st.stop()
 
 # --------------------------- pages ---------------------------
 if page=='Apertura':
@@ -4080,7 +4143,7 @@ elif page=='Administración':
             else:
                 st.error("⚠️ Local y Supabase NO contienen los mismos datos. No realices nuevas capturas hasta revisar Recuperación de base de datos. La protección V0.5.5 impide sobrescribir automáticamente una rama divergente.")
         elif _supabase_ready():
-            st.warning("Supabase está configurado, pero todavía no se pudo validar una revisión remota.")
+            st.warning("Supabase está configurado, pero todavía no se pudo validar una revisión durable remota.")
         st.caption(f"Preflight de esta ejecución: {SYNC_PREFLIGHT_STATUS.get('status')} · {SYNC_PREFLIGHT_STATUS.get('message','')}")
         st.divider()
 
@@ -4089,7 +4152,7 @@ elif page=='Administración':
         if _supabase_ready():
             last=st.session_state.get('_last_supabase_backup','Aún no realizado en esta sesión')
             st.success(f"Supabase Storage configurado · último backup en esta sesión: {last}")
-            st.caption("Cada escritura confirmada se valida y publica mediante dos slots seguros alternados; después actualiza `latest/bar_inventory_v3.db`, el archivo diario y el semanal. Los nombres se sobrescriben para evitar cientos de copias y el manifest se publica al final como punto de recuperación confirmado.")
+            st.caption("Cada escritura confirmada crea primero una revisión inmutable y verificada en `revisions_v2/`. Solo después se actualizan `latest`, el diario y el semanal como copias de conveniencia. La recuperación usa siempre la revisión inmutable más reciente, evitando caché obsoleta y sobrescrituras accidentales.")
             if st.button("Crear / verificar backup ahora en Supabase",width="stretch",key='supabase_backup_now'):
                 ok,msg=backup_db_to_supabase(force=True); (st.success if ok else st.error)(msg)
             if st.session_state.get('_supabase_backup_error'):
