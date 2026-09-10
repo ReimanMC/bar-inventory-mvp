@@ -1,12 +1,14 @@
-# Inventario La Ramona — V0.5.7
+# Inventario La Ramona — V0.5.8
 
 ## Objetivo
 
-V0.5.7 corrige la causa de los bloqueos intermitentes de sincronización observados en V0.5.5/V0.5.6. La aplicación deja de usar como fuente autoritativa objetos de Supabase que se sobrescriben (`latest/manifest.json` y `revisions/slot_a.db` / `slot_b.db`).
+V0.5.8 prioriza la **captura diaria confiable y el respaldo durable**. Corrige el falso conflicto que podía aparecer durante la migración legacy cuando `latest`, `daily`, `weekly` y los slots contenían varias copias equivalentes de la misma base. Esas copias ahora se agrupan por digest y se tratan como una sola versión lógica.
 
-Supabase Storage recomienda usar nuevas rutas de objeto cuando la frescura inmediata importa, porque sobrescribir una ruta puede tardar en propagarse por la capa de caché/CDN. V0.5.7 usa revisiones inmutables únicas y descubre la última revisión mediante el listado de metadatos de Storage.
+También cambia el comportamiento ante fallos transitorios de Supabase: el Dashboard y los formularios siguen disponibles para consulta/diligenciamiento, pero **cada escritura operativa se revalida contra Supabase inmediatamente antes de guardar**. Una captura no se acepta si la instancia no puede demostrar que parte de la revisión durable vigente.
 
-La lógica funcional de inventario, Dashboard, POS, abastecimiento, carga histórica, roles, recetas, reportes y conciliación física se conserva sin cambios respecto a V0.5.6.
+Para reducir condiciones de carrera, las escrituras críticas se serializan dentro del proceso Streamlit y los lotes de POS, recepciones y traslados se guardan en una sola transacción SQLite antes de crear el respaldo.
+
+La lógica funcional de inventario, Dashboard, abastecimiento, recetas, roles, reportes y conciliación física permanece igual.
 
 ## 1. Revisión inmutable como fuente durable
 
@@ -50,11 +52,11 @@ weekly/bar_inventory_YYYY-Www.db
 
 pero esos archivos son únicamente copias de conveniencia para revisión/descarga manual.
 
-La recuperación automática de V0.5.7 usa siempre `revisions_v2/`. Por tanto, una copia `latest` atrasada o servida temporalmente desde caché no puede degradar la base recuperada.
+La recuperación automática de V0.5.8 usa siempre `revisions_v2/`. Por tanto, una copia `latest` atrasada o servida temporalmente desde caché no puede degradar la base recuperada.
 
 ## 3. Migración automática desde V0.5.6
 
-En el primer arranque V0.5.7:
+En el primer arranque V0.5.8:
 
 1. busca revisiones V2;
 2. si todavía no existen, revisa los respaldos legacy disponibles:
@@ -67,7 +69,7 @@ En el primer arranque V0.5.7:
 4. elige una copia únicamente cuando existe una relación segura de superioridad/completitud;
 5. crea la primera revisión inmutable V2.
 
-Si un manifest legacy apunta a un slot faltante, V0.5.7 puede recuperar desde un `latest`/daily/weekly válido en lugar de bloquear toda la aplicación por `NoSuchKey`.
+Si un manifest legacy apunta a un slot faltante, V0.5.8 puede recuperar desde un `latest`/daily/weekly válido. Además, varias copias legacy idénticas ya no se interpretan como múltiples ganadores/conflicto: se agrupan por digest y se selecciona la versión lógica que domina de forma segura a las demás.
 
 ## 4. Protección contra regresión de datos
 
@@ -93,25 +95,33 @@ Los conflictos intentan preservarse en un objeto único bajo `conflicts/`.
 
 ## 5. Resistencia a errores transitorios
 
-Las operaciones de Storage incorporan reintentos acotados con backoff para:
+Las operaciones de Storage incorporan reintentos con backoff para:
 
 - timeouts;
 - 408/425/429;
 - 500/502/503/504;
+- conexiones reiniciadas/rechazadas;
+- cierres inesperados de conexión;
 - errores temporales de red;
-- objetos recién creados que todavía no son visibles en una lectura inmediata.
+- objetos recién creados que todavía no son visibles inmediatamente.
 
-Un `NoSuchKey` de una ruta legacy opcional no se interpreta automáticamente como pérdida de conectividad.
+La búsqueda de la revisión V2 fue optimizada: el nombre del archivo ya contiene la generación, por lo que primero se identifica el `generation` mayor desde LIST y solo se descarga la metadata de esa generación. Esto reduce drásticamente las llamadas a Storage en cada verificación.
 
-## 6. Modo protegido
+## 6. Protección de escritura sin bloquear la operación de consulta
 
-Un conflicto real o una indisponibilidad persistente de Supabase continúa bloqueando nuevas escrituras para evitar que información quede únicamente en almacenamiento temporal.
+Un error transitorio de Supabase durante la carga de una página **ya no oculta Apertura/Cierre/POS/Movimientos**. El usuario puede consultar y diligenciar normalmente.
 
-En V0.5.7 el modo protegido es menos disruptivo:
+Al pulsar Guardar, `_write_sync_guard()` realiza una comprobación remota fresca y obligatoria:
 
-- Manager / Manager General / Admin pueden consultar Dashboard y Reporte PDF en modo lectura;
-- Developer/Owner puede consultar Dashboard y Administración para diagnóstico;
-- Staff recibe el mensaje de protección y no puede realizar capturas hasta recuperar la sincronización.
+- local = remoto → permite guardar;
+- local es descendiente legítimo con cambios aún no respaldados → respalda primero y luego permite continuar;
+- remoto es más reciente → rechaza la escritura y solicita actualizar antes de guardar;
+- ramas divergentes → bloquea la escritura y preserva los datos;
+- Supabase no responde tras los reintentos → no acepta una nueva escritura.
+
+Así, una indisponibilidad momentánea no deja a todos los usuarios sin poder ver la aplicación, pero tampoco permite que una captura nueva se confirme sobre una base no validada.
+
+Las operaciones críticas usan un lock de proceso para serializar **validación → escritura → backup**, reduciendo carreras entre sesiones simultáneas de Streamlit.
 
 ## 7. SQLite local
 
@@ -127,7 +137,7 @@ Se conserva:
 
 ## 8. Lógica operativa preservada
 
-V0.5.7 no modifica las funciones de negocio ya estabilizadas:
+V0.5.8 conserva las funciones de negocio ya estabilizadas:
 
 - Apertura → Cierre → nueva Apertura;
 - cierre después de medianoche con fecha operativa correcta;
@@ -146,43 +156,40 @@ V0.5.7 no modifica las funciones de negocio ya estabilizadas:
 - roles/permisos y Reporte Ejecutivo;
 - `America/Toronto` para presentación de fechas/horas.
 
-## 9. Validación V0.5.7
+## 9. Validación V0.5.8
 
 Se verificó:
 
 - `py_compile` de `app.py`;
-- que ninguna función de negocio fuera modificada respecto a V0.5.6; los cambios se limitan a persistencia/sincronización y UX de modo protegido;
-- recuperación de una base 14 sesiones / 309 conteos desde una copia remota 19 / 386;
-- bootstrap legacy → primera revisión V2;
-- escritura local posterior y publicación generación 2;
-- recuperación de un runtime obsoleto desde la generación más nueva;
-- manifest legacy apuntando a slot faltante con fallback seguro a `latest` válido;
-- detección de dos ramas diferentes en la misma generación sin seleccionar una arbitrariamente;
-- reconocimiento de `HTTP 400 + statusCode 404 + NoSuchKey`;
-- integridad de los SQLite reales usados como referencia.
+- selección legacy con varias copias equivalentes del mismo digest + una copia anterior: se elige la versión nueva sin falso conflicto;
+- descubrimiento V2 descargando únicamente la metadata de la generación más alta;
+- guard de escritura presente antes de Apertura/Cierre histórico/live, POS y movimientos;
+- serialización de escrituras críticas mediante `RLock`;
+- recepción de proveedor y traslado guardados en una sola transacción SQLite;
+- detalle POS + confirmación de lote guardados en una sola transacción SQLite;
+- segunda tentativa de backup durable después de una escritura confirmada;
+- errores transitorios de lectura no ocultan los formularios, mientras el guard de escritura mantiene la protección;
+- conservación de la reconciliación Apertura + Entradas − Cierre − Ajustes y POS pendiente hasta confirmación.
 
 ## 10. Actualización
 
-Para pasar de V0.5.6 a V0.5.7:
+Para pasar de V0.5.7 a V0.5.8:
 
+- **antes del deploy**, descarga manualmente la SQLite actual si existe una captura reciente que todavía no esté confirmada en Supabase;
 - reemplaza `app.py`;
-- actualiza `README.md` si deseas mantener documentación;
-- opcional: sube `docs/VALIDATION_V0.5.7.txt`.
-
-No cambia `requirements.txt`, Streamlit Secrets ni el bucket de Supabase.
+- actualiza `README.md`;
+- opcional: sube `docs/VALIDATION_V0.5.8.txt`;
+- no cambia `requirements.txt`, Streamlit Secrets ni el bucket de Supabase.
 
 No subas `.db`, Secrets, `__pycache__` ni `.pyc` a GitHub.
-
-### Antes del deploy
-
-Si existe una captura reciente que todavía no confirmó respaldo en Supabase, descarga manualmente la SQLite actual antes de actualizar código.
 
 ### Después del deploy
 
 1. entra como Developer/Owner;
-2. ve a **Administración → Configuración → Estado de sincronización**;
-3. confirma que Local y Supabase coinciden;
-4. confirma que aparece una revisión V2 / generación;
-5. en Supabase Storage verifica la carpeta `revisions_v2/`;
-6. realiza una única escritura real controlada;
-7. confirma que la generación aumenta y que el otro usuario ve el mismo Dashboard.
+2. confirma que la versión sea V0.5.8;
+3. ve a **Administración → Configuración → Estado de sincronización**;
+4. confirma que local y remoto coinciden o que la base local más reciente se publique correctamente;
+5. realiza una sola Apertura/Cierre controlada;
+6. verifica que el mensaje confirme **Backup durable ✅**;
+7. revisa desde otro usuario que el Dashboard muestre la misma actividad;
+8. solo después reanuda la operación normal.
