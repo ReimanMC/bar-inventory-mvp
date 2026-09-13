@@ -1,195 +1,207 @@
-# Inventario La Ramona — V0.5.8
+# Inventario La Ramona — V0.5.9
 
 ## Objetivo
 
-V0.5.8 prioriza la **captura diaria confiable y el respaldo durable**. Corrige el falso conflicto que podía aparecer durante la migración legacy cuando `latest`, `daily`, `weekly` y los slots contenían varias copias equivalentes de la misma base. Esas copias ahora se agrupan por digest y se tratan como una sola versión lógica.
+V0.5.9 separa completamente el **inventario diario** del **inventario semanal** sin modificar la arquitectura de persistencia y respaldo estabilizada en V0.5.8.
 
-También cambia el comportamiento ante fallos transitorios de Supabase: el Dashboard y los formularios siguen disponibles para consulta/diligenciamiento, pero **cada escritura operativa se revalida contra Supabase inmediatamente antes de guardar**. Una captura no se acepta si la instancia no puede demostrar que parte de la revisión durable vigente.
+La prioridad continúa siendo que cada captura confirmada quede primero en SQLite mediante una transacción segura y después se publique como una revisión inmutable validada en Supabase Storage.
 
-Para reducir condiciones de carrera, las escrituras críticas se serializan dentro del proceso Streamlit y los lotes de POS, recepciones y traslados se guardan en una sola transacción SQLite antes de crear el respaldo.
+## 1. Inventario diario
 
-La lógica funcional de inventario, Dashboard, abastecimiento, recetas, roles, reportes y conciliación física permanece igual.
-
-## 1. Revisión inmutable como fuente durable
-
-Cada escritura confirmada crea una nueva revisión única bajo:
+El flujo diario queda exclusivamente como:
 
 ```text
-revisions_v2/
-  g0000000001_<timestamp>_<revision>.db
-  g0000000001_<timestamp>_<revision>.meta.json
-  g0000000002_<timestamp>_<revision>.db
-  g0000000002_<timestamp>_<revision>.meta.json
-  ...
+Apertura diaria → Cierre diario → nueva Apertura
 ```
 
-Los archivos de revisión no se sobrescriben. El `.db` se valida antes y después de subirlo mediante:
+Incluye:
 
-- `PRAGMA quick_check`;
-- digest lógico SHA-256 de los datos de negocio;
-- SHA-256 del archivo SQLite completo.
+- todas las cervezas activas;
+- únicamente los licores marcados como principales/diarios;
+- capturas parciales de cervezas o licores;
+- trazabilidad por usuario y hora;
+- comparación física posterior con POS cuando POS haya sido cargado o confirmado.
 
-La metadata incluye:
+El selector Diario/Semanal fue retirado de Apertura y Cierre para evitar mezclar procesos distintos.
 
-- revisión;
-- generación monotónica;
-- revisión padre;
-- fecha/hora;
-- digest de datos;
-- SHA-256 del archivo;
-- versión de la app;
-- conteos de salud de la base.
+Los registros WEEKLY antiguos que ya existan en `inventory_sessions` se conservan para auditoría, pero ya no participan en el flujo operativo diario.
 
-## 2. `latest`, `daily` y `weekly` dejan de ser autoritativos
+## 2. Inventario semanal independiente
 
-La aplicación continúa actualizando por comodidad:
+Se agrega una nueva opción en el menú lateral:
 
 ```text
-latest/bar_inventory_v3.db
-daily/bar_inventory_YYYY-MM-DD.db
-weekly/bar_inventory_YYYY-Www.db
+📋 Inventario semanal
 ```
 
-pero esos archivos son únicamente copias de conveniencia para revisión/descarga manual.
+Está disponible para STAFF, MANAGER, MANAGER GENERAL y ADMIN cuando la sincronización permite escrituras.
 
-La recuperación automática de V0.5.8 usa siempre `revisions_v2/`. Por tanto, una copia `latest` atrasada o servida temporalmente desde caché no puede degradar la base recuperada.
+Características:
 
-## 3. Migración automática desde V0.5.6
+- puede iniciarse cualquier día según disponibilidad del equipo; la fecha operativa se toma automáticamente del día en que se inicia;
+- cuenta **todos los productos físicos activos** de Cerveza y Licor;
+- no requiere Apertura/Cierre;
+- no modifica ni bloquea el turno diario;
+- no genera diferencias contra POS;
+- puede guardarse por partes;
+- puede continuar otro usuario en otro momento;
+- conserva quién ingresó cada captura y a qué hora;
+- puede recontarse un producto antes de finalizar;
+- solo se finaliza cuando todos los productos requeridos tienen un conteo.
 
-En el primer arranque V0.5.8:
+Un inventario semanal en progreso no se usa todavía como stock oficial. Solo un inventario semanal **COMPLETED** puede convertirse en referencia física para abastecimiento.
 
-1. busca revisiones V2;
-2. si todavía no existen, revisa los respaldos legacy disponibles:
-   - `latest/manifest.json` y su objeto;
-   - `latest/bar_inventory_v3.db`;
-   - `daily/`;
-   - `weekly/`;
-   - `revisions/slot_a.db` y `slot_b.db`;
-3. valida cada candidato;
-4. elige una copia únicamente cuando existe una relación segura de superioridad/completitud;
-5. crea la primera revisión inmutable V2.
+## 3. Nuevas tablas de auditoría semanal
 
-Si un manifest legacy apunta a un slot faltante, V0.5.8 puede recuperar desde un `latest`/daily/weekly válido. Además, varias copias legacy idénticas ya no se interpretan como múltiples ganadores/conflicto: se agrupan por digest y se selecciona la versión lógica que domina de forma segura a las demás.
+V0.5.9 añade:
 
-## 4. Protección contra regresión de datos
+```text
+weekly_inventory_sessions
+weekly_inventory_session_products
+weekly_inventory_captures
+weekly_inventory_counts
+```
 
-Antes de publicar una nueva revisión la aplicación compara:
+### `weekly_inventory_sessions`
 
-- revisión remota base;
-- digest lógico;
-- generación;
-- usuarios/productos;
-- sesiones y conteos;
+Conserva fecha física, estado, usuario/hora de inicio y usuario/hora de finalización.
+
+### `weekly_inventory_session_products`
+
+Congela la lista de productos requeridos al iniciar el inventario. Si posteriormente se crea un producto nuevo, no cambia el progreso de un inventario semanal que ya estaba en curso.
+
+### `weekly_inventory_captures`
+
+Cada vez que un usuario pulsa **Guardar avance semanal** se conserva una captura independiente.
+
+### `weekly_inventory_counts`
+
+Conserva cada conteo físico por producto, usuario y hora. Los re-conteos son append-only: no borran el registro anterior; el conteo más reciente dentro de la sesión es la referencia vigente.
+
+## 4. Concurrencia multiusuario
+
+El inventario semanal incorpora protección adicional para varios usuarios:
+
+- solo puede existir un inventario semanal `IN_PROGRESS` a la vez;
+- iniciar dos veces no genera dos sesiones activas;
+- cada guardado se serializa con el mismo lock de escrituras durables usado por la operación diaria;
+- antes de escribir se revalida Supabase;
+- si otro usuario actualizó un producto después de que la pantalla fue cargada, el sistema bloquea la sobrescritura y solicita actualizar la página;
+- si otro usuario finaliza la sesión mientras alguien mantiene un formulario antiguo abierto, el formulario antiguo no puede guardar sobre una sesión finalizada.
+
+## 5. Cantidades
+
+### Cerveza
+
+Se registra en unidades/botellas.
+
+### Licor
+
+Se registra como:
+
+- botellas completas;
+- 0.25;
+- 0.50;
+- 0.75.
+
+Cuando existe `bottle_ml`, la aplicación conserva además la equivalencia en oz. Si falta ml, conserva la cantidad en botellas equivalentes y puede convertirla posteriormente cuando se complete la presentación.
+
+No se exige confirmar que un valor cero sea un error: el cero puede ser un conteo físico válido.
+
+## 6. Abastecimiento
+
+`current_stock_basis()` ahora compara dos fuentes físicas:
+
+1. el conteo diario más reciente;
+2. el conteo semanal **finalizado** más reciente.
+
+Se usa el que haya sido capturado más recientemente y luego se aplican los movimientos posteriores.
+
+Esto permite que los licores secundarios, que normalmente no aparecen en el inventario diario, tengan un stock físico actualizado después del inventario semanal.
+
+Un semanal incompleto nunca altera abastecimiento.
+
+## 7. Backup y sincronización
+
+Se conserva sin degradaciones la arquitectura V0.5.8:
+
+```text
+SQLite transaccional
+    ↓
+validación previa contra Supabase
+    ↓
+revisions_v2/<revisión única>.db
+    ↓
+validación de integridad / digest
+    ↓
+latest / daily / weekly (copias de conveniencia)
+```
+
+Las nuevas tablas semanales fueron añadidas al digest lógico y al estado de salud de sincronización. Por tanto, una captura semanal cambia la huella de datos y debe quedar respaldada en Supabase igual que Apertura, Cierre, POS o movimientos.
+
+En **Administración → Configuración → Estado de sincronización** se muestran por separado:
+
+- sesiones/conteos diarios;
+- sesiones/conteos semanales;
 - movimientos;
-- POS;
-- recetas y auditoría de productos.
+- POS.
 
-Reglas:
+## 8. Recuperación
 
-- local = remoto: sincronizado;
-- remoto más nuevo y local sin cambios propios: se recupera remoto;
-- local es descendiente legítimo de la revisión remota: se publica nueva revisión;
-- local y remoto cambiaron independientemente: conflicto, no se sobrescribe ninguna rama.
+Los backups antiguos V0.5.8 siguen siendo válidos. Al abrirlos en V0.5.9, las tablas semanales se crean por migración sin modificar los datos diarios históricos.
 
-Los conflictos intentan preservarse en un objeto único bajo `conflicts/`.
+El respaldo integrado antiguo continúa siendo únicamente un último recurso cuando no existe una copia válida en Supabase.
 
-## 5. Resistencia a errores transitorios
+## 9. Productos duplicados
 
-Las operaciones de Storage incorporan reintentos con backoff para:
+La gestión segura de duplicados ahora considera también referencias del inventario semanal.
 
-- timeouts;
-- 408/425/429;
-- 500/502/503/504;
-- conexiones reiniciadas/rechazadas;
-- cierres inesperados de conexión;
-- errores temporales de red;
-- objetos recién creados que todavía no son visibles inmediatamente.
+Un producto que ya forma parte de una fotografía semanal no se elimina/fusiona de forma destructiva. En esos casos se recomienda desactivarlo para preservar la trazabilidad histórica.
 
-La búsqueda de la revisión V2 fue optimizada: el nombre del archivo ya contiene la generación, por lo que primero se identifica el `generation` mayor desde LIST y solo se descarga la metadata de esa generación. Esto reduce drásticamente las llamadas a Storage en cada verificación.
+## 10. Reinicio total
 
-## 6. Protección de escritura sin bloquear la operación de consulta
+La herramienta ADMIN **Dejar operación en cero** elimina también:
 
-Un error transitorio de Supabase durante la carga de una página **ya no oculta Apertura/Cierre/POS/Movimientos**. El usuario puede consultar y diligenciar normalmente.
+- sesiones semanales;
+- capturas semanales;
+- conteos semanales;
 
-Al pulsar Guardar, `_write_sync_guard()` realiza una comprobación remota fresca y obligatoria:
+además de inventario diario, POS y movimientos.
 
-- local = remoto → permite guardar;
-- local es descendiente legítimo con cambios aún no respaldados → respalda primero y luego permite continuar;
-- remoto es más reciente → rechaza la escritura y solicita actualizar antes de guardar;
-- ramas divergentes → bloquea la escritura y preserva los datos;
-- Supabase no responde tras los reintentos → no acepta una nueva escritura.
+Sigue conservando productos, recetas, usuarios, roles y configuración.
 
-Así, una indisponibilidad momentánea no deja a todos los usuarios sin poder ver la aplicación, pero tampoco permite que una captura nueva se confirme sobre una base no validada.
-
-Las operaciones críticas usan un lock de proceso para serializar **validación → escritura → backup**, reduciendo carreras entre sesiones simultáneas de Streamlit.
-
-## 7. SQLite local
-
-Se conserva:
-
-- `PRAGMA foreign_keys=ON`;
-- `PRAGMA busy_timeout=30000`;
-- `PRAGMA journal_mode=WAL`;
-- `PRAGMA synchronous=FULL`;
-- una conexión por ejecución de Streamlit;
-- snapshot consistente mediante SQLite Backup API;
-- eliminación de sidecars WAL/SHM al reemplazar una base durante recuperación.
-
-## 8. Lógica operativa preservada
-
-V0.5.8 conserva las funciones de negocio ya estabilizadas:
-
-- Apertura → Cierre → nueva Apertura;
-- cierre después de medianoche con fecha operativa correcta;
-- capturas parciales y trazabilidad por usuario/hora;
-- inventario diario: cervezas + licores principales;
-- inventario semanal: cervezas + todos los licores activos;
-- licores en botellas equivalentes y oz cuando existe ml;
-- salida física y venta por conteo no negativas;
-- ajustes por pruebas, desperdicios, cortesías y roturas;
-- POS manual pendiente hasta su carga/confirmación;
-- diferencia = venta por conteo − POS solo con POS confirmado;
-- Dashboard y filtros históricos;
-- abastecimiento;
-- carga histórica de Apertura/Cierre Developer/Owner;
-- gestión segura de productos duplicados;
-- roles/permisos y Reporte Ejecutivo;
-- `America/Toronto` para presentación de fechas/horas.
-
-## 9. Validación V0.5.8
+## 11. Validación V0.5.9
 
 Se verificó:
 
 - `py_compile` de `app.py`;
-- selección legacy con varias copias equivalentes del mismo digest + una copia anterior: se elige la versión nueva sin falso conflicto;
-- descubrimiento V2 descargando únicamente la metadata de la generación más alta;
-- guard de escritura presente antes de Apertura/Cierre histórico/live, POS y movimientos;
-- serialización de escrituras críticas mediante `RLock`;
-- recepción de proveedor y traslado guardados en una sola transacción SQLite;
-- detalle POS + confirmación de lote guardados en una sola transacción SQLite;
-- segunda tentativa de backup durable después de una escritura confirmada;
-- errores transitorios de lectura no ocultan los formularios, mientras el guard de escritura mantiene la protección;
-- conservación de la reconciliación Apertura + Entradas − Cierre − Ajustes y POS pendiente hasta confirmación.
+- migración sobre un backup real con 12 usuarios, 69 productos, 19 sesiones diarias y 386 conteos diarios;
+- creación del inventario semanal sin alterar las tablas diarias;
+- guardado parcial y reanudación hasta 69/69 productos;
+- finalización del semanal y `PRAGMA quick_check = ok`;
+- `PRAGMA foreign_key_check` sin errores;
+- restricción de una sola sesión semanal activa;
+- inventario semanal incompleto excluido de stock/abastecimiento;
+- inventario semanal finalizado seleccionado como stock cuando es el conteo físico más reciente;
+- tablas semanales incluidas en digest/sincronización con orden canónico estable;
+- migración V0.5.8 → V0.5.9 publicada como descendiente legítimo antes de nuevas escrituras;
+- eliminación del selector Semanal de Apertura/Cierre;
+- navegación semanal disponible como proceso independiente;
+- protección de concurrencia por producto antes de sobrescribir un re-conteo.
 
-## 10. Actualización
+Consulta `docs/VALIDATION_V0.5.9.txt` para el detalle.
 
-Para pasar de V0.5.7 a V0.5.8:
+## 12. Actualización
 
-- **antes del deploy**, descarga manualmente la SQLite actual si existe una captura reciente que todavía no esté confirmada en Supabase;
-- reemplaza `app.py`;
-- actualiza `README.md`;
-- opcional: sube `docs/VALIDATION_V0.5.8.txt`;
-- no cambia `requirements.txt`, Streamlit Secrets ni el bucket de Supabase.
+Para pasar de V0.5.8 a V0.5.9:
 
-No subas `.db`, Secrets, `__pycache__` ni `.pyc` a GitHub.
+1. confirma que **Administración → Configuración → Estado de sincronización** esté en verde antes del deploy;
+2. reemplaza `app.py`;
+3. actualiza `README.md`;
+4. opcional: agrega `docs/VALIDATION_V0.5.9.txt`;
+5. no cambies `requirements.txt`;
+6. no cambies Streamlit Secrets;
+7. no cambies el bucket de Supabase;
+8. no subas `.db`, Secrets, `__pycache__` ni `.pyc` a GitHub.
 
-### Después del deploy
-
-1. entra como Developer/Owner;
-2. confirma que la versión sea V0.5.8;
-3. ve a **Administración → Configuración → Estado de sincronización**;
-4. confirma que local y remoto coinciden o que la base local más reciente se publique correctamente;
-5. realiza una sola Apertura/Cierre controlada;
-6. verifica que el mensaje confirme **Backup durable ✅**;
-7. revisa desde otro usuario que el Dashboard muestre la misma actividad;
-8. solo después reanuda la operación normal.
+Después del deploy, verifica que Local y Supabase coincidan. Luego puede iniciarse un inventario semanal desde la nueva opción independiente sin afectar la Apertura/Cierre diaria.
