@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.8"
+APP_VERSION = "0.5.9"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -442,7 +442,8 @@ def _supabase_list_files(prefix='',limit=100,offset=0,order='desc'):
 def _sqlite_health(path):
     """Read-only integrity and business-row summary for recovery/sync decisions."""
     info={"valid":False,"reason":"","users":0,"active_users":0,"products":0,
-          "inventory_sessions":0,"inventory_counts":0,"movements":0,"pos_sales":0,
+          "inventory_sessions":0,"inventory_counts":0,"weekly_inventory_sessions":0,
+          "weekly_inventory_captures":0,"weekly_inventory_counts":0,"movements":0,"pos_sales":0,
           "pos_batches":0,"cocktails":0,"recipes":0,"product_admin_audit":0,
           "last_session_date":None,"last_event_at":None,"size_bytes":0}
     if not path or not os.path.exists(path) or os.path.getsize(path)<=0:
@@ -459,11 +460,13 @@ def _sqlite_health(path):
         info['users']=count_table('users')
         info['active_users']=int(c.execute("SELECT COUNT(*) FROM users WHERE COALESCE(active,1)=1").fetchone()[0])
         for key,table in [('products','products'),('inventory_sessions','inventory_sessions'),('inventory_counts','inventory_counts'),
-                          ('movements','movements'),('pos_sales','pos_sales'),('pos_batches','pos_batches'),('cocktails','cocktails'),
-                          ('recipes','recipes'),('product_admin_audit','product_admin_audit')]: info[key]=count_table(table)
+                          ('weekly_inventory_sessions','weekly_inventory_sessions'),('weekly_inventory_captures','weekly_inventory_captures'),
+                          ('weekly_inventory_counts','weekly_inventory_counts'),('movements','movements'),('pos_sales','pos_sales'),
+                          ('pos_batches','pos_batches'),('cocktails','cocktails'),('recipes','recipes'),('product_admin_audit','product_admin_audit')]:
+            info[key]=count_table(table)
         r=c.execute("SELECT MAX(session_date) FROM inventory_sessions").fetchone(); info['last_session_date']=r[0] if r else None
         ev=[]
-        for table in ('inventory_sessions','movements','pos_sales','pos_batches','product_admin_audit'):
+        for table in ('inventory_sessions','weekly_inventory_sessions','weekly_inventory_captures','weekly_inventory_counts','movements','pos_sales','pos_batches','product_admin_audit'):
             if table in tables:
                 cols={x[1] for x in c.execute(f"PRAGMA table_info({table})").fetchall()}
                 if 'created_at' in cols:
@@ -480,8 +483,9 @@ def _sqlite_health(path):
 
 
 _DIGEST_TABLES=(
-    'users','categories','products','locations','inventory_sessions','inventory_counts','movements',
-    'cocktails','recipes','pos_sales','pos_batches','settings','legacy_rows','product_admin_audit'
+    'users','categories','products','locations','inventory_sessions','inventory_counts',
+    'weekly_inventory_sessions','weekly_inventory_session_products','weekly_inventory_captures','weekly_inventory_counts',
+    'movements','cocktails','recipes','pos_sales','pos_batches','settings','legacy_rows','product_admin_audit'
 )
 _DIGEST_EXCLUDE_COLUMNS={'users':{'last_login_at'}}
 
@@ -498,8 +502,9 @@ def _db_data_digest(path):
             cols=[r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
             cols=[x for x in cols if x not in _DIGEST_EXCLUDE_COLUMNS.get(table,set())]
             if not cols: continue
-            order='id' if 'id' in cols else ('key' if 'key' in cols else cols[0])
-            sql=f"SELECT {','.join(chr(34)+x+chr(34) for x in cols)} FROM {chr(34)+table+chr(34)} ORDER BY {chr(34)+order+chr(34)}"
+            order_cols=['id'] if 'id' in cols else (['key'] if 'key' in cols else list(cols))
+            order_sql=','.join(chr(34)+x+chr(34) for x in order_cols)
+            sql=f"SELECT {','.join(chr(34)+x+chr(34) for x in cols)} FROM {chr(34)+table+chr(34)} ORDER BY {order_sql}"
             h.update((table+'\n').encode())
             for row in c.execute(sql):
                 vals=[]
@@ -560,7 +565,8 @@ def _write_sync_state_in_file(path,revision,base_digest,status='ok',message='',g
 
 
 def _health_vector(h):
-    keys=('users','products','inventory_sessions','inventory_counts','movements','pos_sales','pos_batches','cocktails','recipes','product_admin_audit')
+    keys=('users','products','inventory_sessions','inventory_counts','weekly_inventory_sessions','weekly_inventory_captures',
+          'weekly_inventory_counts','movements','pos_sales','pos_batches','cocktails','recipes','product_admin_audit')
     return tuple(int(h.get(k,0) or 0) for k in keys)
 
 
@@ -1265,6 +1271,41 @@ def ensure_v057_schema():
     con.commit()
 ensure_v057_schema()
 
+# V0.5.9 migration: independent weekly physical inventory, separated from daily Opening/Closing.
+def ensure_v059_schema():
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS weekly_inventory_sessions(
+      id INTEGER PRIMARY KEY, inventory_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'IN_PROGRESS'
+        CHECK(status IN ('IN_PROGRESS','COMPLETED')),
+      started_by_user_id INTEGER, started_at TEXT NOT NULL, completed_by_user_id INTEGER, completed_at TEXT, notes TEXT,
+      FOREIGN KEY(started_by_user_id) REFERENCES users(id),
+      FOREIGN KEY(completed_by_user_id) REFERENCES users(id));
+    CREATE TABLE IF NOT EXISTS weekly_inventory_session_products(
+      weekly_session_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+      PRIMARY KEY(weekly_session_id,product_id),
+      FOREIGN KEY(weekly_session_id) REFERENCES weekly_inventory_sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id));
+    CREATE TABLE IF NOT EXISTS weekly_inventory_captures(
+      id INTEGER PRIMARY KEY, weekly_session_id INTEGER NOT NULL, user_id INTEGER, created_at TEXT NOT NULL,
+      scope TEXT, observation TEXT,
+      FOREIGN KEY(weekly_session_id) REFERENCES weekly_inventory_sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id));
+    CREATE TABLE IF NOT EXISTS weekly_inventory_counts(
+      id INTEGER PRIMARY KEY, capture_id INTEGER NOT NULL, weekly_session_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+      location_id INTEGER NOT NULL, qty_base REAL NOT NULL, qty_bottle_equiv REAL, observation TEXT,
+      user_id INTEGER, created_at TEXT NOT NULL,
+      FOREIGN KEY(capture_id) REFERENCES weekly_inventory_captures(id) ON DELETE CASCADE,
+      FOREIGN KEY(weekly_session_id) REFERENCES weekly_inventory_sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id), FOREIGN KEY(location_id) REFERENCES locations(id),
+      FOREIGN KEY(user_id) REFERENCES users(id));
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_one_active ON weekly_inventory_sessions(status) WHERE status='IN_PROGRESS';
+    CREATE INDEX IF NOT EXISTS idx_weekly_sessions_date_status ON weekly_inventory_sessions(inventory_date,status,started_at);
+    CREATE INDEX IF NOT EXISTS idx_weekly_counts_session_product ON weekly_inventory_counts(weekly_session_id,product_id,created_at,id);
+    CREATE INDEX IF NOT EXISTS idx_weekly_captures_session_created ON weekly_inventory_captures(weekly_session_id,created_at,id);
+    """)
+    con.commit()
+ensure_v059_schema()
+
 
 def _align_or_bootstrap_sync_state():
     """After migrations, align lineage or publish a pending legitimate local descendant."""
@@ -1283,6 +1324,15 @@ def _align_or_bootstrap_sync_state():
         status=SYNC_PREFLIGHT_STATUS.get('status')
         if status in ('remote_missing','local_ahead'):
             backup_db_to_supabase(force=True,allow_bootstrap=True)
+        elif status=='synced' and tmp and rh.get('valid') and digest!=rd:
+            # A code/schema migration may legitimately change the canonical digest after the
+            # preflight ran (V0.5.9 adds empty weekly tables). Publish only when the local DB
+            # still declares the current remote head as its parent; this is a safe descendant,
+            # not a competing business-data branch.
+            state=_read_sync_state_path(DB) or {}
+            remote_rev=str((meta or {}).get('revision') or '')
+            if (state.get('remote_revision') and str(state.get('remote_revision'))==remote_rev) or (state.get('base_digest') and str(state.get('base_digest'))==rd):
+                backup_db_to_supabase(force=True)
     except Exception as e:
         try:st.session_state['_supabase_backup_error']=str(e)
         except Exception:pass
@@ -1475,20 +1525,27 @@ def product_usage_summary(pid):
     rec=one("""SELECT COUNT(*) rows,
                       SUM(CASE WHEN ABS(COALESCE(oz_qty,0))>1e-9 THEN 1 ELSE 0 END) nonzero
                FROM recipes WHERE product_id=?""",(pid,))
+    winv=one("""SELECT COUNT(*) rows,
+                       SUM(CASE WHEN ABS(COALESCE(qty_base,0))>1e-9 OR ABS(COALESCE(qty_bottle_equiv,0))>1e-9 THEN 1 ELSE 0 END) nonzero
+                FROM weekly_inventory_counts WHERE product_id=?""",(pid,))
+    wsp=one("SELECT COUNT(*) rows FROM weekly_inventory_session_products WHERE product_id=?",(pid,))
     out={
         'inventory_rows':int(inv['rows'] or 0),'inventory_nonzero':int(inv['nonzero'] or 0),
+        'weekly_inventory_rows':int(winv['rows'] or 0),'weekly_inventory_nonzero':int(winv['nonzero'] or 0),
+        'weekly_session_refs':int(wsp['rows'] or 0),
         'movement_rows':int(mov['rows'] or 0),'movement_nonzero':int(mov['nonzero'] or 0),
         'pos_rows':int(pos['rows'] or 0),'pos_nonzero':int(pos['nonzero'] or 0),
         'recipe_rows':int(rec['rows'] or 0),'recipe_nonzero':int(rec['nonzero'] or 0),
     }
-    out['total_rows']=out['inventory_rows']+out['movement_rows']+out['pos_rows']+out['recipe_rows']
-    out['nonzero_rows']=out['inventory_nonzero']+out['movement_nonzero']+out['pos_nonzero']+out['recipe_nonzero']
+    out['total_rows']=out['inventory_rows']+out['weekly_inventory_rows']+out['weekly_session_refs']+out['movement_rows']+out['pos_rows']+out['recipe_rows']
+    out['nonzero_rows']=out['inventory_nonzero']+out['weekly_inventory_nonzero']+out['movement_nonzero']+out['pos_nonzero']+out['recipe_nonzero']
     out['safe_delete_unused']=out['total_rows']==0
     # A duplicate that only generated zero-valued inventory/movement/POS rows and
     # is not used in any recipe can be cleaned without losing physical or sales quantities.
     out['safe_delete_zero_only']=(
-        out['total_rows']>0 and out['inventory_nonzero']==0 and out['movement_nonzero']==0
-        and out['pos_nonzero']==0 and out['recipe_rows']==0
+        out['total_rows']>0 and out['inventory_nonzero']==0 and out['weekly_inventory_nonzero']==0
+        and out['movement_nonzero']==0 and out['pos_nonzero']==0 and out['recipe_rows']==0
+        and out['weekly_session_refs']==0
     )
     return out
 
@@ -1565,6 +1622,8 @@ def merge_duplicate_product(source_pid,target_pid,user_id):
     if conflicts['unsafe_recipes']:
         return False,'Ambos productos aparecen en la misma receta con cantidades. Revisa esa receta antes de fusionar.'
     usage_before=product_usage_summary(source_pid)
+    if usage_before.get('weekly_session_refs',0)>0:
+        return False,'El producto ya forma parte de un inventario semanal. Para preservar la fotografía histórica, desactívalo en lugar de fusionarlo.'
     try:
         con.execute('BEGIN IMMEDIATE')
         # Remove only zero-valued source rows that collide with an existing target row.
@@ -1599,7 +1658,7 @@ def qty_fmt(p, v):
 def last_close(pid, lid, before_or_on=None):
     sql="""SELECT ic.qty_base,s.session_date,s.created_at FROM inventory_counts ic
            JOIN inventory_sessions s ON s.id=ic.session_id
-           WHERE ic.product_id=? AND ic.location_id=? AND s.session_type='CLOSING'"""
+           WHERE ic.product_id=? AND ic.location_id=? AND s.session_type='CLOSING' AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'"""
     ps=[pid,lid]
     if before_or_on: sql += " AND s.session_date<=?"; ps.append(before_or_on)
     sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
@@ -1754,6 +1813,202 @@ def save_historical_session(kind, counts, session_date, notes="", inventory_cycl
     return {'ok':True,'saved':True,'duplicate':False,'id':int(sid),'created_at':created_at,'backup_ok':backup_ok,'backup_message':backup_msg}
 
 
+# ---------------------- V0.5.9 independent weekly inventory ----------------------
+def weekly_active_session():
+    return one("""SELECT w.*,u.name started_by
+                  FROM weekly_inventory_sessions w
+                  LEFT JOIN users u ON u.id=w.started_by_user_id
+                  WHERE w.status='IN_PROGRESS'
+                  ORDER BY w.started_at DESC,w.id DESC LIMIT 1""")
+
+
+def weekly_session_by_id(session_id):
+    return one("""SELECT w.*,u.name started_by,cu.name completed_by
+                  FROM weekly_inventory_sessions w
+                  LEFT JOIN users u ON u.id=w.started_by_user_id
+                  LEFT JOIN users cu ON cu.id=w.completed_by_user_id
+                  WHERE w.id=?""",(int(session_id),))
+
+
+def weekly_session_products(session_id):
+    return q("""SELECT p.*,c.name category,c.count_unit
+                FROM weekly_inventory_session_products wsp
+                JOIN products p ON p.id=wsp.product_id
+                JOIN categories c ON c.id=p.category_id
+                WHERE wsp.weekly_session_id=?
+                ORDER BY c.name,p.name,COALESCE(p.bottle_ml,0)""",(int(session_id),))
+
+
+def weekly_latest_count(session_id,pid,location_id):
+    return one("""SELECT wc.*,u.name employee
+                  FROM weekly_inventory_counts wc
+                  LEFT JOIN users u ON u.id=wc.user_id
+                  WHERE wc.weekly_session_id=? AND wc.product_id=? AND wc.location_id=?
+                  ORDER BY wc.created_at DESC,wc.id DESC LIMIT 1""",
+               (int(session_id),int(pid),int(location_id)))
+
+
+def weekly_inventory_progress(session_id):
+    required={int(r['product_id']) for r in q("SELECT product_id FROM weekly_inventory_session_products WHERE weekly_session_id=?",(int(session_id),))}
+    counted={int(r['product_id']) for r in q("SELECT DISTINCT product_id FROM weekly_inventory_counts WHERE weekly_session_id=?",(int(session_id),))}
+    return {
+        'required_ids':required,'counted_ids':counted,'required_count':len(required),
+        'counted_count':len(required & counted),'complete':bool(required) and required.issubset(counted),
+        'pending_ids':required-counted,
+    }
+
+
+def weekly_last_completed_count(pid,location_id,before_or_on=None):
+    sql="""SELECT wc.qty_base,wc.qty_bottle_equiv,w.inventory_date,w.completed_at,w.id weekly_session_id
+             FROM weekly_inventory_counts wc
+             JOIN weekly_inventory_sessions w ON w.id=wc.weekly_session_id
+             WHERE wc.product_id=? AND wc.location_id=? AND w.status='COMPLETED'"""
+    ps=[int(pid),int(location_id)]
+    if before_or_on:
+        sql += " AND w.inventory_date<=?"; ps.append(str(before_or_on))
+    sql += " ORDER BY w.inventory_date DESC,w.completed_at DESC,w.id DESC,wc.created_at DESC,wc.id DESC LIMIT 1"
+    return one(sql,ps)
+
+
+@_serialized_durable_write
+def start_weekly_inventory(inventory_date,notes=''):
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:return {'ok':False,'error':guard_msg}
+    d=inventory_date.isoformat() if hasattr(inventory_date,'isoformat') else str(inventory_date)
+    if date.fromisoformat(d)>local_today():return {'ok':False,'error':'La fecha del inventario semanal no puede estar en el futuro.'}
+    existing=weekly_active_session()
+    if existing:return {'ok':True,'existing':True,'id':int(existing['id']),'created_at':existing['started_at']}
+    same_day=one("SELECT id FROM weekly_inventory_sessions WHERE inventory_date=? AND status='COMPLETED' ORDER BY completed_at DESC LIMIT 1",(d,))
+    if same_day:return {'ok':False,'error':'Ya existe un inventario semanal finalizado para esa fecha. Para preservar trazabilidad no se crea un segundo inventario semanal del mismo día.'}
+    physical=[p for p in products() if p['category'] in ('Cerveza','Licor')]
+    if not physical:return {'ok':False,'error':'No hay productos físicos activos para inventariar.'}
+    created=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        # Re-check while holding the SQLite write lock.
+        r=con.execute("SELECT id,started_at FROM weekly_inventory_sessions WHERE status='IN_PROGRESS' ORDER BY started_at DESC,id DESC LIMIT 1").fetchone()
+        if r:
+            con.rollback();return {'ok':True,'existing':True,'id':int(r['id']),'created_at':r['started_at']}
+        cur=con.execute("""INSERT INTO weekly_inventory_sessions(inventory_date,status,started_by_user_id,started_at,notes)
+                           VALUES(?,'IN_PROGRESS',?,?,?)""",(d,user['id'],created,notes or ''))
+        sid=int(cur.lastrowid)
+        con.executemany("INSERT INTO weekly_inventory_session_products(weekly_session_id,product_id) VALUES(?,?)",[(sid,int(p['id'])) for p in physical])
+        con.commit()
+    except Exception as exc:
+        con.rollback();return {'ok':False,'error':str(exc)}
+    bok,bmsg=_confirmed_backup_after_write()
+    return {'ok':True,'existing':False,'id':sid,'created_at':created,'backup_ok':bok,'backup_message':bmsg}
+
+
+def _weekly_capture_signature(counts):
+    rows=[]
+    for x in counts:
+        beq=x.get('bottle_equiv')
+        rows.append((int(x['pid']),int(x['lid']),round(float(x.get('qty') or 0),6),None if beq is None else round(float(beq),6)))
+    return tuple(sorted(rows))
+
+
+def _recent_identical_weekly_capture(session_id,counts,max_age_seconds=120):
+    target=_weekly_capture_signature(counts)
+    now_utc=datetime.now(timezone.utc).replace(tzinfo=None)
+    captures=q("""SELECT id,created_at FROM weekly_inventory_captures
+                  WHERE weekly_session_id=? AND user_id=? ORDER BY created_at DESC,id DESC LIMIT 5""",
+               (int(session_id),user['id']))
+    for cap in captures:
+        try:
+            created=datetime.fromisoformat(str(cap['created_at']))
+            if created.tzinfo is not None:created=created.astimezone(timezone.utc).replace(tzinfo=None)
+            if (now_utc-created).total_seconds()>max_age_seconds:continue
+        except Exception:continue
+        rows=q("""SELECT product_id,location_id,qty_base,qty_bottle_equiv
+                  FROM weekly_inventory_counts WHERE capture_id=? ORDER BY product_id,location_id,id""",(cap['id'],))
+        sig=tuple(sorted((int(r['product_id']),int(r['location_id']),round(float(r['qty_base'] or 0),6),None if r['qty_bottle_equiv'] is None else round(float(r['qty_bottle_equiv']),6)) for r in rows))
+        if sig==target:return cap
+    return None
+
+
+@_serialized_durable_write
+def save_weekly_inventory_progress(session_id,counts,scope='Todo el inventario',observation=''):
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:return {'ok':False,'saved':False,'error':guard_msg}
+    session=weekly_session_by_id(session_id)
+    if not session or session['status']!='IN_PROGRESS':return {'ok':False,'saved':False,'error':'El inventario semanal ya no está activo.'}
+    allowed={int(r['product_id']) for r in q("SELECT product_id FROM weekly_inventory_session_products WHERE weekly_session_id=?",(int(session_id),))}
+    clean=[x for x in counts if int(x['pid']) in allowed]
+    if not clean:return {'ok':False,'saved':False,'error':'No hay productos válidos para guardar en esta captura.'}
+    duplicate=_recent_identical_weekly_capture(session_id,clean)
+    if duplicate:return {'ok':True,'saved':False,'duplicate':True,'created_at':duplicate['created_at'],'capture_id':int(duplicate['id']),'backup_ok':True}
+    created=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        row=con.execute("SELECT status FROM weekly_inventory_sessions WHERE id=?",(int(session_id),)).fetchone()
+        if not row or row['status']!='IN_PROGRESS':
+            con.rollback();return {'ok':False,'saved':False,'error':'El inventario semanal fue finalizado por otro usuario. Actualiza la página.'}
+        # Optimistic per-product concurrency guard: if another user counted one of these products
+        # after this form was rendered, do not silently overwrite their newer physical count.
+        for x in clean:
+            latest=con.execute("""SELECT id FROM weekly_inventory_counts
+                                  WHERE weekly_session_id=? AND product_id=? AND location_id=?
+                                  ORDER BY created_at DESC,id DESC LIMIT 1""",
+                               (int(session_id),int(x['pid']),int(x['lid']))).fetchone()
+            actual=(int(latest['id']) if latest else None)
+            expected=x.get('expected_count_id')
+            expected=(int(expected) if expected is not None else None)
+            if actual!=expected:
+                con.rollback();return {'ok':False,'saved':False,'error':f"{x.get('name','Un producto')} fue actualizado por otro usuario mientras tenías esta pantalla abierta. Actualiza la página y vuelve a contar ese producto para evitar sobrescribir información."}
+        duplicate=_recent_identical_weekly_capture(session_id,clean)
+        if duplicate:
+            con.rollback();return {'ok':True,'saved':False,'duplicate':True,'created_at':duplicate['created_at'],'capture_id':int(duplicate['id']),'backup_ok':True}
+        cur=con.execute("""INSERT INTO weekly_inventory_captures(weekly_session_id,user_id,created_at,scope,observation)
+                           VALUES(?,?,?,?,?)""",(int(session_id),user['id'],created,scope,observation or ''))
+        capture_id=int(cur.lastrowid)
+        for x in clean:
+            con.execute("""INSERT INTO weekly_inventory_counts(capture_id,weekly_session_id,product_id,location_id,qty_base,qty_bottle_equiv,observation,user_id,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (capture_id,int(session_id),int(x['pid']),int(x['lid']),float(x.get('qty') or 0),x.get('bottle_equiv'),x.get('obs',''),user['id'],created))
+        con.commit()
+    except Exception as exc:
+        con.rollback();return {'ok':False,'saved':False,'error':str(exc)}
+    bok,bmsg=_confirmed_backup_after_write()
+    return {'ok':True,'saved':True,'duplicate':False,'created_at':created,'capture_id':capture_id,'backup_ok':bok,'backup_message':bmsg}
+
+
+@_serialized_durable_write
+def complete_weekly_inventory(session_id,notes=''):
+    guard_ok,guard_msg=_write_sync_guard()
+    if not guard_ok:return {'ok':False,'error':guard_msg}
+    prog=weekly_inventory_progress(session_id)
+    if not prog['complete']:
+        return {'ok':False,'error':f"Faltan {prog['required_count']-prog['counted_count']} productos por contar antes de finalizar."}
+    completed=now_iso()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        row=con.execute("SELECT status,notes FROM weekly_inventory_sessions WHERE id=?",(int(session_id),)).fetchone()
+        if not row:
+            con.rollback();return {'ok':False,'error':'Inventario semanal no encontrado.'}
+        if row['status']=='COMPLETED':
+            con.rollback();return {'ok':True,'already_completed':True,'created_at':completed,'backup_ok':True}
+        final_notes=(str(row['notes'] or '') + ('\n' if row['notes'] and notes else '') + str(notes or '')).strip()
+        con.execute("""UPDATE weekly_inventory_sessions
+                       SET status='COMPLETED',completed_by_user_id=?,completed_at=?,notes=? WHERE id=?""",
+                    (user['id'],completed,final_notes,int(session_id)))
+        con.commit()
+    except Exception as exc:
+        con.rollback();return {'ok':False,'error':str(exc)}
+    bok,bmsg=_confirmed_backup_after_write()
+    return {'ok':True,'already_completed':False,'created_at':completed,'backup_ok':bok,'backup_message':bmsg}
+
+
+def weekly_recent_sessions(limit=8):
+    return q("""SELECT w.*,u.name started_by,cu.name completed_by,
+                     (SELECT COUNT(*) FROM weekly_inventory_session_products sp WHERE sp.weekly_session_id=w.id) required_count,
+                     (SELECT COUNT(DISTINCT wc.product_id) FROM weekly_inventory_counts wc WHERE wc.weekly_session_id=w.id) counted_count
+                FROM weekly_inventory_sessions w
+                LEFT JOIN users u ON u.id=w.started_by_user_id
+                LEFT JOIN users cu ON cu.id=w.completed_by_user_id
+                ORDER BY w.inventory_date DESC,w.started_at DESC,w.id DESC LIMIT ?""",(int(limit),))
+
+
 def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
     if p['category']=='Cerveza':
         units=float(st.number_input("Unidades / botellas",min_value=0,value=int(round(max(float(default_base or 0),0))),step=1,key=key+'u'))
@@ -1778,7 +2033,7 @@ def bottle_count_input(p, key, default_base=0.0, default_bottles=None):
 def last_close_detail(pid,lid,before_or_on=None):
     sql="""SELECT ic.qty_base,ic.qty_bottle_equiv,s.session_date,s.created_at FROM inventory_counts ic
            JOIN inventory_sessions s ON s.id=ic.session_id
-           WHERE ic.product_id=? AND ic.location_id=? AND s.session_type='CLOSING'"""
+           WHERE ic.product_id=? AND ic.location_id=? AND s.session_type='CLOSING' AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'"""
     ps=[pid,lid]
     if before_or_on: sql += " AND s.session_date<=?"; ps.append(before_or_on)
     sql += " ORDER BY s.session_date DESC,s.created_at DESC LIMIT 1"
@@ -1797,6 +2052,7 @@ def backfill_product_bottle_counts(pid):
         return
     boz=float(p['bottle_ml'])/ML_PER_OZ
     con.execute("UPDATE inventory_counts SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
+    con.execute("UPDATE weekly_inventory_counts SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
     con.execute("UPDATE movements SET qty_base=qty_bottle_equiv*? WHERE product_id=? AND qty_bottle_equiv IS NOT NULL",(boz,pid))
     con.commit(); backup_db()
 
@@ -1898,7 +2154,9 @@ def _paired_inventory_sessions(ds, preferred_cycle=None):
     latest opening of the SAME cycle saved before the closing. If no closing exists,
     the latest opening determines the active cycle. No cross-cycle mixing occurs.
     """
-    closing=_inventory_session(ds,'CLOSING',preferred_cycle)
+    # Operational reconciliation is DAILY by default. Legacy WEEKLY Opening/Closing rows
+    # remain auditable but never replace the independent weekly snapshot introduced in V0.5.9.
+    closing=_inventory_session(ds,'CLOSING',preferred_cycle or 'DAILY')
     if closing:
         cycle=str(closing['inventory_cycle'] or 'DAILY')
         opening=None
@@ -2001,12 +2259,17 @@ def _session_trace_label(session):
 
 # ---------------------- Reliable opening/closing + recovery workflow ----------------------
 def _cycle_for_date(ds):
-    """Latest inventory cycle started for a business date."""
-    r=one("""SELECT COALESCE(inventory_cycle,'DAILY') cycle
+    """Live Opening/Closing is DAILY only from V0.5.9 onward.
+
+    Historical WEEKLY rows created by older versions remain preserved for audit, but they
+    no longer participate in the operational Opening→Closing workflow.
+    """
+    r=one("""SELECT 'DAILY' cycle
              FROM inventory_sessions
              WHERE session_date=? AND session_type='OPENING'
+               AND COALESCE(inventory_cycle,'DAILY')='DAILY'
              ORDER BY created_at DESC,id DESC LIMIT 1""",(ds,))
-    return str(r['cycle']) if r else None
+    return 'DAILY' if r else None
 
 
 def _captured_product_ids(ds,kind,cycle):
@@ -2298,21 +2561,38 @@ def consolidated(d1,d2):
     return rows
 
 def current_stock_basis(p, location_id):
-    """Current physical stock in units/oz/bottles, including same-day movements after the latest count."""
-    r=one("""SELECT ic.qty_base,ic.qty_bottle_equiv,s.session_date,s.created_at
-             FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
-             WHERE ic.product_id=? AND ic.location_id=?
-             ORDER BY s.session_date DESC,s.created_at DESC,s.id DESC LIMIT 1""",(p['id'],location_id))
+    """Current physical stock using the newest valid physical count.
+
+    Daily Opening/Closing counts and COMPLETED independent weekly snapshots compete only by
+    actual capture timestamp.  An in-progress weekly inventory never becomes stock truth, which
+    prevents a half-counted weekly session from distorting replenishment. Movements after the
+    selected count are then applied in the same unit basis.
+    """
+    daily=one("""SELECT ic.qty_base,ic.qty_bottle_equiv,s.session_date base_date,s.created_at base_created,'DAILY' source
+                 FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+                 WHERE ic.product_id=? AND ic.location_id=? AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'
+                 ORDER BY s.created_at DESC,s.id DESC,ic.id DESC LIMIT 1""",(p['id'],location_id))
+    weekly=one("""SELECT wc.qty_base,wc.qty_bottle_equiv,w.inventory_date base_date,wc.created_at base_created,'WEEKLY' source
+                  FROM weekly_inventory_counts wc JOIN weekly_inventory_sessions w ON w.id=wc.weekly_session_id
+                  WHERE wc.product_id=? AND wc.location_id=? AND w.status='COMPLETED'
+                  ORDER BY wc.created_at DESC,wc.id DESC LIMIT 1""",(p['id'],location_id))
+    candidates=[r for r in (daily,weekly) if r is not None]
+    r=max(candidates,key=lambda x:str(x['base_created'] or '')) if candidates else None
     basis='unit' if p['category']=='Cerveza' else ('oz' if p['bottle_ml'] else 'bottle')
     if r:
-        if basis=='unit': base=float(r['qty_base'] or 0)
-        elif basis=='oz': base=float(r['qty_base'] or 0)
+        if basis in ('unit','oz'): base=float(r['qty_base'] or 0)
         elif r['qty_bottle_equiv'] is not None: base=float(r['qty_bottle_equiv'])
         elif abs(float(r['qty_base'] or 0))>1e-9:
-            # Legacy imported liquor quantity already stored as oz.
             basis='oz'; base=float(r['qty_base'])
         else: base=0.0
-        base_date=r['session_date']; base_created=r['created_at']
+        base_created=r['base_created']
+        if str(r['source'])=='WEEKLY':
+            # Weekly sessions may be completed across midnight. Movements must be applied
+            # relative to the actual local capture date of this product, not only the session start date.
+            captured_local=to_local_datetime(base_created)
+            base_date=captured_local.date().isoformat() if captured_local else r['base_date']
+        else:
+            base_date=r['base_date']
         time_clause=" AND (movement_date>? OR (movement_date=? AND created_at>?))"
         time_params=(base_date,base_date,base_created)
     else:
@@ -2522,13 +2802,13 @@ def _last_inventory_activity(ds):
                   FROM inventory_sessions s
                   LEFT JOIN users u ON u.id=s.user_id
                   LEFT JOIN inventory_counts ic ON ic.session_id=s.id
-                  WHERE s.session_date=?
+                  WHERE s.session_date=? AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'
                   GROUP BY s.id
                   ORDER BY s.created_at DESC LIMIT 1""",(ds,))
 
 def _latest_inventory_date_in_period(d1,d2):
     """Última fecha con inventario dentro del periodo seleccionado."""
-    r=one("SELECT MAX(session_date) ds FROM inventory_sessions WHERE session_date BETWEEN ? AND ?",
+    r=one("SELECT MAX(session_date) ds FROM inventory_sessions WHERE session_date BETWEEN ? AND ? AND COALESCE(inventory_cycle,'DAILY')='DAILY'",
           (d1.isoformat(),d2.isoformat()))
     if not r or not r['ds']:
         return None
@@ -2547,6 +2827,19 @@ def recent_activity(limit=8):
         kind='Apertura' if r['session_type']=='OPENING' else 'Cierre'
         cycle='semanal' if str(r['inventory_cycle'])=='WEEKLY' else 'diario'
         items.append((r['created_at'],r['employee'] or 'Usuario',f"{kind} {cycle} · {int(r['qty'] or 0)} productos"))
+    # Inventario semanal independiente
+    for r in q("""SELECT wc.created_at,u.name employee,w.inventory_date,COUNT(wic.id) qty
+                  FROM weekly_inventory_captures wc
+                  JOIN weekly_inventory_sessions w ON w.id=wc.weekly_session_id
+                  LEFT JOIN users u ON u.id=wc.user_id
+                  LEFT JOIN weekly_inventory_counts wic ON wic.capture_id=wc.id
+                  GROUP BY wc.id ORDER BY wc.created_at DESC LIMIT 20"""):
+        items.append((r['created_at'],r['employee'] or 'Usuario',f"Inventario semanal · avance {int(r['qty'] or 0)} productos · fecha {r['inventory_date']}"))
+    for r in q("""SELECT w.completed_at,u.name employee,w.inventory_date
+                  FROM weekly_inventory_sessions w LEFT JOIN users u ON u.id=w.completed_by_user_id
+                  WHERE w.status='COMPLETED' AND w.completed_at IS NOT NULL
+                  ORDER BY w.completed_at DESC LIMIT 10"""):
+        items.append((r['completed_at'],r['employee'] or 'Usuario',f"Inventario semanal finalizado · {r['inventory_date']}"))
     # POS agrupado por guardado/tipo
     for r in q("""SELECT ps.created_at,u.name employee,ps.sale_type,SUM(ps.quantity) qty
                   FROM pos_sales ps LEFT JOIN users u ON u.id=ps.user_id
@@ -3153,16 +3446,16 @@ with st.sidebar:
         pages=[]
         st.warning("Modo protegido por conflicto de datos. Contacta al Manager/Developer.")
     elif user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN'):
-        pages=['Dashboard',allowed_inventory_page,'Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
+        pages=['Dashboard',allowed_inventory_page,'Inventario semanal','Abastecimiento','POS / Ventas','Recibir pedido','Trasladar productos','Reporte PDF']
         if sync_degraded: st.warning("Conexión Supabase por revalidar. Puedes diligenciar datos; Guardar hará una validación remota obligatoria antes de aceptar la operación.")
     else:
-        pages=[allowed_inventory_page,'Recibir pedido','Trasladar productos']
+        pages=[allowed_inventory_page,'Inventario semanal','Recibir pedido','Trasladar productos']
         if sync_degraded: st.warning("Conexión Supabase por revalidar. Puedes diligenciar datos; Guardar validará el respaldo antes de aceptar la operación.")
     # MANAGER y MANAGER GENERAL pueden entrar a Administración; las acciones críticas
     # continúan protegidas dentro de la página para ADMIN/Developer Owner.
     if user['role'] in ('MANAGER','GENERAL_MANAGER','ADMIN') and 'Administración' not in pages:
         pages += ['Administración']
-    icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
+    icons={'Dashboard':'▦','Apertura':'↑','Cierre':'↓','Inventario semanal':'📋','Abastecimiento':'🛒','POS / Ventas':'▤','Recibir pedido':'📦','Trasladar productos':'↔','Reporte PDF':'▥','Administración':'⚙'}
     display=[f"{icons.get(p,'•')}  {p}" for p in pages]
     if display:
         selected=st.radio("Navegación",display,label_visibility="collapsed")
@@ -3193,18 +3486,11 @@ if page=='Apertura':
     if wf['stage']=='WAIT_NEXT_OPENING':
         st.info(f"El último turno ya está cerrado. La próxima apertura corresponde al {d.strftime('%d/%m/%Y')} y quedará habilitada cuando llegue esa fecha.")
         st.stop()
-    locked_cycle=wf.get('cycle') if wf.get('progress') and wf['progress']['opening_count']>0 else None
-    options=['Diario','Semanal']; locked_label='Semanal' if locked_cycle=='WEEKLY' else 'Diario'
-    cycle_label=st.radio("Tipo de inventario",options,index=(1 if locked_cycle=='WEEKLY' else 0),horizontal=True,key='opening_cycle',disabled=bool(locked_cycle))
-    cycle=locked_cycle or ('DAILY' if cycle_label=='Diario' else 'WEEKLY')
-    cycle_label='Semanal' if cycle=='WEEKLY' else 'Diario'
-    if locked_cycle:
+    cycle='DAILY'; cycle_label='Diario'
+    if wf.get('progress') and wf['progress']['opening_count']>0:
         p=inventory_cycle_progress(d.isoformat(),cycle)
-        st.info(f"Apertura en progreso: {p['opening_count']} de {p['required_count']} productos registrados. Debes completar esta apertura antes de que el Cierre se habilite.")
-    if cycle=='DAILY':
-        st.caption("Inventario diario: todas las cervezas + licores principales. Los demás licores quedan fuera para agilizar el conteo.")
-    else:
-        st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
+        st.info(f"Apertura diaria en progreso: {p['opening_count']} de {p['required_count']} productos registrados. Debes completar esta apertura antes de que el Cierre se habilite.")
+    st.caption("Inventario diario: todas las cervezas + licores principales. El inventario semanal de todos los productos se realiza de forma independiente desde «Inventario semanal».")
     st.caption("Si no existe un cierre anterior comparable, el conteo se guarda como referencia sin generar una alerta falsa.")
     scope=st.radio("Registrar en esta captura",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key=f'opening_scope_{cycle}_{d}')
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; ps=inventory_products(cycle)
@@ -3218,9 +3504,6 @@ if page=='Apertura':
         for p in g:
             prev,prev_bottles,prev_date=last_close_detail(p['id'],bar,(d-timedelta(days=1)).isoformat())
             with st.expander(product_label(p),expanded=True):
-                # Secondary liquors are only counted weekly. Their prior weekly close is a reference,
-                # not a same-day continuity check, because sales occurred during the interval.
-                weekly_secondary=(cycle=='WEEKLY' and cat=='Licor' and int(p['daily_inventory'] or 0)==0)
                 if prev is None:
                     st.info("Primer inventario registrado para este producto. No existe cierre anterior para comparar.")
                     res=bottle_count_input(p,f"op_{cycle}_{d}_{p['id']}",0); val=res['base']; var=None; obs=''; bottle_equiv=res['bottles']
@@ -3230,18 +3513,14 @@ if page=='Apertura':
                     else:
                         st.info(f"📌 BASE PARA APERTURA · Último cierre ({prev_date}): {qty_fmt(p,prev)}")
                     res=bottle_count_input(p,f"op_{cycle}_{d}_{p['id']}",prev,prev_bottles); val=res['base']; bottle_equiv=res['bottles']; obs=''
-                    if weekly_secondary:
-                        var=None
-                        st.caption("Licor de inventario semanal: el cierre anterior se muestra solo como referencia y no genera alerta automática por el intervalo entre conteos.")
+                    if cat=='Licor' and not p['bottle_ml']:
+                        var=(bottle_equiv-prev_bottles) if prev_bottles is not None else None; tol=.25; var_unit='botellas'
                     else:
-                        if cat=='Licor' and not p['bottle_ml']:
-                            var=(bottle_equiv-prev_bottles) if prev_bottles is not None else None; tol=.25; var_unit='botellas'
-                        else:
-                            var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
-                        if var is not None and abs(var)>tol:
-                            st.warning(f"Referencia contra cierre anterior: {var:+.2f} {var_unit}. Este valor NO bloquea la apertura ni se considera una venta; el conteo físico que ingreses se guardará tal cual.")
-                            obs=st.text_input("Observación (opcional)",key=f"opobs_{cycle}_{d}_{p['id']}",help="Úsala solo si quieres dejar contexto para auditoría. No es obligatoria para guardar la apertura.")
-                        elif var is not None: st.caption(f"Referencia contra cierre anterior: {var:+.2f} {var_unit} · no afecta el cálculo de ventas del nuevo turno")
+                        var=val-prev; tol=float(setting('tolerance_beer','1')) if cat=='Cerveza' else float(setting('tolerance_liquor','1')); var_unit=unit_label(p)
+                    if var is not None and abs(var)>tol:
+                        st.warning(f"Referencia contra cierre anterior: {var:+.2f} {var_unit}. Este valor NO bloquea la apertura ni se considera una venta; el conteo físico que ingreses se guardará tal cual.")
+                        obs=st.text_input("Observación (opcional)",key=f"opobs_{cycle}_{d}_{p['id']}",help="Úsala solo si quieres dejar contexto para auditoría. No es obligatoria para guardar la apertura.")
+                    elif var is not None: st.caption(f"Referencia contra cierre anterior: {var:+.2f} {var_unit} · no afecta el cálculo de ventas del nuevo turno")
                 counts.append({'pid':p['id'],'lid':bar,'qty':val,'prev':prev,'var':var,'obs':obs,'bottle_equiv':bottle_equiv,'name':p['name'],'category':p['category']})
     st.caption("Regla de control: Apertura y Cierre son conteos físicos y nunca se rechazan por ser diferentes a una referencia anterior. Las diferencias reales se calculan después con Apertura + Entradas − Cierre − Ajustes y se comparan con POS.")
     st.info(f"Productos a contar: {len(ps)} · Tipo: {cycle_label} · Captura: {scope}")
@@ -3278,15 +3557,11 @@ elif page=='Cierre':
     if wf['stage']!='CLOSING':
         st.warning("No existe una apertura completa pendiente de cierre. El sistema no permite crear un cierre sin apertura.")
         st.stop()
-    d=wf['business_date']; cycle=wf['cycle']; detected=cycle
+    d=wf['business_date']; cycle='DAILY'
     st.date_input("Fecha operativa del cierre",value=d,disabled=True,key='closing_business_date')
-    cycle_label='Semanal' if cycle=='WEEKLY' else 'Diario'
-    st.radio("Tipo de inventario",['Diario','Semanal'],index=(1 if cycle=='WEEKLY' else 0),horizontal=True,key='closing_cycle',disabled=True)
+    cycle_label='Diario'
     st.success(f"Cierre habilitado para la apertura del {d.strftime('%d/%m/%Y')}. Aunque el reloj marque {local_today().strftime('%d/%m/%Y')}, este cierre quedará vinculado al turno que sigue abierto.")
-    if cycle=='DAILY':
-        st.caption("Inventario diario: todas las cervezas + licores principales.")
-    else:
-        st.caption("Inventario semanal: todas las cervezas + todos los licores activos.")
+    st.caption("Inventario diario: todas las cervezas + licores principales. El inventario semanal es independiente y no altera este turno.")
     scope=st.radio("Registrar en esta captura",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key=f'closing_scope_{cycle}_{d}')
     bar=one("SELECT id FROM locations WHERE name='Bar'")['id']; wh=one("SELECT id FROM locations WHERE name='Bodega'")['id']
     ps=inventory_products(cycle); all_ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
@@ -3376,6 +3651,159 @@ elif page=='Cierre':
                 flash_msg=operation_confirmation(('Su cierre fue exitoso y respaldado' if result.get('backup_ok',True) else 'Cierre registrado; respaldo remoto pendiente'),d,detail,result.get('created_at'))
                 st.session_state['_inventory_flash']={'level':('success' if result.get('backup_ok',True) else 'warning'),'message':flash_msg}
                 st.rerun()
+
+elif page=='Inventario semanal':
+    page_header("Inventario semanal", "Conteo físico independiente de todos los productos activos. No abre ni cierra el turno diario y no genera diferencias contra POS.")
+    st.caption("Úsalo cuando el equipo tenga disponibilidad. Puede iniciarse cualquier día, guardarse por partes y continuarse por otros usuarios hasta completar todos los productos.")
+    st.info("Este conteo alimenta el stock físico y el abastecimiento. La Apertura/Cierre diaria continúa limitada a cervezas + licores principales.")
+    bar=one("SELECT id FROM locations WHERE name='Bar'")['id']
+    active_weekly=weekly_active_session()
+    recent_weekly=weekly_recent_sessions(6)
+
+    if not active_weekly:
+        if recent_weekly:
+            last=recent_weekly[0]
+            status_txt='Completo' if last['status']=='COMPLETED' else 'En progreso'
+            st.caption(f"Último inventario semanal: {last['inventory_date']} · {status_txt} · {int(last['counted_count'] or 0)}/{int(last['required_count'] or 0)} productos.")
+        c1,c2=st.columns([1,2])
+        weekly_date=c1.date_input("Fecha del inventario semanal",value=local_today(),disabled=True,key='weekly_start_date')
+        weekly_start_note=c2.text_input("Observación de inicio (opcional)",key='weekly_start_note')
+        if st.button("Iniciar inventario semanal",type="primary",width="stretch",key='weekly_start_btn'):
+            result=start_weekly_inventory(weekly_date,weekly_start_note)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible iniciar el inventario semanal.'))
+            else:
+                if result.get('existing'):
+                    st.info("Ya existía un inventario semanal en progreso. Se abrirá para continuar.")
+                elif result.get('backup_ok'):
+                    st.success("Inventario semanal iniciado y respaldado en Supabase.")
+                else:
+                    st.warning("Inventario semanal iniciado en SQLite; el respaldo remoto quedó pendiente: "+str(result.get('backup_message','')))
+                st.rerun()
+        if recent_weekly:
+            st.subheader("Historial semanal reciente")
+            hist=[]
+            for r in recent_weekly:
+                hist.append({
+                    'Fecha':r['inventory_date'],
+                    'Estado':'✅ Completo' if r['status']=='COMPLETED' else '🟡 En progreso',
+                    'Progreso':f"{int(r['counted_count'] or 0)}/{int(r['required_count'] or 0)}",
+                    'Iniciado por':r['started_by'] or 'Usuario',
+                    'Inicio':format_local_datetime(r['started_at'],'%d/%m/%Y %I:%M %p') if r['started_at'] else '—',
+                    'Finalizado por':r['completed_by'] or '—',
+                    'Fin':format_local_datetime(r['completed_at'],'%d/%m/%Y %I:%M %p') if r['completed_at'] else '—',
+                })
+            st.dataframe(pd.DataFrame(hist),width='stretch',hide_index=True)
+        st.stop()
+
+    weekly_id=int(active_weekly['id'])
+    weekly_prog=weekly_inventory_progress(weekly_id)
+    required_products=weekly_session_products(weekly_id)
+    st.success(
+        f"Inventario semanal en progreso · fecha física {active_weekly['inventory_date']} · "
+        f"{weekly_prog['counted_count']}/{weekly_prog['required_count']} productos · "
+        f"iniciado por {active_weekly['started_by'] or 'Usuario'} a las {format_local_time(active_weekly['started_at'])}."
+    )
+    m1,m2,m3=st.columns(3)
+    m1.metric("Productos requeridos",weekly_prog['required_count'])
+    m2.metric("Registrados",weekly_prog['counted_count'])
+    m3.metric("Pendientes",max(weekly_prog['required_count']-weekly_prog['counted_count'],0))
+    st.progress((weekly_prog['counted_count']/weekly_prog['required_count']) if weekly_prog['required_count'] else 0.0)
+
+    scope=st.radio("Productos a registrar ahora",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key=f'weekly_scope_{weekly_id}')
+    pending_only=st.checkbox("Mostrar solo productos pendientes",value=True,key=f'weekly_pending_only_{weekly_id}',help="Desmárcalo si necesitas volver a contar un producto antes de finalizar.")
+    ps=list(required_products)
+    if scope=='Solo cervezas':ps=[p for p in ps if p['category']=='Cerveza']
+    elif scope=='Solo licores':ps=[p for p in ps if p['category']=='Licor']
+    if pending_only:ps=[p for p in ps if int(p['id']) in weekly_prog['pending_ids']]
+
+    counts=[]
+    if not ps:
+        st.info("No hay productos pendientes en esta selección. Puedes cambiar la categoría o desmarcar «Mostrar solo productos pendientes» para recontar.")
+    for cat in ['Cerveza','Licor']:
+        group=[p for p in ps if p['category']==cat]
+        if group:st.subheader(cat)
+        for p in group:
+            current=weekly_latest_count(weekly_id,p['id'],bar)
+            prior=weekly_last_completed_count(p['id'],bar,active_weekly['inventory_date']) if current is None else None
+            default_base=0.0;default_bottles=None
+            with st.expander(product_label(p),expanded=True):
+                if current is not None:
+                    default_base=float(current['qty_base'] or 0)
+                    default_bottles=float(current['qty_bottle_equiv']) if current['qty_bottle_equiv'] is not None else None
+                    if p['category']=='Licor' and not p['bottle_ml'] and default_bottles is not None:
+                        st.info(f"Último conteo de este semanal: {default_bottles:.2f} bot · {current['employee'] or 'Usuario'} · {format_local_time(current['created_at'])}. Puedes recontarlo antes de finalizar.")
+                    else:
+                        st.info(f"Último conteo de este semanal: {qty_fmt(p,default_base)} · {current['employee'] or 'Usuario'} · {format_local_time(current['created_at'])}. Puedes recontarlo antes de finalizar.")
+                elif prior is not None:
+                    default_base=float(prior['qty_base'] or 0)
+                    default_bottles=float(prior['qty_bottle_equiv']) if prior['qty_bottle_equiv'] is not None else None
+                    if p['category']=='Licor' and not p['bottle_ml'] and default_bottles is not None:
+                        st.caption(f"Referencia del último semanal ({prior['inventory_date']}): {default_bottles:.2f} bot · solo guía, no bloquea el conteo.")
+                    else:
+                        st.caption(f"Referencia del último semanal ({prior['inventory_date']}): {qty_fmt(p,default_base)} · solo guía, no bloquea el conteo.")
+                else:
+                    # If this product has never been in a completed weekly snapshot, show the latest
+                    # operational stock as a guide. It is not interpreted as a weekly count until saved.
+                    ref,ref_basis=current_stock_basis(p,bar)
+                    if ref_basis=='bottle':
+                        default_bottles=ref;default_base=0.0
+                        st.caption(f"Referencia física disponible: {basis_qty_text(p,ref,ref_basis)} · solo guía.")
+                    else:
+                        default_base=ref
+                        if p['category']=='Licor' and p['bottle_ml']:
+                            default_bottles=ref/bottle_oz(p) if bottle_oz(p) else None
+                        st.caption(f"Referencia física disponible: {basis_qty_text(p,ref,ref_basis)} · solo guía.")
+                res=bottle_count_input(p,f"wk_{weekly_id}_{p['id']}",default_base,default_bottles)
+                obs=st.text_input("Observación (opcional)",key=f"wkobs_{weekly_id}_{p['id']}")
+                counts.append({'pid':p['id'],'lid':bar,'qty':res['base'],'bottle_equiv':res['bottles'],'obs':obs,'name':p['name'],'category':p['category'],
+                               'expected_count_id':(int(current['id']) if current is not None else None)})
+
+    capture_note=st.text_input("Nota de esta captura (opcional)",key=f'weekly_capture_note_{weekly_id}')
+    if counts and st.button("Guardar avance semanal",type="primary",width="stretch",key=f'weekly_save_{weekly_id}'):
+        result=save_weekly_inventory_progress(weekly_id,counts,scope,capture_note)
+        if not result.get('ok'):
+            st.error(result.get('error','No fue posible guardar el avance semanal.'))
+        else:
+            new_prog=weekly_inventory_progress(weekly_id)
+            if result.get('duplicate'):
+                detail=f"La captura ya había sido recibida; no se creó un duplicado. Progreso {new_prog['counted_count']}/{new_prog['required_count']}."
+            else:
+                detail=f"Avance semanal guardado · {new_prog['counted_count']}/{new_prog['required_count']} productos."
+                detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok') else f"  \n⚠️ Guardado en SQLite; backup remoto: {result.get('backup_message','pendiente')}")
+            st.session_state['_inventory_flash']={
+                'level':('success' if result.get('backup_ok',True) else 'warning'),
+                'message':operation_confirmation(('Avance semanal guardado y respaldado' if result.get('backup_ok',True) else 'Avance semanal guardado; respaldo pendiente'),date.fromisoformat(active_weekly['inventory_date']),detail,result.get('created_at'))
+            }
+            st.rerun()
+
+    # Refresh after any UI interactions; finalization is intentionally separate from data capture.
+    weekly_prog=weekly_inventory_progress(weekly_id)
+    st.divider()
+    if weekly_prog['complete']:
+        st.success("Todos los productos del inventario semanal ya tienen conteo. Puedes revisarlos/recontarlos o finalizar el inventario.")
+        final_note=st.text_area("Observación final (opcional)",key=f'weekly_final_note_{weekly_id}')
+        if st.button("Finalizar inventario semanal",type="primary",width="stretch",key=f'weekly_complete_{weekly_id}'):
+            result=complete_weekly_inventory(weekly_id,final_note)
+            if not result.get('ok'):
+                st.error(result.get('error','No fue posible finalizar el inventario semanal.'))
+            else:
+                detail=f"Inventario semanal completo · {weekly_prog['counted_count']}/{weekly_prog['required_count']} productos. Este conteo queda como fotografía física independiente y no genera diferencias contra POS."
+                detail += ("  \nRespaldo automático: **✅ Supabase actualizado**." if result.get('backup_ok',True) else f"  \n⚠️ Finalizado en SQLite; backup remoto: {result.get('backup_message','pendiente')}")
+                st.session_state['_inventory_flash']={
+                    'level':('success' if result.get('backup_ok',True) else 'warning'),
+                    'message':operation_confirmation(('Inventario semanal finalizado y respaldado' if result.get('backup_ok',True) else 'Inventario semanal finalizado; respaldo pendiente'),date.fromisoformat(active_weekly['inventory_date']),detail,result.get('created_at'))
+                }
+                st.rerun()
+    else:
+        st.caption(f"Para finalizar faltan {weekly_prog['required_count']-weekly_prog['counted_count']} productos. Puedes salir de la aplicación y continuar más tarde; cada avance ya guardado permanece en SQLite y Supabase.")
+
+    if recent_weekly:
+        st.subheader("Inventarios semanales recientes")
+        hist=[]
+        for r in recent_weekly:
+            hist.append({'Fecha':r['inventory_date'],'Estado':'✅ Completo' if r['status']=='COMPLETED' else '🟡 En progreso','Progreso':f"{int(r['counted_count'] or 0)}/{int(r['required_count'] or 0)}",'Iniciado por':r['started_by'] or 'Usuario','Finalizado por':r['completed_by'] or '—'})
+        st.dataframe(pd.DataFrame(hist),width='stretch',hide_index=True)
 
 elif page=='Recibir pedido':
     page_header("Recibir pedido", "Registra entradas de proveedor en bodega o bar.")
@@ -4322,12 +4750,12 @@ elif page=='Administración':
         if remote_sync_h and remote_sync_h.get('valid'):
             same=(local_sync_digest==remote_sync_digest)
             c1,c2=st.columns(2)
-            c1.info(f"Local · {local_sync_h['products']} productos · {local_sync_h['inventory_sessions']} sesiones · {local_sync_h['inventory_counts']} conteos · {local_sync_h['movements']} movimientos · {local_sync_h['pos_sales']} POS")
-            c2.info(f"Supabase · {remote_sync_h['products']} productos · {remote_sync_h['inventory_sessions']} sesiones · {remote_sync_h['inventory_counts']} conteos · {remote_sync_h['movements']} movimientos · {remote_sync_h['pos_sales']} POS")
+            c1.info(f"Local · {local_sync_h['products']} productos · diario {local_sync_h['inventory_sessions']} sesiones/{local_sync_h['inventory_counts']} conteos · semanal {local_sync_h['weekly_inventory_sessions']} sesiones/{local_sync_h['weekly_inventory_counts']} conteos · {local_sync_h['movements']} movimientos · {local_sync_h['pos_sales']} POS")
+            c2.info(f"Supabase · {remote_sync_h['products']} productos · diario {remote_sync_h['inventory_sessions']} sesiones/{remote_sync_h['inventory_counts']} conteos · semanal {remote_sync_h['weekly_inventory_sessions']} sesiones/{remote_sync_h['weekly_inventory_counts']} conteos · {remote_sync_h['movements']} movimientos · {remote_sync_h['pos_sales']} POS")
             if same:
                 st.success(f"✅ Sincronizado · revisión {(remote_sync_rev or 'legacy')[:8]} · huella {local_sync_digest[:12]}")
             else:
-                st.error("⚠️ Local y Supabase NO contienen los mismos datos. No realices nuevas capturas hasta revisar Recuperación de base de datos. La protección V0.5.5 impide sobrescribir automáticamente una rama divergente.")
+                st.error("⚠️ Local y Supabase NO contienen los mismos datos. No realices nuevas capturas hasta revisar Recuperación de base de datos. La protección V0.5.9 impide sobrescribir automáticamente una rama divergente.")
         elif _supabase_ready():
             st.warning("Supabase está configurado, pero todavía no se pudo validar una revisión durable remota.")
         st.caption(f"Preflight de esta ejecución: {SYNC_PREFLIGHT_STATUS.get('status')} · {SYNC_PREFLIGHT_STATUS.get('message','')}")
@@ -4365,7 +4793,7 @@ elif page=='Administración':
             st.caption("Solo Developer/Owner. Permite validar y restaurar un respaldo SQLite completo sin volver a desplegar código. Antes de reemplazar la base se conserva una copia local de contingencia.")
             current_health=_sqlite_health(DB)
             if current_health['valid']:
-                st.info(f"Base actual: {current_health['active_users']}/{current_health['users']} usuarios activos · {current_health['products']} productos · {current_health['inventory_sessions']} sesiones · {current_health['inventory_counts']} conteos · {current_health['movements']} movimientos · {current_health['pos_sales']} filas POS.")
+                st.info(f"Base actual: {current_health['active_users']}/{current_health['users']} usuarios activos · {current_health['products']} productos · diario {current_health['inventory_sessions']} sesiones/{current_health['inventory_counts']} conteos · semanal {current_health['weekly_inventory_sessions']} sesiones/{current_health['weekly_inventory_counts']} conteos · {current_health['movements']} movimientos · {current_health['pos_sales']} filas POS.")
             else:
                 st.warning(f"La base actual no supera la validación: {current_health['reason']}")
             if _supabase_ready():
@@ -4375,7 +4803,7 @@ elif page=='Administración':
                     try:
                         tmp_latest,h=restore_latest_from_supabase_to_temp()
                         st.session_state['_supabase_latest_health']=h
-                        st.success(f"Latest válido: {h['active_users']}/{h['users']} usuarios activos · {h['products']} productos · {h['inventory_sessions']} sesiones · {h['inventory_counts']} conteos · {h['movements']} movimientos · {h['pos_sales']} filas POS · rev {(h.get('revision') or 'legacy')[:8]} · huella {(h.get('data_digest') or '')[:12]}.")
+                        st.success(f"Latest válido: {h['active_users']}/{h['users']} usuarios activos · {h['products']} productos · diario {h['inventory_sessions']} sesiones/{h['inventory_counts']} conteos · semanal {h['weekly_inventory_sessions']} sesiones/{h['weekly_inventory_counts']} conteos · {h['movements']} movimientos · {h['pos_sales']} filas POS · rev {(h.get('revision') or 'legacy')[:8]} · huella {(h.get('data_digest') or '')[:12]}.")
                     except Exception as e:
                         st.error(f"No se pudo verificar latest: {e}")
                     finally:
@@ -4438,12 +4866,13 @@ elif page=='Administración':
                 except Exception: pass
             st.divider()
         if owner_for_correction:
-            st.subheader("Carga histórica de Apertura / Cierre")
+            st.subheader("Carga histórica de Apertura / Cierre diario")
             st.caption("Solo Developer/Owner. Transcribe inventarios conservados en papel sin alterar el flujo activo de hoy. La fecha operativa histórica queda separada de la fecha/hora real en que tú realizas la digitación.")
             h1,h2,h3=st.columns(3)
             hist_date=h1.date_input("Fecha operativa histórica",value=max(local_today()-timedelta(days=1),date(2026,1,1)),max_value=local_today(),key='hist_inventory_date')
             hist_kind=h2.selectbox("Tipo de registro",['OPENING','CLOSING'],format_func=lambda x:'Apertura' if x=='OPENING' else 'Cierre',key='hist_inventory_kind')
-            hist_cycle=h3.selectbox("Ciclo",['DAILY','WEEKLY'],format_func=lambda x:'Diario' if x=='DAILY' else 'Semanal',key='hist_inventory_cycle')
+            hist_cycle='DAILY'
+            h3.text_input("Ciclo",value='Diario',disabled=True,key='hist_inventory_cycle_fixed')
             hist_scope=st.radio("Productos a transcribir",['Todo el inventario','Solo cervezas','Solo licores'],horizontal=True,key='hist_inventory_scope')
             hist_users=q("SELECT id,name,email FROM users WHERE active=1 ORDER BY name")
             hist_operator=st.selectbox("Responsable indicado en el registro de papel (opcional)",['No especificado']+[f"{r['name']} · {r['email']}" for r in hist_users],key='hist_original_operator')
@@ -4556,15 +4985,21 @@ elif page=='Administración':
             st.caption("Solo ADMIN puede ejecutar este reinicio. La herramienta elimina datos transaccionales anteriores: inventarios, POS/ventas y movimientos. Conserva productos, categorías, presentaciones, recetas, usuarios, roles y configuración.")
             inv_sessions=one("SELECT COUNT(*) n FROM inventory_sessions")['n']
             inv_counts=one("SELECT COUNT(*) n FROM inventory_counts")['n']
+            weekly_sessions=one("SELECT COUNT(*) n FROM weekly_inventory_sessions")['n']
+            weekly_counts=one("SELECT COUNT(*) n FROM weekly_inventory_counts")['n']
             pos_rows=one("SELECT COUNT(*) n FROM pos_sales")['n']
             mov_rows=one("SELECT COUNT(*) n FROM movements")['n']
-            st.info(f"Datos actuales: {inv_sessions} sesiones · {inv_counts} conteos · {pos_rows} registros POS/ventas · {mov_rows} movimientos.")
+            st.info(f"Datos actuales: diario {inv_sessions} sesiones/{inv_counts} conteos · semanal {weekly_sessions} sesiones/{weekly_counts} conteos · {pos_rows} registros POS/ventas · {mov_rows} movimientos.")
             confirm_reset=st.text_input("Para confirmar escribe exactamente: INICIAR DESDE CERO",key="reset_inventory_confirm")
             if st.button("Dejar operación en cero",type="secondary",width="stretch"):
                 if confirm_reset.strip() != "INICIAR DESDE CERO":
                     st.error("Confirmación incorrecta. Escribe exactamente: INICIAR DESDE CERO")
                 else:
                     try:
+                        con.execute("DELETE FROM weekly_inventory_counts")
+                        con.execute("DELETE FROM weekly_inventory_captures")
+                        con.execute("DELETE FROM weekly_inventory_session_products")
+                        con.execute("DELETE FROM weekly_inventory_sessions")
                         con.execute("DELETE FROM inventory_counts")
                         con.execute("DELETE FROM inventory_sessions")
                         con.execute("DELETE FROM pos_sales")
@@ -4574,7 +5009,7 @@ elif page=='Administración':
                         con.execute("INSERT INTO settings(key,value) VALUES('production_inventory_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_iso(),))
                         con.commit()
                         backup_db()
-                        st.success("Operación reiniciada en cero. Se eliminaron inventarios, POS/ventas y movimientos anteriores. Productos, recetas, usuarios, roles y configuración permanecen intactos. El próximo conteo será la nueva línea base.")
+                        st.success("Operación reiniciada en cero. Se eliminaron inventarios diarios y semanales, POS/ventas y movimientos anteriores. Productos, recetas, usuarios, roles y configuración permanecen intactos. El próximo conteo será la nueva línea base.")
                         st.rerun()
                     except Exception as e:
                         con.rollback()
