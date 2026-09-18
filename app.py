@@ -14,7 +14,7 @@ DB = "bar_inventory_v3.db"
 ML_PER_OZ = 29.5735295625
 DEFAULT_TOL_BEER = 1.0
 DEFAULT_TOL_LIQUOR = 1.0
-APP_VERSION = "0.5.9"
+APP_VERSION = "0.5.10"
 
 # V0.5.1 recovery floor: verified SQLite snapshot supplied by the Developer/Owner.
 # It is only used when the runtime database is missing or clearly reset (no operational
@@ -2272,19 +2272,81 @@ def _cycle_for_date(ds):
     return 'DAILY' if r else None
 
 
-def _captured_product_ids(ds,kind,cycle):
-    rows=q("""SELECT DISTINCT ic.product_id
+def _is_historical_inventory_note_sql(alias='s'):
+    # Historical paper transcriptions are audit records and must never control the live shift workflow.
+    return f"COALESCE({alias}.notes,'') NOT LIKE '[TRANSCRIPCIÓN HISTÓRICA POR CONTINGENCIA%'"
+
+
+LIVE_SHIFT_REQUIRED_PREFIX='[LIVE_SHIFT_REQUIRED:'
+
+
+def _live_shift_required_note(required_ids):
+    ids=','.join(str(int(x)) for x in sorted(set(required_ids or [])))
+    return f"{LIVE_SHIFT_REQUIRED_PREFIX}{ids}]"
+
+
+def _parse_live_shift_required_ids(notes):
+    txt=str(notes or '')
+    pos=txt.find(LIVE_SHIFT_REQUIRED_PREFIX)
+    if pos<0:return None
+    end=txt.find(']',pos)
+    if end<0:return None
+    raw=txt[pos+len(LIVE_SHIFT_REQUIRED_PREFIX):end].strip()
+    if not raw:return set()
+    try:return {int(x.strip()) for x in raw.split(',') if x.strip()}
+    except Exception:return None
+
+
+def _shift_required_ids(ds,cycle,after_session_id=0):
+    # Freeze the expected product set from the first capture of a live shift. This prevents
+    # catalog changes made later from retroactively making an already-started opening incomplete.
+    r=one(f"""SELECT s.notes FROM inventory_sessions s
+              WHERE s.session_date=? AND s.session_type='OPENING'
+                AND COALESCE(s.inventory_cycle,'DAILY')=? AND s.id>?
+                AND {_is_historical_inventory_note_sql('s')}
+              ORDER BY s.id ASC LIMIT 1""",(ds,cycle,int(after_session_id or 0)))
+    if r:
+        frozen=_parse_live_shift_required_ids(r['notes'])
+        if frozen is not None:return frozen
+    # Legacy shifts created before V0.5.10 did not store a frozen product set. If a close
+    # has already started, the opening set is the safest historical definition of what
+    # that shift expected; later catalog additions must not reopen or invalidate it.
+    opening_rows=q(f"""SELECT DISTINCT ic.product_id FROM inventory_counts ic
+                         JOIN inventory_sessions s ON s.id=ic.session_id
+                         WHERE s.session_date=? AND s.session_type='OPENING'
+                           AND COALESCE(s.inventory_cycle,'DAILY')=? AND s.id>?
+                           AND {_is_historical_inventory_note_sql('s')}""",
+                   (ds,cycle,int(after_session_id or 0)))
+    closing_seen=one(f"""SELECT s.id FROM inventory_sessions s
+                         WHERE s.session_date=? AND s.session_type='CLOSING'
+                           AND COALESCE(s.inventory_cycle,'DAILY')=? AND s.id>?
+                           AND {_is_historical_inventory_note_sql('s')}
+                         ORDER BY s.id ASC LIMIT 1""",
+                     (ds,cycle,int(after_session_id or 0)))
+    if closing_seen and opening_rows:
+        return {int(x['product_id']) for x in opening_rows}
+    return {int(p['id']) for p in inventory_products(cycle)}
+
+
+def _captured_product_ids(ds,kind,cycle,after_session_id=0):
+    rows=q(f"""SELECT DISTINCT ic.product_id
               FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
               WHERE s.session_date=? AND s.session_type=?
-                AND COALESCE(s.inventory_cycle,'DAILY')=?""",(ds,kind,cycle))
+                AND COALESCE(s.inventory_cycle,'DAILY')=?
+                AND s.id>? AND {_is_historical_inventory_note_sql('s')}""",
+           (ds,kind,cycle,int(after_session_id or 0)))
     return {int(r['product_id']) for r in rows}
 
 
-def inventory_cycle_progress(ds,cycle):
-    """Progress for one business date/cycle using append-only partial captures."""
-    required={int(p['id']) for p in inventory_products(cycle)}
-    opening=_captured_product_ids(ds,'OPENING',cycle)
-    closing=_captured_product_ids(ds,'CLOSING',cycle)
+def inventory_cycle_progress(ds,cycle,after_session_id=0):
+    """Progress for one live shift using append-only partial captures.
+
+    `after_session_id` isolates the current shift from a previous shift that may have
+    opened/closed on the same calendar date. This removes any dependency on midnight.
+    """
+    required=_shift_required_ids(ds,cycle,after_session_id)
+    opening=_captured_product_ids(ds,'OPENING',cycle,after_session_id)
+    closing=_captured_product_ids(ds,'CLOSING',cycle,after_session_id)
     return {
         'required_ids':required,
         'opening_ids':opening,
@@ -2294,46 +2356,94 @@ def inventory_cycle_progress(ds,cycle):
         'closing_count':len(required & closing),
         'opening_complete':bool(required) and required.issubset(opening),
         'closing_complete':bool(required) and required.issubset(closing),
+        'after_session_id':int(after_session_id or 0),
     }
 
 
+def _latest_live_daily_opening():
+    return one(f"""SELECT s.* FROM inventory_sessions s
+                   WHERE s.session_type='OPENING' AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'
+                     AND {_is_historical_inventory_note_sql('s')}
+                   ORDER BY s.id DESC LIMIT 1""")
+
+
+def _previous_live_daily_closing_id(before_session_id):
+    r=one(f"""SELECT s.id FROM inventory_sessions s
+               WHERE s.session_type='CLOSING' AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'
+                 AND s.id<? AND {_is_historical_inventory_note_sql('s')}
+               ORDER BY s.id DESC LIMIT 1""",(int(before_session_id),))
+    return int(r['id']) if r else 0
+
+
+def _latest_live_daily_closing_id(after_session_id=0):
+    r=one(f"""SELECT s.id FROM inventory_sessions s
+               WHERE s.session_type='CLOSING' AND COALESCE(s.inventory_cycle,'DAILY')='DAILY'
+                 AND s.id>? AND {_is_historical_inventory_note_sql('s')}
+               ORDER BY s.id DESC LIMIT 1""",(int(after_session_id or 0),))
+    return int(r['id']) if r else 0
+
+
+def _latest_live_inventory_session(ds,kind,cycle='DAILY',after_session_id=0):
+    return one(f"""SELECT s.*,u.name employee,COUNT(ic.id) item_count
+                   FROM inventory_sessions s
+                   LEFT JOIN users u ON u.id=s.user_id
+                   LEFT JOIN inventory_counts ic ON ic.session_id=s.id
+                   WHERE s.session_date=? AND s.session_type=?
+                     AND COALESCE(s.inventory_cycle,'DAILY')=? AND s.id>?
+                     AND {_is_historical_inventory_note_sql('s')}
+                   GROUP BY s.id ORDER BY s.id DESC LIMIT 1""",
+               (ds,kind,cycle,int(after_session_id or 0)))
+
+
+def _latest_live_product_count(ds,pid,kind,lid,cycle='DAILY',after_session_id=0):
+    return one(f"""SELECT ic.qty_base,ic.qty_bottle_equiv,ic.previous_qty,ic.variance,
+                           COALESCE(ic.observation,'') observation,s.id session_id,s.created_at,
+                           s.inventory_cycle,u.name employee
+                    FROM inventory_counts ic JOIN inventory_sessions s ON s.id=ic.session_id
+                    LEFT JOIN users u ON u.id=s.user_id
+                    WHERE s.session_date=? AND s.session_type=? AND ic.product_id=? AND ic.location_id=?
+                      AND COALESCE(s.inventory_cycle,'DAILY')=? AND s.id>?
+                      AND {_is_historical_inventory_note_sql('s')}
+                    ORDER BY s.id DESC,ic.id DESC LIMIT 1""",
+               (ds,kind,int(pid),int(lid),cycle,int(after_session_id or 0)))
+
+
 def inventory_workflow_state():
-    """Return the only valid next inventory action.
+    """Return the valid live action without calendar/time gating.
 
-    A shift is identified by its business date, not by the wall-clock date of the
-    closing timestamp. This allows an opening on Sep 3 to be closed after midnight
-    on Sep 4 while the closing remains attached to Sep 3 for reconciliation.
+    Operational rule:
+    - an OPENING can start whenever no live shift remains pending;
+    - once an opening starts, it remains the active shift until its CLOSING is complete,
+      even if several calendar days pass;
+    - immediately after a complete close, a new opening is allowed, including on the
+      same calendar date;
+    - the opening date is preserved as the business date for the paired close, while
+      real created_at timestamps retain the exact wall-clock date/time for audit.
 
-    Only yesterday and today can block the current workflow, preventing old test or
-    incomplete historical records from locking the live operation indefinitely.
+    Historical paper transcriptions never block the live workflow.
     """
     today=local_today()
-    candidates=[today-timedelta(days=1),today]
-    # Oldest unresolved recent shift wins. This also surfaces a previous-day shift
-    # if an accidental next-day opening was created before the prior close.
-    for d in candidates:
-        ds=d.isoformat(); cycle=_cycle_for_date(ds)
-        if not cycle: continue
-        prog=inventory_cycle_progress(ds,cycle)
-        if prog['closing_complete']:
-            continue
-        if prog['closing_ids']:
-            stage='CLOSING'
-        elif prog['opening_complete']:
-            stage='CLOSING'
-        else:
-            stage='OPENING'
-        return {'stage':stage,'business_date':d,'cycle':cycle,'progress':prog,'active':True}
+    latest_open=_latest_live_daily_opening()
+    if latest_open:
+        ds=str(latest_open['session_date'])
+        try:d=date.fromisoformat(ds)
+        except Exception:d=today
+        boundary=_previous_live_daily_closing_id(int(latest_open['id']))
+        prog=inventory_cycle_progress(ds,'DAILY',boundary)
+        if not prog['closing_complete']:
+            stage='CLOSING' if (prog['opening_complete'] or prog['closing_count']>0) else 'OPENING'
+            return {'stage':stage,'business_date':d,'cycle':'DAILY','progress':prog,'active':True,'after_session_id':boundary}
+        # The most recent live shift is fully closed. A new opening is valid immediately.
+        latest_close=_latest_live_daily_closing_id(int(latest_open['id']))
+        boundary=max(boundary,latest_close)
+        return {'stage':'OPENING','business_date':today,'cycle':'DAILY',
+                'progress':inventory_cycle_progress(today.isoformat(),'DAILY',boundary),
+                'active':False,'after_session_id':boundary}
 
-    # No unresolved shift. If today was already fully closed, the next valid opening
-    # is tomorrow and is not writable until that calendar date arrives.
-    cycle_today=_cycle_for_date(today.isoformat())
-    if cycle_today:
-        prog_today=inventory_cycle_progress(today.isoformat(),cycle_today)
-        if prog_today['closing_complete']:
-            next_date=today+timedelta(days=1)
-            return {'stage':'WAIT_NEXT_OPENING','business_date':next_date,'cycle':None,'progress':prog_today,'active':False}
-    return {'stage':'OPENING','business_date':today,'cycle':cycle_today,'progress':(inventory_cycle_progress(today.isoformat(),cycle_today) if cycle_today else None),'active':False}
+    # No live opening has ever been recorded: opening is available now.
+    return {'stage':'OPENING','business_date':today,'cycle':'DAILY',
+            'progress':inventory_cycle_progress(today.isoformat(),'DAILY',0),
+            'active':False,'after_session_id':0}
 
 
 def _workflow_status_text(wf):
@@ -2341,12 +2451,10 @@ def _workflow_status_text(wf):
     if wf['stage']=='CLOSING':
         p=wf['progress']; cyc='Semanal' if wf['cycle']=='WEEKLY' else 'Diario'
         return f"Turno {d} · {cyc} · apertura {p['opening_count']}/{p['required_count']} · cierre {p['closing_count']}/{p['required_count']}"
-    if wf['stage']=='WAIT_NEXT_OPENING':
-        return f"Turno cerrado · próxima apertura {d}"
     if wf.get('progress'):
         p=wf['progress']; cyc='Semanal' if wf['cycle']=='WEEKLY' else 'Diario'
         return f"Apertura {d} · {cyc} · {p['opening_count']}/{p['required_count']} productos"
-    return f"Próxima acción: apertura {d}"
+    return f"Apertura disponible ahora · fecha operativa {d}"
 
 
 def _validate_inventory_save(kind,business_date,cycle):
@@ -3479,16 +3587,13 @@ if page is None:
 
 # --------------------------- pages ---------------------------
 if page=='Apertura':
-    page_header("Apertura", "Conteo inicial del turno. El sistema bloquea cierres duplicados y no permite una nueva apertura mientras exista un turno pendiente de cierre.")
+    page_header("Apertura", "Conteo inicial del turno. Puede realizarse a cualquier hora y en cualquier día cuando no exista un turno pendiente de cierre.")
     wf=inventory_workflow_state()
     d=wf['business_date']
     st.date_input("Fecha operativa de apertura",value=d,disabled=True,key='opening_business_date')
-    if wf['stage']=='WAIT_NEXT_OPENING':
-        st.info(f"El último turno ya está cerrado. La próxima apertura corresponde al {d.strftime('%d/%m/%Y')} y quedará habilitada cuando llegue esa fecha.")
-        st.stop()
     cycle='DAILY'; cycle_label='Diario'
     if wf.get('progress') and wf['progress']['opening_count']>0:
-        p=inventory_cycle_progress(d.isoformat(),cycle)
+        p=wf['progress']
         st.info(f"Apertura diaria en progreso: {p['opening_count']} de {p['required_count']} productos registrados. Debes completar esta apertura antes de que el Cierre se habilite.")
     st.caption("Inventario diario: todas las cervezas + licores principales. El inventario semanal de todos los productos se realiza de forma independiente desde «Inventario semanal».")
     st.caption("Si no existe un cierre anterior comparable, el conteo se guarda como referencia sin generar una alerta falsa.")
@@ -3502,7 +3607,7 @@ if page=='Apertura':
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
         for p in g:
-            prev,prev_bottles,prev_date=last_close_detail(p['id'],bar,(d-timedelta(days=1)).isoformat())
+            prev,prev_bottles,prev_date=last_close_detail(p['id'],bar,d.isoformat())
             with st.expander(product_label(p),expanded=True):
                 if prev is None:
                     st.info("Primer inventario registrado para este producto. No existe cierre anterior para comparar.")
@@ -3534,11 +3639,11 @@ if page=='Apertura':
         if not valid: st.error(msg)
         elif not zero_confirm: st.error("Confirma los productos en cero o usa una captura parcial para registrar solo la categoría que ya fue contada.")
         else:
-            result=save_session('OPENING',counts,d,inventory_cycle=cycle)
+            result=save_session('OPENING',counts,d,notes=_live_shift_required_note(wf['progress']['required_ids']),inventory_cycle=cycle)
             if not result.get('ok'):
                 st.error(result.get('error','No fue posible guardar la apertura.'))
             else:
-                new_prog=inventory_cycle_progress(d.isoformat(),cycle)
+                new_prog=inventory_cycle_progress(d.isoformat(),cycle,wf.get('after_session_id',0))
                 if result.get('duplicate'):
                     detail=f"La captura ya había sido recibida y **no se creó un duplicado**. Progreso: {new_prog['opening_count']}/{new_prog['required_count']} productos."
                 elif new_prog['opening_complete']:
@@ -3552,7 +3657,7 @@ if page=='Apertura':
                 st.rerun()
 
 elif page=='Cierre':
-    page_header("Cierre", "Conteo final del turno. Si la operación pasa de medianoche, el cierre conserva la fecha operativa de la apertura y la hora real queda en la auditoría.")
+    page_header("Cierre", "Conteo final del turno. Puede realizarse a cualquier hora o día posterior; siempre queda vinculado a la apertura activa y conserva la hora real para auditoría.")
     wf=inventory_workflow_state()
     if wf['stage']!='CLOSING':
         st.warning("No existe una apertura completa pendiente de cierre. El sistema no permite crear un cierre sin apertura.")
@@ -3567,7 +3672,7 @@ elif page=='Cierre':
     ps=inventory_products(cycle); all_ps=[p for p in products() if p['category'] in ('Cerveza','Licor')]
     if scope=='Solo cervezas': ps=[p for p in ps if p['category']=='Cerveza']
     elif scope=='Solo licores': ps=[p for p in ps if p['category']=='Licor']
-    opening_meta=_inventory_session(d.isoformat(),'OPENING',cycle)
+    opening_meta=_latest_live_inventory_session(d.isoformat(),'OPENING',cycle,wf.get('after_session_id',0))
     if opening_meta:
         st.success(f"Aperturas disponibles para este ciclo. Última captura: {_session_trace_label(opening_meta)}")
     else:
@@ -3578,7 +3683,7 @@ elif page=='Cierre':
         g=[p for p in ps if p['category']==cat]
         if g: st.subheader(cat)
         for p in g:
-            op_rec=_latest_product_count(d.isoformat(),p['id'],'OPENING',bar,cycle)
+            op_rec=_latest_live_product_count(d.isoformat(),p['id'],'OPENING',bar,cycle,wf.get('after_session_id',0))
             op=float(op_rec['qty_base']) if op_rec is not None else None
             op_bottles=float(op_rec['qty_bottle_equiv']) if op_rec is not None and op_rec['qty_bottle_equiv'] is not None else None
             if op_rec is not None: default,default_bottles=op,op_bottles
@@ -3639,7 +3744,7 @@ elif page=='Cierre':
             if not result.get('ok'):
                 st.error(result.get('error','No fue posible guardar el cierre.'))
             else:
-                new_prog=inventory_cycle_progress(d.isoformat(),cycle)
+                new_prog=inventory_cycle_progress(d.isoformat(),cycle,wf.get('after_session_id',0))
                 if result.get('duplicate'):
                     detail=f"La captura ya había sido recibida y **no se creó un duplicado**. Progreso: {new_prog['closing_count']}/{new_prog['required_count']} productos."
                 elif new_prog['closing_complete']:
