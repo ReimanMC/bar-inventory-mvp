@@ -1,8 +1,8 @@
-# Inventario La Ramona — V0.5.9
+# Inventario La Ramona — V0.5.10
 
 ## Objetivo
 
-V0.5.9 separa completamente el **inventario diario** del **inventario semanal** sin modificar la arquitectura de persistencia y respaldo estabilizada en V0.5.8.
+V0.5.10 conserva la separación entre **inventario diario** e **inventario semanal** y corrige el flujo operativo diario para que Apertura/Cierre dependan del **estado real del turno**, no del cambio de fecha a medianoche.
 
 La prioridad continúa siendo que cada captura confirmada quede primero en SQLite mediante una transacción segura y después se publique como una revisión inmutable validada en Supabase Storage.
 
@@ -25,6 +25,27 @@ Incluye:
 El selector Diario/Semanal fue retirado de Apertura y Cierre para evitar mezclar procesos distintos.
 
 Los registros WEEKLY antiguos que ya existan en `inventory_sessions` se conservan para auditoría, pero ya no participan en el flujo operativo diario.
+
+
+## 1A. Flujo diario flexible por turno — V0.5.10
+
+La Apertura y el Cierre ya **no están bloqueados por una fecha futura ni por las 11:59 p. m.**
+
+Reglas operativas:
+
+- si no existe un turno pendiente, **Apertura queda disponible inmediatamente**;
+- una Apertura puede comenzar a cualquier hora y cualquier día;
+- una vez iniciada, ese turno permanece activo hasta completar su Cierre;
+- el Cierre puede realizarse minutos, horas o días después;
+- si el Cierre ocurre después de medianoche, conserva como fecha operativa la fecha de la Apertura, pero `created_at` conserva la fecha/hora real del cierre para auditoría;
+- después de completar un Cierre, una nueva Apertura puede comenzar inmediatamente, incluso si todavía es la misma fecha calendario;
+- las transcripciones históricas de contingencia no controlan ni bloquean el flujo en vivo.
+
+Para aislar turnos distintos que eventualmente ocurran en una misma fecha, el progreso diario utiliza como frontera la última sesión de Cierre anterior.
+
+Desde V0.5.10, al iniciar una Apertura se congela también la lista de productos requeridos de ese turno dentro de la metadata de la captura. Así, si durante el turno se agrega un nuevo producto al catálogo o se cambia un licor principal, el turno ya iniciado no se vuelve incompleto retroactivamente.
+
+El inventario semanal independiente continúa sin alterar ni bloquear este flujo diario.
 
 ## 2. Inventario semanal independiente
 
@@ -205,3 +226,20 @@ Para pasar de V0.5.8 a V0.5.9:
 8. no subas `.db`, Secrets, `__pycache__` ni `.pyc` a GitHub.
 
 Después del deploy, verifica que Local y Supabase coincidan. Luego puede iniciarse un inventario semanal desde la nueva opción independiente sin afectar la Apertura/Cierre diaria.
+
+
+## 13. Validación V0.5.10
+
+Se verificó específicamente:
+
+- Apertura disponible sin esperar al día siguiente después de un Cierre completo;
+- Cierre de una Apertura varios días después sin bloqueo por calendario;
+- Cierre parcial que continúa habilitado hasta completarse;
+- nueva Apertura el mismo día después de un Cierre completo sin mezclar conteos del turno anterior;
+- inventario histórico en papel excluido del flujo operativo en vivo;
+- lista de productos requerida congelada al iniciar el turno para evitar que cambios posteriores del catálogo invaliden una Apertura ya iniciada;
+- compatibilidad legacy: cuando un Cierre antiguo ya había comenzado, el conjunto real de productos de su Apertura define el turno aunque el catálogo actual tenga más productos;
+- `py_compile` exitoso de `app.py`;
+- arquitectura de SQLite + Supabase y flujo semanal V0.5.9 sin modificaciones funcionales.
+
+Consulta `docs/VALIDATION_V0.5.10.txt` para el detalle.
