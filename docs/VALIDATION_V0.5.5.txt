@@ -1,80 +1,26 @@
-LA RAMONA INVENTORY MVP — V0.5.9 VALIDATION
-============================================
+LA RAMONA INVENTORY — VALIDATION V0.5.10
 
 Scope
 -----
-Independent weekly physical inventory separated from the daily Opening/Closing workflow,
-while preserving V0.5.8 SQLite + immutable Supabase revision persistence.
+Correction of live DAILY Opening/Closing workflow. No change to Supabase secrets, bucket, weekly inventory tables, POS formulas or dashboard KPIs.
 
-Static validation
------------------
-PASS: app.py compiles with Python py_compile.
-PASS: APP_VERSION is 0.5.9.
-PASS: Apertura/Cierre no longer expose a Diario/Semanal selector.
-PASS: sidebar contains independent "Inventario semanal" navigation.
-PASS: weekly tables are included in the canonical business-data digest.
-PASS: weekly session/capture/count metrics are included in synchronization health.
-PASS: live daily workflow ignores legacy WEEKLY Opening/Closing rows.
+Validated scenarios
+-------------------
+1. Fresh system: Opening is available immediately for the current local date.
+2. Opening completed on Sep 17; current date Sep 20: Closing remains enabled and linked to Sep 17.
+3. Partial Closing across days: Closing remains the only live action until required products are complete.
+4. Completed Closing: a new Opening becomes available immediately; there is no WAIT_NEXT_OPENING / next-calendar-day gate.
+5. Same-day reopen: the new shift uses the previous Closing session ID as a boundary, so prior shift counts are not reused as progress.
+6. Historical paper transcriptions tagged TRANSCRIPCIÓN HISTÓRICA POR CONTINGENCIA do not block the live workflow.
+7. Product-set freeze: a shift started with products {1,2,3} stays complete even if products 4 and 5 are later added to the daily catalog.
+8. Legacy compatibility: if a legacy Closing had already started, its Opening product set defines the expected products instead of later catalog additions.
+9. Opening reference now includes the latest Closing on or before the opening date, supporting after-midnight/variable schedule operations.
+10. Python compilation: PASS.
 
-Migration test on real La Ramona backup
-----------------------------------------
-Source database used: bar_inventory_2026-09-07.db
-Initial state:
-- users: 12
-- active physical products: 69
-- daily-required products: 17
-- inventory_sessions: 19
-- inventory_counts: 386
-
-After V0.5.9 weekly schema creation:
-PASS: existing daily session/count rows remained unchanged.
-PASS: weekly schema created without foreign-key violations.
-
-Weekly workflow simulation
---------------------------
-PASS: weekly session snapshot required 69 active Beer/Liquor products.
-PASS: first partial capture saved 35/69 products.
-PASS: second capture completed progress to 69/69.
-PASS: weekly session transitioned to COMPLETED.
-PASS: daily inventory remained 19 sessions / 386 counts.
-PASS: PRAGMA quick_check = ok.
-PASS: PRAGMA foreign_key_check returned no rows.
-PASS: partial unique index prevented a second simultaneous IN_PROGRESS weekly session.
-
-Stock / replenishment behavior
-------------------------------
-PASS: a newer COMPLETED weekly count can become the physical stock reference.
-PASS: an IN_PROGRESS weekly count is ignored by current stock / replenishment.
-PASS: daily and completed-weekly candidates are selected by physical capture timestamp.
-
-Concurrency / audit controls
-----------------------------
-PASS: weekly data is append-only by capture; re-count does not delete prior count history.
-PASS: finalization is separate from progress capture.
-PASS: write path uses the existing serialized durable-write and pre-write Supabase guard.
-PASS: per-product optimistic guard prevents a stale form from silently overwriting a newer weekly count from another user.
-PASS: finalized weekly sessions reject later writes.
-
-Persistence / backup coverage
------------------------------
-PASS: weekly_inventory_sessions is included in health/dominance metrics.
-PASS: weekly_inventory_captures is included in health/dominance metrics.
-PASS: weekly_inventory_counts is included in health/dominance metrics.
-PASS: weekly_inventory_session_products is included in canonical logical digest with deterministic multi-column ordering.
-PASS: new weekly writes therefore change the data digest and are eligible for durable Supabase publication.
-PASS: V0.5.8 immutable revisions_v2 architecture remains unchanged.
-PASS: post-migration digest changes are published only when the current remote revision is still the declared parent, preventing a false branch conflict.
-
-Operational separation
-----------------------
-PASS: daily inventory remains Beer + principal liquors only.
-PASS: weekly inventory snapshots all active Beer + Liquor products.
-PASS: weekly inventory does not create OPENING/CLOSING rows.
-PASS: weekly inventory does not create POS differences or sales-by-count values.
-PASS: legacy WEEKLY rows in inventory_sessions remain auditable but do not control the live daily workflow.
+Operational rule
+----------------
+Opening and Closing are controlled by shift state, not clock/calendar boundaries. The exact real timestamp remains recorded for audit. The business date of the Closing remains the Opening business date for reconciliation.
 
 Result
 ------
-V0.5.9 is suitable for MVP deployment for the tested workflow. As with any Streamlit + SQLite
-architecture, runtime availability cannot be mathematically guaranteed; durable Supabase revisions
-remain the recovery layer. The tested weekly workflow does not weaken the V0.5.8 persistence model.
+PASS for all targeted workflow tests.
