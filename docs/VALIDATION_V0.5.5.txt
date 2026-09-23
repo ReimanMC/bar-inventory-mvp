@@ -1,26 +1,79 @@
-LA RAMONA INVENTORY — VALIDATION V0.5.10
+LA RAMONA INVENTORY — VALIDATION V0.6.0
+======================================
 
 Scope
 -----
-Correction of live DAILY Opening/Closing workflow. No change to Supabase secrets, bucket, weekly inventory tables, POS formulas or dashboard KPIs.
+Major operational change: daily inventory moves from Opening→Closing to Closing→Closing.
+Existing historical rows are preserved.
 
-Validated scenarios
+Static validation
+-----------------
+- app.py py_compile: PASS
+- No new Python dependencies: PASS
+- Supabase immutable revision / backup code left structurally intact: PASS
+- Daily navigation no longer exposes Apertura: PASS
+- Live save validation rejects new OPENING captures: PASS
+
+Data preservation test
+----------------------
+Source test database: BackupRAMONA.db
+Initial:
+- inventory_sessions: 19
+- inventory_counts: 386
+- PRAGMA quick_check: ok
+
+Synthetic close-only cycle:
+- Required daily products: 17
+- Partial capture 1: beers
+- Partial capture 2: liquors
+- Resulting inventory_sessions: 21
+- Resulting inventory_counts: 403
+- Historical OPENING row count unchanged: PASS
+- Close-only required set captured: 17/17 PASS
+- PRAGMA quick_check: ok
+- PRAGMA foreign_key_check: 0 errors
+
+Reconciliation test
 -------------------
-1. Fresh system: Opening is available immediately for the current local date.
-2. Opening completed on Sep 17; current date Sep 20: Closing remains enabled and linked to Sep 17.
-3. Partial Closing across days: Closing remains the only live action until required products are complete.
-4. Completed Closing: a new Opening becomes available immediately; there is no WAIT_NEXT_OPENING / next-calendar-day gate.
-5. Same-day reopen: the new shift uses the previous Closing session ID as a boundary, so prior shift counts are not reused as progress.
-6. Historical paper transcriptions tagged TRANSCRIPCIÓN HISTÓRICA POR CONTINGENCIA do not block the live workflow.
-7. Product-set freeze: a shift started with products {1,2,3} stays complete even if products 4 and 5 are later added to the daily catalog.
-8. Legacy compatibility: if a legacy Closing had already started, its Opening product set defines the expected products instead of later catalog additions.
-9. Opening reference now includes the latest Closing on or before the opening date, supporting after-midnight/variable schedule operations.
-10. Python compilation: PASS.
+Corona example from real backup baseline:
+- Previous close: 268 units
+- Synthetic current close: 250 units
+- Physical outflow: 18 units
+- No negative consumption generated: PASS
 
-Operational rule
-----------------
-Opening and Closing are controlled by shift state, not clock/calendar boundaries. The exact real timestamp remains recorded for audit. The business date of the Closing remains the Opening business date for reconciliation.
+Formula verified:
+- physical = max(previous close + entries - current close, 0)
+- count sale = max(physical - authorized adjustments, 0)
+- difference is calculated only when POS is confirmed
 
-Result
-------
-PASS for all targeted workflow tests.
+Workflow checks
+---------------
+- No opening prerequisite for new daily close: PASS
+- Close can start on any operational date <= today: PASS
+- Partial beer/liquor captures share one immutable close-cycle marker: PASS
+- Required product set frozen when first partial close is saved: PASS
+- Previous closing boundary frozen in cycle metadata: PASS
+- Completed close allows a new close immediately: PASS
+- First close without previous baseline becomes a non-alerting baseline: PASS
+- Historical transcriptions do not control the live close cycle: PASS
+- Weekly inventory remains independent: PASS
+
+Dashboard / reporting semantics
+-------------------------------
+- Daily latest inventory date is based on CLOSING rows: PASS
+- Dashboard physical columns use Cierre anterior / Cierre actual: PASS
+- Existing historical OPENING rows remain visible in audit views: PASS
+- Current stock daily source restricted to CLOSING rows: PASS
+
+Backup / persistence
+--------------------
+- SQLite write path preserved
+- Durable write lock preserved
+- Fresh Supabase write-time guard preserved
+- Immutable revisions_v2 backup flow preserved
+- latest/daily/weekly convenience copies preserved
+- No schema-destructive migration introduced
+
+Conclusion
+----------
+V0.6.0 preserves existing data and changes only the operational daily inventory semantics to consecutive physical closings.
